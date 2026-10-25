@@ -87,7 +87,13 @@ impl std::fmt::Debug for MockDdb {
     }
 }
 
-#[allow(clippy::unused_async)]
+// Every method is `async` on purpose: callers' production code does
+// `client.put_item(...).send().await`, and a test that swaps in the mock must
+// not have to drop the `.await`. There is nothing to await inside, so clippy's
+// `unused_async` (and its newer `unused_async_trait_impl` spelling) is expected
+// here; `unknown_lints` keeps older clippy versions, which do not know the newer
+// name, from rejecting the attribute.
+#[allow(unknown_lints, clippy::unused_async, clippy::unused_async_trait_impl)]
 impl MockDdb {
     /// A mock with no tables, using the real clock.
     #[must_use]
