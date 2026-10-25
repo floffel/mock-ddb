@@ -1,0 +1,1 @@
+SET a = :v, b[5] = :w REMOVE c,ETs

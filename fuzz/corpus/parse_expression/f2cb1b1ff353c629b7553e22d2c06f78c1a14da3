@@ -1,0 +1,1 @@
+SET a = :v, b[0] = :w +aR, a = :v, b[0] = :w +aR, b[0] =:w +:w +bw +:w +aR,bs

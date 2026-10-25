@@ -1,0 +1,1 @@
+SET a = :v, b[0] = :w +aR, b[0] = :w +aR b b <cd :D

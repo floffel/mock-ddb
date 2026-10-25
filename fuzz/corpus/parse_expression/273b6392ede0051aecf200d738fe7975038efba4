@@ -1,0 +1,1 @@
+SET a = :v, REMOVE c ADD d :n DELETE .

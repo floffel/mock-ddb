@@ -1,0 +1,1 @@
+SET a = :v, b[0] = :w REMOVE c AD: D dn DELETE e :s
