@@ -234,7 +234,7 @@ mod tests {
             Token::Minus,
         ];
         for token in tokens {
-            assert!(!token.describe().is_empty());
+            assert_ne!(token.describe(), "");
         }
         assert_eq!(Token::Ident("a".into()).describe(), "`a`");
         assert_eq!(Token::Name("n".into()).describe(), "`#n`");

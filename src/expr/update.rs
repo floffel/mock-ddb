@@ -380,6 +380,6 @@ mod tests {
         assert!(!target.contains_key("nothing"));
         let empty = Update { clauses: vec![] };
         let touched = super::apply(&empty, &mut target, &context, &key_schema()).unwrap();
-        assert!(touched.is_empty());
+        assert_eq!(touched.len(), 0);
     }
 }

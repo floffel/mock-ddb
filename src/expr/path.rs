@@ -360,7 +360,7 @@ mod tests {
         assert!(set_path(&mut item, &[Segment::Index(0)], s("x")).is_err());
         remove_path(&mut item, &[Segment::Index(0)]);
         remove_path(&mut item, &[]);
-        assert!(project(&item, &[&[]]).is_empty());
+        assert_eq!(project(&item, &[&[]]).len(), 0);
         let mut value = s("scalar");
         assert!(set_in(&mut value, &[], s("x"), &[]).is_err());
     }

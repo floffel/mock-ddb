@@ -350,7 +350,7 @@ async fn put_conditions_and_return_values() {
     assert!(overwrite.is_conditional_check_failed());
     assert_eq!(overwrite.code(), "ConditionalCheckFailedException");
     assert!(!overwrite.is_retryable());
-    assert!(overwrite.cancellation_reasons().is_empty());
+    assert_eq!(overwrite.cancellation_reasons().len(), 0);
 
     // The failed condition left the original in place.
     let found = mock
@@ -497,7 +497,7 @@ async fn update_creates_missing_items_and_returns_values() {
         .unwrap()
         .attributes
         .unwrap();
-    assert!(removed.is_empty());
+    assert_eq!(removed.len(), 0);
 }
 
 #[tokio::test]
@@ -603,7 +603,7 @@ async fn seed_dump_and_clear() {
     assert!(mock.seed("missing", vec![]).is_err());
     assert!(mock.seed("users", vec![Item::new()]).is_err());
     assert_eq!(mock.count("missing"), 0);
-    assert!(mock.dump("missing").is_empty());
+    assert_eq!(mock.dump("missing").len(), 0);
 
     mock.clear();
     assert_eq!(mock.count("users"), 0);
@@ -672,7 +672,7 @@ async fn select_counts_query_without_projection() {
         .await
         .unwrap();
     assert_eq!(counted.count, 2);
-    assert!(counted.items.is_empty());
+    assert_eq!(counted.items.len(), 0);
 
     let specific = mock
         .scan(mock_ddb::ScanRequest::new("users").with_select(Select::SpecificAttributes))

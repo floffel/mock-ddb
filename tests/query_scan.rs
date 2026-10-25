@@ -220,7 +220,7 @@ async fn query_projection_and_count_select() {
         .await
         .unwrap();
     assert_eq!(counted.count, 1);
-    assert!(counted.items.is_empty());
+    assert_eq!(counted.items.len(), 0);
 }
 
 #[tokio::test]
@@ -494,7 +494,7 @@ async fn scan_filters_and_counts() {
         .unwrap();
     assert_eq!(page.count, 3);
     assert_eq!(page.scanned_count, 6);
-    assert!(page.items.is_empty());
+    assert_eq!(page.items.len(), 0);
 }
 
 #[tokio::test]

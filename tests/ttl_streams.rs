@@ -409,7 +409,7 @@ mod streams {
     #[tokio::test]
     async fn tables_without_a_stream_have_no_arn() {
         let mock = users();
-        assert!(mock.list_streams().is_empty());
+        assert_eq!(mock.list_streams().len(), 0);
         let description = mock.describe_table("users").await.unwrap();
         assert!(description.latest_stream_arn.is_none());
         assert!(mock.get_records("arn:aws:dynamodb:local").await.is_err());
@@ -421,7 +421,7 @@ mod streams {
         mock.seed("events", vec![pk("e1"), pk("e2")]).unwrap();
         assert_eq!(mock.get_records(&arn).await.unwrap().len(), 2);
         mock.delete_table("events").await.unwrap();
-        assert!(mock.list_streams().is_empty());
+        assert_eq!(mock.list_streams().len(), 0);
     }
 
     #[tokio::test]

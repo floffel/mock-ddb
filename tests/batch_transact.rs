@@ -38,7 +38,7 @@ async fn batch_write_accepts_twenty_five_writes_across_tables() {
         );
     }
     let response = mock.batch_write_item(request).await.unwrap();
-    assert!(response.unprocessed_items.is_empty());
+    assert_eq!(response.unprocessed_items.len(), 0);
     assert_eq!(mock.count("orders"), 20);
     assert_eq!(mock.count("users"), 5);
 
@@ -201,7 +201,7 @@ async fn batch_get_spans_tables_and_keeps_request_order() {
         .collect();
     assert_eq!(order_ids, vec!["2", "1"]);
     assert_eq!(response.responses["users"].len(), 1);
-    assert!(response.unprocessed_keys.is_empty());
+    assert_eq!(response.unprocessed_keys.len(), 0);
 
     let bad_key = mock
         .batch_get_item(BatchGetItemRequest::new().add(

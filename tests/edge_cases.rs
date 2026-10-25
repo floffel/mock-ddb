@@ -445,8 +445,8 @@ async fn table_lifecycle_and_defaults() {
         .unwrap();
     assert_eq!(description.table_name, name);
     assert_eq!(description.item_count, 0);
-    assert!(description.global_secondary_indexes.is_empty());
-    assert!(description.local_secondary_indexes.is_empty());
+    assert_eq!(description.global_secondary_indexes.len(), 0);
+    assert_eq!(description.local_secondary_indexes.len(), 0);
     assert_eq!(
         mock.list_tables(ListTablesRequest::default())
             .await
@@ -520,10 +520,12 @@ async fn deleting_a_table_removes_its_stream_and_items() {
     let description = mock.delete_table("users").await.unwrap();
     assert_eq!(description.item_count, 1);
     assert_eq!(mock.count("users"), 0);
-    assert!(mock
-        .list_tables(ListTablesRequest::default())
-        .await
-        .unwrap()
-        .table_names
-        .is_empty());
+    assert_eq!(
+        mock.list_tables(ListTablesRequest::default())
+            .await
+            .unwrap()
+            .table_names
+            .len(),
+        0
+    );
 }

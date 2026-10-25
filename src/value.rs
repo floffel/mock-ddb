@@ -598,9 +598,12 @@ mod tests {
         assert_eq!(text.type_name(), "S");
         assert_eq!(number.type_name(), "N");
         assert_eq!(binary.type_name(), "B");
-        assert!(Scalar::S(String::new()).is_empty());
-        assert!(Scalar::B(Vec::new()).is_empty());
-        assert!(!number.is_empty());
+        let empty_string = Scalar::S(String::new()).is_empty();
+        let empty_binary = Scalar::B(Vec::new()).is_empty();
+        let number_is_empty = number.is_empty();
+        assert!(empty_string);
+        assert!(empty_binary);
+        assert!(!number_is_empty);
         assert_eq!(Scalar::from_value(&AttributeValue::M(HashMap::new())), None);
         assert_eq!(
             Scalar::from_value(&AttributeValue::N("1.0".into())),
