@@ -97,6 +97,13 @@ impl std::fmt::Debug for MockDdb {
 impl MockDdb {
     /// A mock with no tables, using the real clock.
     #[must_use]
+    ///
+    /// ```
+    /// use mock_ddb::MockDdb;
+    ///
+    /// let mock = MockDdb::new();
+    /// assert_eq!(mock.count("nothing"), 0);
+    /// ```
     pub fn new() -> Self {
         Self::with_clock(Arc::new(SystemClock))
     }
@@ -146,6 +153,15 @@ impl MockDdb {
         Ok(mock)
     }
 
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use mock_ddb::{MockClock, MockDdb};
+    ///
+    /// let mock = MockDdb::new();
+    /// mock.set_clock(Arc::new(MockClock::at_epoch_seconds(1_000)));
+    /// assert_eq!(mock.now_seconds(), 1_000);
+    /// ```
     /// Replace the clock, e.g. to pin time in the middle of a test.
     pub fn set_clock(&self, clock: Arc<dyn Clock>) {
         self.inner.write().clock = clock;
@@ -153,6 +169,13 @@ impl MockDdb {
 
     /// The clock's current instant, in whole seconds since the Unix epoch.
     #[must_use]
+    ///
+    /// ```
+    /// use mock_ddb::MockDdb;
+    ///
+    /// let mock = MockDdb::new();
+    /// assert!(mock.now_seconds() > 0);
+    /// ```
     pub fn now_seconds(&self) -> i64 {
         epoch_seconds(self.inner.read().clock.now())
     }
@@ -199,6 +222,14 @@ impl MockDdb {
     /// removes them when they are read or [`purge_expired`](Self::purge_expired)
     /// runs.
     #[must_use]
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, KeySchema, KeyType, MockDdb};
+    ///
+    /// let mock = MockDdb::with_table("users", KeySchema::hash("pk", KeyType::String)).unwrap();
+    /// mock.seed("users", vec![item([("pk", s("u#1"))])]).unwrap();
+    /// assert_eq!(mock.count("users"), 1);
+    /// ```
     pub fn count(&self, table_name: &str) -> usize {
         let inner = self.inner.read();
         let now = epoch_seconds(inner.clock.now());
@@ -232,6 +263,15 @@ impl MockDdb {
         })
     }
 
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, KeySchema, KeyType, MockDdb};
+    ///
+    /// let mock = MockDdb::with_table("users", KeySchema::hash("pk", KeyType::String)).unwrap();
+    /// mock.seed("users", vec![item([("pk", s("u#1"))])]).unwrap();
+    /// mock.clear();
+    /// assert_eq!(mock.count("users"), 0);
+    /// ```
     /// Drop every table.
     pub fn clear(&self) {
         let mut inner = self.inner.write();
@@ -286,6 +326,17 @@ impl MockDdb {
         Ok(description)
     }
 
+    ///
+    /// ```
+    /// use mock_ddb::{KeySchema, KeyType, MockDdb};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mock = MockDdb::with_table("users", KeySchema::hash("pk", KeyType::String)).unwrap();
+    /// let removed = mock.delete_table("users").await.unwrap();
+    /// assert_eq!(removed.table_name, "users");
+    /// # }
+    /// ```
     /// Delete a table and return its final description.
     ///
     /// # Errors
@@ -301,6 +352,16 @@ impl MockDdb {
         Ok(table.describe(table.live_count(now)))
     }
 
+    ///
+    /// ```
+    /// use mock_ddb::{KeySchema, KeyType, MockDdb};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mock = MockDdb::with_table("users", KeySchema::hash("pk", KeyType::String)).unwrap();
+    /// assert_eq!(mock.describe_table("users").await.unwrap().table_status, "ACTIVE");
+    /// # }
+    /// ```
     /// Describe a table.
     ///
     /// # Errors
@@ -316,6 +377,17 @@ impl MockDdb {
         Ok(table.describe(table.live_count(now)))
     }
 
+    ///
+    /// ```
+    /// use mock_ddb::{KeySchema, KeyType, ListTablesRequest, MockDdb};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mock = MockDdb::with_table("users", KeySchema::hash("pk", KeyType::String)).unwrap();
+    /// let listing = mock.list_tables(ListTablesRequest::default()).await.unwrap();
+    /// assert_eq!(listing.table_names, vec!["users"]);
+    /// # }
+    /// ```
     /// List table names, sorted.
     ///
     /// # Errors
@@ -435,6 +507,23 @@ impl MockDdb {
         })
     }
 
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, GetItemRequest, KeySchema, KeyType, MockDdb, PutItemRequest};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mock = MockDdb::with_table("users", KeySchema::hash("pk", KeyType::String)).unwrap();
+    /// mock.put_item(PutItemRequest::new("users", item([("pk", s("u#1"))])))
+    ///     .await
+    ///     .unwrap();
+    /// let found = mock
+    ///     .get_item(GetItemRequest::new("users", item([("pk", s("u#1"))])))
+    ///     .await
+    ///     .unwrap();
+    /// assert!(found.item.is_some());
+    /// # }
+    /// ```
     /// Read an item.
     ///
     /// # Errors
@@ -475,6 +564,26 @@ impl MockDdb {
         Ok(GetItemOutput { item })
     }
 
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, DeleteItemRequest, KeySchema, KeyType, MockDdb, PutItemRequest, ReturnValues};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mock = MockDdb::with_table("users", KeySchema::hash("pk", KeyType::String)).unwrap();
+    /// mock.put_item(PutItemRequest::new("users", item([("pk", s("u#1"))])))
+    ///     .await
+    ///     .unwrap();
+    /// let removed = mock
+    ///     .delete_item(
+    ///         DeleteItemRequest::new("users", item([("pk", s("u#1"))]))
+    ///             .with_return_values(ReturnValues::AllOld),
+    ///     )
+    ///     .await
+    ///     .unwrap();
+    /// assert!(removed.attributes.is_some());
+    /// # }
+    /// ```
     /// Delete an item.
     ///
     /// Deleting a key that does not exist succeeds and returns no attributes,
@@ -828,6 +937,20 @@ impl MockDdb {
         })
     }
 
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, BatchWriteItemRequest, KeySchema, KeyType, MockDdb, WriteRequest};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mock = MockDdb::with_table("users", KeySchema::hash("pk", KeyType::String)).unwrap();
+    /// let request = BatchWriteItemRequest::new()
+    ///     .add("users", WriteRequest::Put { item: item([("pk", s("u#1"))]) })
+    ///     .add("users", WriteRequest::Delete { key: item([("pk", s("u#2"))]) });
+    /// assert!(mock.batch_write_item(request).await.unwrap().unprocessed_items.is_empty());
+    /// assert_eq!(mock.count("users"), 1);
+    /// # }
+    /// ```
     /// Write up to 25 items in one non-atomic batch.
     ///
     /// # Errors
@@ -908,6 +1031,24 @@ impl MockDdb {
         Ok(BatchWriteItemOutput::default())
     }
 
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, BatchGetItemRequest, KeySchema, KeyType, KeysAndAttributes, MockDdb};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mock = MockDdb::with_table("users", KeySchema::hash("pk", KeyType::String)).unwrap();
+    /// mock.seed("users", vec![item([("pk", s("u#1"))])]).unwrap();
+    /// let response = mock
+    ///     .batch_get_item(
+    ///         BatchGetItemRequest::new()
+    ///             .add("users", KeysAndAttributes::new(vec![item([("pk", s("u#1"))])])),
+    ///     )
+    ///     .await
+    ///     .unwrap();
+    /// assert_eq!(response.responses["users"].len(), 1);
+    /// # }
+    /// ```
     /// Read up to 100 keys in one batch. Missing keys are omitted.
     ///
     /// # Errors
@@ -971,6 +1112,22 @@ impl MockDdb {
         })
     }
 
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, KeySchema, KeyType, MockDdb, TransactWriteItem, TransactWriteItemsRequest};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mock = MockDdb::with_table("users", KeySchema::hash("pk", KeyType::String)).unwrap();
+    /// mock.transact_write_items(TransactWriteItemsRequest::new(vec![
+    ///     TransactWriteItem::put("users", item([("pk", s("u#1"))])),
+    ///     TransactWriteItem::condition_check("users", item([("pk", s("u#2"))]), "attribute_not_exists(pk)"),
+    /// ]))
+    /// .await
+    /// .unwrap();
+    /// assert_eq!(mock.count("users"), 1);
+    /// # }
+    /// ```
     /// Run an atomic transaction of up to 100 actions.
     ///
     /// # Errors
@@ -1090,6 +1247,25 @@ impl MockDdb {
         Ok(())
     }
 
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, KeySchema, KeyType, MockDdb, TransactGet, TransactGetItemsRequest};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mock = MockDdb::with_table("users", KeySchema::hash("pk", KeyType::String)).unwrap();
+    /// mock.seed("users", vec![item([("pk", s("u#1"))])]).unwrap();
+    /// let response = mock
+    ///     .transact_get_items(TransactGetItemsRequest::new(vec![
+    ///         TransactGet::new("users", item([("pk", s("u#1"))])),
+    ///         TransactGet::new("users", item([("pk", s("u#2"))])),
+    ///     ]))
+    ///     .await
+    ///     .unwrap();
+    /// assert!(response.responses[0].is_some());
+    /// assert!(response.responses[1].is_none());
+    /// # }
+    /// ```
     /// Read up to 100 items atomically. The response keeps request order and
     /// carries `None` for a missing key.
     ///
@@ -1145,6 +1321,20 @@ impl MockDdb {
 
     // -- TTL ----------------------------------------------------------------
 
+    ///
+    /// ```
+    /// use mock_ddb::{KeySchema, KeyType, MockDdb, TimeToLiveStatus, UpdateTimeToLiveRequest};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mock = MockDdb::with_table("users", KeySchema::hash("pk", KeyType::String)).unwrap();
+    /// let description = mock
+    ///     .update_time_to_live(UpdateTimeToLiveRequest::new("users", "expires_at", true))
+    ///     .await
+    ///     .unwrap();
+    /// assert_eq!(description.status, TimeToLiveStatus::Enabled);
+    /// # }
+    /// ```
     /// Enable or disable TTL on a table.
     ///
     /// # Errors
@@ -1192,6 +1382,17 @@ impl MockDdb {
         })
     }
 
+    ///
+    /// ```
+    /// use mock_ddb::{KeySchema, KeyType, MockDdb};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mock = MockDdb::with_table("users", KeySchema::hash("pk", KeyType::String)).unwrap();
+    /// let description = mock.describe_time_to_live("users").await.unwrap();
+    /// assert!(description.attribute_name.is_none());
+    /// # }
+    /// ```
     /// Report a table's TTL configuration.
     ///
     /// # Errors
@@ -1215,6 +1416,21 @@ impl MockDdb {
         })
     }
 
+    ///
+    /// ```
+    /// use mock_ddb::{item, n, s, KeySchema, KeyType, MockDdb, UpdateTimeToLiveRequest};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mock = MockDdb::with_table("users", KeySchema::hash("pk", KeyType::String)).unwrap();
+    /// mock.update_time_to_live(UpdateTimeToLiveRequest::new("users", "expires_at", true))
+    ///     .await
+    ///     .unwrap();
+    /// mock.seed("users", vec![item([("pk", s("u#1")), ("expires_at", n("1"))])])
+    ///     .unwrap();
+    /// assert_eq!(mock.purge_expired("users").unwrap(), 1);
+    /// # }
+    /// ```
     /// Delete every expired item in a table and report how many were removed.
     ///
     /// The real service deletes asynchronously within 48 hours of expiry; the
@@ -1239,6 +1455,22 @@ impl MockDdb {
     /// Every stream ARN, sorted by table name.
     #[cfg(feature = "streams")]
     #[must_use]
+    ///
+    /// ```
+    /// use mock_ddb::{CreateTableRequest, KeySchema, KeyType, MockDdb, StreamViewType};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mock = MockDdb::new();
+    /// mock.create_table(
+    ///     CreateTableRequest::new("users", KeySchema::hash("pk", KeyType::String))
+    ///         .with_stream(StreamViewType::NewImage),
+    /// )
+    /// .await
+    /// .unwrap();
+    /// assert_eq!(mock.list_streams().len(), 1);
+    /// # }
+    /// ```
     pub fn list_streams(&self) -> Vec<String> {
         let inner = self.inner.read();
         inner
@@ -1254,6 +1486,27 @@ impl MockDdb {
     ///
     /// Returns [`Error::ResourceNotFound`] when no table has this stream ARN.
     #[cfg(feature = "streams")]
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, CreateTableRequest, KeySchema, KeyType, MockDdb, PutItemRequest, StreamViewType};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mock = MockDdb::new();
+    /// let table = mock
+    ///     .create_table(
+    ///         CreateTableRequest::new("users", KeySchema::hash("pk", KeyType::String))
+    ///             .with_stream(StreamViewType::NewImage),
+    ///     )
+    ///     .await
+    ///     .unwrap();
+    /// mock.put_item(PutItemRequest::new("users", item([("pk", s("u#1"))])))
+    ///     .await
+    ///     .unwrap();
+    /// let arn = table.latest_stream_arn.unwrap();
+    /// assert_eq!(mock.get_records(&arn).await.unwrap().len(), 1);
+    /// # }
+    /// ```
     pub async fn get_records(&self, stream_arn: &str) -> Result<Vec<StreamRecord>> {
         let inner = self.inner.read();
         for table in inner.tables.values() {

@@ -135,3 +135,52 @@ pub use stream::{StreamEventName, StreamRecord};
 /// The alias is the SDK's own map type, so items flow between production code
 /// and the mock without conversion.
 pub type Item = HashMap<String, AttributeValue>;
+
+/// Wrap an item as an `AttributeValue::M`, the shape DynamoDB uses when an item
+/// (or part of one) is embedded in a document attribute.
+///
+/// ```
+/// use mock_ddb::{item, item_to_value, s, AttributeValue};
+///
+/// let wrapped = item_to_value(item([("pk", s("u#1"))]));
+/// assert!(matches!(wrapped, AttributeValue::M(_)));
+/// ```
+#[must_use]
+pub fn item_to_value(item: Item) -> AttributeValue {
+    AttributeValue::M(item)
+}
+
+/// Unwrap an `AttributeValue::M` back into an item. Returns `None` for any
+/// other value type, so a caller cannot mistake a scalar for a document.
+///
+/// ```
+/// use mock_ddb::{s, item_from_value, AttributeValue};
+///
+/// let document = AttributeValue::M(std::collections::HashMap::from([(
+///     "pk".to_string(),
+///     s("u#1"),
+/// )]));
+/// assert_eq!(item_from_value(&document).map(|item| item.len()), Some(1));
+/// assert!(item_from_value(&s("scalar")).is_none());
+/// ```
+#[must_use]
+pub fn item_from_value(value: &AttributeValue) -> Option<Item> {
+    match value {
+        AttributeValue::M(entries) => Some(entries.clone()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn items_convert_to_maps_and_back() {
+        let record = request::item([("pk", s("u#1")), ("n", n("2"))]);
+        let wrapped = item_to_value(record.clone());
+        assert!(matches!(wrapped, AttributeValue::M(_)));
+        assert_eq!(item_from_value(&wrapped), Some(record));
+        assert_eq!(item_from_value(&s("scalar")), None);
+    }
+}

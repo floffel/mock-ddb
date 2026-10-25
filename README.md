@@ -127,7 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | Transactions | `transact_write_items` (100 actions: `Put`, `Update`, `Delete`, `ConditionCheck`; atomic; per-member cancellation reasons; `ClientRequestToken` idempotency), `transact_get_items` |
 | TTL | `update_time_to_live`, `describe_time_to_live`, lazy expiry on every read path, `purge_expired` |
 | Streams | one ordered log per table, `get_records`, `list_streams`, `NEW_IMAGE` / `OLD_IMAGE` / `NEW_AND_OLD_IMAGES` / `KEYS_ONLY` (feature `streams`, on by default) |
-| Test helpers | `seed`, `dump`, `count`, `clear`, `set_clock`, `purge_expired` |
+| Test helpers | `seed`, `dump`, `count`, `clear`, `set_clock`, `purge_expired`, `item_to_value` / `item_from_value` for embedding an item as `AttributeValue::M` |
 
 ### Expressions
 
@@ -275,10 +275,11 @@ cargo +nightly fuzz run parse_expression -- -max_total_time=60
 cargo +nightly fuzz run random_items -- -max_total_time=60
 ```
 
-- 230 tests (184 test functions plus 47 doctests): unit tests per module, an integration suite per area
+- 271 tests (189 test functions plus 82 doctests): unit tests per module, an integration suite per area
   (`surface`, `expressions`, `query_scan`, `batch_transact`, `ttl_streams`,
   `edge_cases`, `concurrency`, `coverage`), property tests with `proptest`, and
-  a doctest on every public item.
+  a doctest on every public type, every operation and every error method.
+  Builder setters are exercised by their request type's example.
 - Line coverage is 97 %+ with all features on (`cargo llvm-cov --all-features`).
 - Two fuzz targets: `parse_expression` (the condition/update/projection
   parsers and evaluators) and `random_items` (arbitrary attribute trees through

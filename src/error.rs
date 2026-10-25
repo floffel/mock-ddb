@@ -104,6 +104,13 @@ pub enum Error {
 impl Error {
     /// The DynamoDB error code for this failure.
     #[must_use]
+    ///
+    /// ```
+    /// use mock_ddb::Error;
+    ///
+    /// assert_eq!(Error::validation("bad").code(), "ValidationException");
+    /// assert_eq!(Error::table_not_found("users").code(), "ResourceNotFoundException");
+    /// ```
     pub fn code(&self) -> &'static str {
         match self {
             Self::ResourceNotFound { .. } => "ResourceNotFoundException",
@@ -125,6 +132,18 @@ impl Error {
     /// [`CancellationReasonCode::TransactionConflict`], which the real service
     /// does ask clients to retry.
     #[must_use]
+    ///
+    /// ```
+    /// use mock_ddb::{CancellationReason, CancellationReasonCode, Error};
+    ///
+    /// let reason = CancellationReason::new(CancellationReasonCode::TransactionConflict, "conflict");
+    /// let cancelled = Error::TransactionCanceled {
+    ///     message: "cancelled".to_string(),
+    ///     reasons: vec![reason],
+    /// };
+    /// assert!(cancelled.is_retryable());
+    /// assert!(!Error::validation("bad").is_retryable());
+    /// ```
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::TransactionCanceled { reasons, .. } => reasons
@@ -136,12 +155,32 @@ impl Error {
 
     /// Whether this is a rejected condition rather than a malformed request.
     #[must_use]
+    ///
+    /// ```
+    /// use mock_ddb::Error;
+    ///
+    /// assert!(!Error::validation("bad").is_conditional_check_failed());
+    /// ```
     pub fn is_conditional_check_failed(&self) -> bool {
         matches!(self, Self::ConditionalCheckFailed { .. })
     }
 
     /// The cancellation reasons of a cancelled transaction, or an empty slice.
     #[must_use]
+    ///
+    /// ```
+    /// use mock_ddb::{CancellationReason, CancellationReasonCode, Error};
+    ///
+    /// let cancelled = Error::TransactionCanceled {
+    ///     message: "cancelled".to_string(),
+    ///     reasons: vec![CancellationReason::new(
+    ///         CancellationReasonCode::ConditionalCheckFailed,
+    ///         "no",
+    ///     )],
+    /// };
+    /// assert_eq!(cancelled.cancellation_reasons().len(), 1);
+    /// assert_eq!(Error::validation("bad").cancellation_reasons().len(), 0);
+    /// ```
     pub fn cancellation_reasons(&self) -> &[CancellationReason] {
         match self {
             Self::TransactionCanceled { reasons, .. } => reasons,
@@ -180,6 +219,12 @@ impl Error {
 
     /// Build an `InternalServerError`.
     #[must_use]
+    ///
+    /// ```
+    /// use mock_ddb::Error;
+    ///
+    /// assert_eq!(Error::internal("bug").code(), "InternalServerError");
+    /// ```
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal {
             message: message.into(),
@@ -227,6 +272,14 @@ impl CancellationReason {
 
     /// Attach the item image reported with the reason.
     #[must_use]
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, CancellationReason, CancellationReasonCode};
+    ///
+    /// let reason = CancellationReason::new(CancellationReasonCode::None, "")
+    ///     .with_item(Some(item([("pk", s("u#1"))])));
+    /// assert!(reason.item.is_some());
+    /// ```
     pub fn with_item(mut self, item: Option<Item>) -> Self {
         self.item = item;
         self
@@ -254,6 +307,13 @@ pub enum CancellationReasonCode {
 impl CancellationReasonCode {
     /// The code string the service uses.
     #[must_use]
+    ///
+    /// ```
+    /// use mock_ddb::CancellationReasonCode;
+    ///
+    /// assert_eq!(CancellationReasonCode::ConditionalCheckFailed.as_str(), "ConditionalCheckFailed");
+    /// assert_eq!(CancellationReasonCode::None.to_string(), "None");
+    /// ```
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ConditionalCheckFailed => "ConditionalCheckFailed",

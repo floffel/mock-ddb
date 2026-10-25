@@ -47,6 +47,14 @@ pub enum StreamEventName {
 impl StreamEventName {
     /// The name the service uses: `INSERT`, `MODIFY`, `REMOVE`.
     #[must_use]
+    ///
+    /// ```
+    /// use mock_ddb::StreamEventName;
+    ///
+    /// assert_eq!(StreamEventName::Insert.as_str(), "INSERT");
+    /// assert_eq!(StreamEventName::Modify.as_str(), "MODIFY");
+    /// assert_eq!(StreamEventName::Remove.as_str(), "REMOVE");
+    /// ```
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Insert => "INSERT",

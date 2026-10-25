@@ -79,6 +79,13 @@ pub struct ConditionExpression {
 }
 
 impl ConditionExpression {
+    ///
+    /// ```
+    /// use mock_ddb::ConditionExpression;
+    ///
+    /// assert!(ConditionExpression::parse("attribute_exists(pk)").is_ok());
+    /// assert!(ConditionExpression::parse("attribute_exists(").is_err());
+    /// ```
     /// Parse a condition expression.
     ///
     /// # Errors
@@ -92,6 +99,17 @@ impl ConditionExpression {
         })
     }
 
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use mock_ddb::{s, ConditionExpression, Item};
+    ///
+    /// let condition = ConditionExpression::parse("pk = :pk").unwrap();
+    /// let mut item = Item::new();
+    /// item.insert("pk".into(), s("u#1"));
+    /// let values = HashMap::from([(":pk".to_string(), s("u#1"))]);
+    /// assert!(condition.evaluate(Some(&item), &HashMap::new(), &values).unwrap());
+    /// ```
     /// Evaluate against an item. `None` means "the item does not exist", which
     /// is what makes `attribute_not_exists(pk)` true on a create.
     ///
@@ -162,6 +180,19 @@ impl UpdateExpression {
         })
     }
 
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use mock_ddb::{n, Item, UpdateExpression};
+    ///
+    /// let update = UpdateExpression::parse("SET v = :v").unwrap();
+    /// let mut item = Item::new();
+    /// let touched = update
+    ///     .apply(&mut item, &HashMap::new(), &HashMap::from([(":v".to_string(), n("1"))]))
+    ///     .unwrap();
+    /// assert!(touched.contains("v"));
+    /// assert_eq!(item.get("v"), Some(&n("1")));
+    /// ```
     /// Apply to an item, returning the top-level attributes the expression
     /// touched.
     ///
@@ -239,6 +270,18 @@ impl ProjectionExpression {
         })
     }
 
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use mock_ddb::{s, Item, ProjectionExpression};
+    ///
+    /// let projection = ProjectionExpression::parse("pk").unwrap();
+    /// let mut item = Item::new();
+    /// item.insert("pk".into(), s("u#1"));
+    /// item.insert("secret".into(), s("x"));
+    /// let projected = projection.project(&item, &HashMap::new()).unwrap();
+    /// assert_eq!(projected.len(), 1);
+    /// ```
     /// Keep only the projected attributes.
     ///
     /// A path that runs into a list index contributes the whole list, because
