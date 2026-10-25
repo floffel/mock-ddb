@@ -22,6 +22,32 @@ pub(crate) struct Number {
 /// DynamoDB's documented maximum significant digits.
 const MAX_SIGNIFICANT_DIGITS: usize = 38;
 
+/// Smallest magnitude DynamoDB stores, as `digits.len() + exponent`.
+///
+/// The documented floor is `1E-130`: one significant digit with exponent
+/// `-130` gives `-129`. Anything below that is rejected by the service.
+const MIN_ORDER: i64 = -129;
+
+/// Largest magnitude DynamoDB stores, as `digits.len() + exponent`.
+///
+/// The documented ceiling is `9.99…E+125` (38 nines): 38 digits with exponent
+/// `88` gives `126`. `127` would be `1E+126`, which the service rejects.
+const MAX_ORDER: i64 = 126;
+
+/// Longest run of padding zeros [`Number::to_plain_string`] will produce.
+///
+/// The documented range covers it exactly: `1E+125` pads 125 zeros and
+/// `1E-130` pads 129. A number that needs more is not storable, and the
+/// formatter returns `None` instead of allocating it — a 5-byte input such as
+/// `1e2147483647` would otherwise ask for gigabytes.
+const MAX_PADDING: usize = 130;
+
+/// Furthest apart two exponents may be before [`Number::add`] gives up.
+///
+/// Aligning the operands means materialising the gap as zeros; DynamoDB's own
+/// exponent range keeps real values well inside this.
+const MAX_ALIGNMENT_SHIFT: i64 = 400;
+
 impl Number {
     /// Parse a DynamoDB number string. `None` means the string is not a number.
     pub(crate) fn parse(text: &str) -> Option<Self> {
@@ -87,6 +113,20 @@ impl Number {
         self.digits.len()
     }
 
+    /// The value's order of magnitude: `digits.len() + exponent`, i.e. the
+    /// power of ten just below the magnitude.
+    ///
+    /// Zero has no order of magnitude; callers check [`Self::is_zero`] first.
+    fn order(&self) -> i64 {
+        i64::try_from(self.digits.len()).unwrap_or(i64::MAX) + i64::from(self.exponent)
+    }
+
+    /// Whether the value fits DynamoDB's documented exponent range
+    /// (`1E-130` … `9.99…E+125`).
+    fn in_documented_range(&self) -> bool {
+        self.is_zero() || (MIN_ORDER..=MAX_ORDER).contains(&self.order())
+    }
+
     /// A canonical string identifying the value: `43`, `-15E-1`, `0`.
     ///
     /// Two numbers are equal exactly when their canonical forms match, which is
@@ -123,12 +163,19 @@ impl Number {
     /// for stored values, and returning `None` keeps a hostile expression from
     /// exhausting memory.
     pub(crate) fn add(&self, other: &Self) -> Option<Self> {
-        let exponent = self.exponent.min(other.exponent);
-        let left_shift = usize::try_from(self.exponent - exponent).ok()?;
-        let right_shift = usize::try_from(other.exponent - exponent).ok()?;
-        if left_shift > 400 || right_shift > 400 {
+        // Difference in `i64`: two accepted `i32` exponents can be further
+        // apart than `i32` itself can express (`i32::MAX - i32::MIN`), and the
+        // subtraction used to overflow before the shift guard below ran.
+        let base = i64::from(self.exponent).min(i64::from(other.exponent));
+        let left_shift = i64::from(self.exponent) - base;
+        let right_shift = i64::from(other.exponent) - base;
+        if left_shift > MAX_ALIGNMENT_SHIFT || right_shift > MAX_ALIGNMENT_SHIFT {
             return None;
         }
+        let left_shift = usize::try_from(left_shift).ok()?;
+        let right_shift = usize::try_from(right_shift).ok()?;
+        // The smaller of two `i32`s is one of them, so it always fits.
+        let exponent = self.exponent.min(other.exponent);
         let left = format!("{}{}", self.digits, "0".repeat(left_shift));
         let right = format!("{}{}", other.digits, "0".repeat(right_shift));
         let left = if left.is_empty() {
@@ -190,36 +237,48 @@ impl Number {
     }
 
     /// Format the number the way DynamoDB stores it (no exponent notation).
-    pub(crate) fn to_plain_string(&self) -> String {
+    ///
+    /// `None` when rendering would need more than [`MAX_PADDING`] zeros — the
+    /// value is outside DynamoDB's range, so it is not storable and there is
+    /// nothing useful to render. Returning `None` keeps a 5-byte input like
+    /// `1e2147483647` from asking for gigabytes of zero padding.
+    pub(crate) fn to_plain_string(&self) -> Option<String> {
         if self.is_zero() {
-            return "0".to_string();
+            return Some("0".to_string());
         }
         let sign = if self.negative { "-" } else { "" };
         if self.exponent >= 0 {
-            let zeros = usize::try_from(self.exponent).unwrap_or_default();
-            format!("{sign}{}{}", self.digits, "0".repeat(zeros))
+            let zeros = usize::try_from(self.exponent).ok()?;
+            if zeros > MAX_PADDING {
+                return None;
+            }
+            Some(format!("{sign}{}{}", self.digits, "0".repeat(zeros)))
         } else {
-            let scale = self.exponent.unsigned_abs() as usize;
+            // `unsigned_abs` keeps `i32::MIN` from overflowing.
+            let scale = usize::try_from(self.exponent.unsigned_abs()).ok()?;
+            if scale > MAX_PADDING {
+                return None;
+            }
             if scale < self.digits.len() {
                 let split = self.digits.len() - scale;
-                format!("{sign}{}.{}", &self.digits[..split], &self.digits[split..])
+                Some(format!(
+                    "{sign}{}.{}",
+                    &self.digits[..split],
+                    &self.digits[split..]
+                ))
             } else {
-                format!(
+                Some(format!(
                     "{sign}0.{}{}",
                     "0".repeat(scale - self.digits.len()),
                     self.digits
-                )
+                ))
             }
         }
     }
 
     /// Compare the magnitudes (absolute values) of two numbers.
     fn magnitude_cmp(&self, other: &Self) -> Ordering {
-        let self_order =
-            i64::try_from(self.digits.len()).unwrap_or(i64::MAX) + i64::from(self.exponent);
-        let other_order =
-            i64::try_from(other.digits.len()).unwrap_or(i64::MAX) + i64::from(other.exponent);
-        self_order.cmp(&other_order).then_with(|| {
+        self.order().cmp(&other.order()).then_with(|| {
             let width = self.digits.len().max(other.digits.len());
             let mut left = self.digits.bytes();
             let mut right = other.digits.bytes();
@@ -286,9 +345,12 @@ impl Ord for Number {
 
 /// Validate a number string against DynamoDB's documented limits.
 ///
-/// The service rejects numbers with more than 38 significant digits, so the
-/// mock does too: a test written against an out-of-range number should fail
-/// here rather than pass and fail in production.
+/// The service rejects numbers with more than 38 significant digits and
+/// numbers outside `1E-130` … `9.99…E+125`, so the mock does too: a test
+/// written against an out-of-range number should fail here rather than pass
+/// and fail in production. The exponent check is also what keeps
+/// `1e2147483647` from reaching [`Number::to_plain_string`] with a padding
+/// request that no machine can satisfy.
 pub(crate) fn validate(text: &str) -> crate::Result<()> {
     let Some(number) = Number::parse(text) else {
         return Err(crate::Error::validation(format!(
@@ -298,6 +360,11 @@ pub(crate) fn validate(text: &str) -> crate::Result<()> {
     if number.significant_digits() > MAX_SIGNIFICANT_DIGITS {
         return Err(crate::Error::validation(format!(
             "Attempting to store more than {MAX_SIGNIFICANT_DIGITS} significant digits in a Number: {text}"
+        )));
+    }
+    if !number.in_documented_range() {
+        return Err(crate::Error::validation(format!(
+            "Attempting to store a Number outside the supported exponent range (1E-130 to 9.99E+125): {text}"
         )));
     }
     Ok(())
@@ -437,6 +504,101 @@ mod tests {
     }
 
     #[test]
+    fn validate_bounds_the_exponent_to_the_documented_range() {
+        // Inside: 1E-130 (order -129) through 9.99…E+125 (order 126).
+        assert!(validate("1e-130").is_ok());
+        assert!(validate("1e125").is_ok());
+        assert!(validate(&format!("{}e88", "9".repeat(38))).is_ok());
+
+        // One step outside on each end: 1E-131 (order -130) and 1E+126
+        // (order 127).
+        assert!(validate("1e-131").is_err());
+        assert!(validate("1e126").is_err());
+        assert!(validate(&format!("{}e89", "9".repeat(38))).is_err());
+
+        // The hostile value from the audit: accepted before, and then the
+        // formatter asked for 2^31 zeros.
+        let error = validate("1e2147483647").unwrap_err();
+        assert!(error.to_string().contains("exponent range"), "{error}");
+        assert!(validate("-1e2147483647").is_err());
+    }
+
+    #[test]
+    fn plain_string_refuses_absurd_padding() {
+        // Hostile exponents are refused instead of allocated.
+        let huge = Number::parse("1e2147483647").unwrap();
+        assert_eq!(huge.to_plain_string(), None);
+        let tiny = Number::parse("1e-2147480000").unwrap();
+        assert_eq!(tiny.to_plain_string(), None);
+
+        // Boundary pair on the padding limit: 130 zeros render, 131 do not.
+        let at_limit = Number {
+            negative: false,
+            digits: "1".to_string(),
+            exponent: 130,
+        };
+        assert_eq!(at_limit.to_plain_string().unwrap().len(), 131);
+        let past_limit = Number {
+            negative: false,
+            digits: "1".to_string(),
+            exponent: 131,
+        };
+        assert_eq!(past_limit.to_plain_string(), None);
+
+        // Same on the fractional side: a scale of 130 pads 129 zeros, 131 is
+        // refused.
+        let fraction_limit = Number {
+            negative: false,
+            digits: "1".to_string(),
+            exponent: -130,
+        };
+        assert_eq!(
+            fraction_limit.to_plain_string().unwrap(),
+            format!("0.{}1", "0".repeat(129))
+        );
+        let fraction_past = Number {
+            negative: false,
+            digits: "1".to_string(),
+            exponent: -131,
+        };
+        assert_eq!(fraction_past.to_plain_string(), None);
+
+        // Everything DynamoDB accepts still renders.
+        assert_eq!(
+            Number::parse("1e125")
+                .unwrap()
+                .to_plain_string()
+                .unwrap()
+                .len(),
+            126
+        );
+    }
+
+    #[test]
+    fn arithmetic_survives_extreme_exponents() {
+        // `i32::MAX - i32::MIN` does not fit in `i32`: the subtraction used to
+        // panic in debug builds before the shift guard could reject the pair.
+        let max = Number::parse("1e2147483647").expect("exponent i32::MAX is accepted");
+        let min = Number::parse("1e-2147483648").expect("exponent i32::MIN is accepted");
+        assert!(max.add(&min).is_none());
+        assert!(min.add(&max).is_none());
+        assert!(max.sub(&min).is_none());
+        assert!(min.sub(&max).is_none());
+        // Same exponent on both sides needs no alignment at all, so it is not
+        // the guard's business — it must simply not panic.
+        assert!(max.add(&max).is_some());
+        assert!(min.add(&min).is_some());
+
+        // Boundary pair for the alignment guard itself: a gap of 400 is still
+        // aligned, 401 is not.
+        let unit = Number::parse("1").unwrap();
+        let at_limit = Number::parse("1e400").unwrap();
+        assert!(unit.add(&at_limit).is_some());
+        let past_limit = Number::parse("1e401").unwrap();
+        assert!(unit.add(&past_limit).is_none());
+    }
+
+    #[test]
     fn arithmetic_is_exact() {
         let add = |left: &str, right: &str| {
             Number::parse(left)
@@ -444,6 +606,7 @@ mod tests {
                 .add(&Number::parse(right).unwrap())
                 .unwrap()
                 .to_plain_string()
+                .expect("renderable")
         };
         assert_eq!(add("1", "2"), "3");
         assert_eq!(add("1.5", "1.5"), "3");
@@ -459,6 +622,7 @@ mod tests {
                 .sub(&Number::parse(right).unwrap())
                 .unwrap()
                 .to_plain_string()
+                .expect("renderable")
         };
         assert_eq!(sub("3", "2"), "1");
         assert_eq!(sub("2", "3"), "-1");
@@ -492,19 +656,19 @@ mod tests {
             .unwrap()
             .add(&Number::parse("0").unwrap())
             .unwrap();
-        assert_eq!(zero.to_plain_string(), "5");
+        assert_eq!(zero.to_plain_string().as_deref(), Some("5"));
         let sum = Number::parse("0.0")
             .unwrap()
             .add(&Number::parse("0.00").unwrap())
             .unwrap();
-        assert_eq!(sum.to_plain_string(), "0");
+        assert_eq!(sum.to_plain_string().as_deref(), Some("0"));
     }
 
     #[test]
     fn plain_string_round_trips() {
         for text in ["0", "1", "-1", "1.5", "-0.25", "1000000", "0.001"] {
             let number = Number::parse(text).unwrap();
-            assert_eq!(number.to_plain_string(), text);
+            assert_eq!(number.to_plain_string().as_deref(), Some(text));
         }
     }
 }

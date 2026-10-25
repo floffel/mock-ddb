@@ -150,6 +150,46 @@ async fn number_precision_and_ordering() {
 }
 
 #[tokio::test]
+async fn exponents_outside_the_documented_range_are_rejected() {
+    let mock = numbers();
+    let put = |key: &'static str, value: String| {
+        let mock = &mock;
+        async move {
+            mock.put_item(PutItemRequest::new(
+                "numbers",
+                item([("pk", s("exp")), ("sk", n(key)), ("v", n(&value))]),
+            ))
+            .await
+        }
+    };
+
+    // Just inside the documented range at both ends: 1E-130 and 9.99…E+125.
+    put("1", "1e-130".to_string())
+        .await
+        .expect("1E-130 is storable");
+    put("2", "1e125".to_string())
+        .await
+        .expect("1E+125 is storable");
+    put("3", format!("{}e88", "9".repeat(38)))
+        .await
+        .expect("9.99…E+125 is storable");
+
+    // One step outside at both ends.
+    for (key, value) in [("4", "1e-131"), ("5", "1e126")] {
+        let error = put(key, value.to_string()).await.expect_err("out of range");
+        assert!(error.to_string().contains("exponent range"), "{error}");
+    }
+
+    // The audit's hostile value: a five-byte number that used to be accepted
+    // and then asked the formatter for 2^31 zeros. It must be a validation
+    // error, and it must arrive without allocating.
+    let error = put("6", "1e2147483647".to_string())
+        .await
+        .expect_err("out of range");
+    assert!(error.to_string().contains("exponent range"), "{error}");
+}
+
+#[tokio::test]
 async fn large_numbers_compare_without_losing_precision() {
     let mock = numbers();
     let a = "10000000000000000000000000000000000001";

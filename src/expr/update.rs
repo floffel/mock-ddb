@@ -196,7 +196,10 @@ fn arithmetic(
         left.add(&right)
     }
     .ok_or_else(|| Error::validation("Invalid UpdateExpression: number out of range"))?;
-    Ok(AttributeValue::N(result.to_plain_string()))
+    let rendered = result
+        .to_plain_string()
+        .ok_or_else(|| Error::validation("Invalid UpdateExpression: number out of range"))?;
+    Ok(AttributeValue::N(rendered))
 }
 
 /// `ADD` semantics: numbers add, sets union.
@@ -211,7 +214,10 @@ fn add_values(current: &AttributeValue, delta: &AttributeValue) -> Result<Attrib
             let sum = left.add(&right).ok_or_else(|| {
                 Error::validation("Invalid UpdateExpression: number out of range")
             })?;
-            Ok(AttributeValue::N(sum.to_plain_string()))
+            let rendered = sum.to_plain_string().ok_or_else(|| {
+                Error::validation("Invalid UpdateExpression: number out of range")
+            })?;
+            Ok(AttributeValue::N(rendered))
         }
         _ => set_union(current, delta).ok_or_else(|| add_type_error(delta)),
     }
