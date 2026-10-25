@@ -154,6 +154,29 @@ async fn purge_removes_expired_rows() {
 }
 
 #[tokio::test]
+async fn an_expired_item_is_not_returned_as_the_old_value() {
+    let (mock, _clock) = ttl_table().await;
+    mock.seed(
+        "sessions",
+        vec![item([("pk", s("u#1")), ("expires_at", n("999999"))])],
+    )
+    .unwrap();
+
+    let replaced = mock
+        .put_item(
+            PutItemRequest::new("sessions", item([("pk", s("u#1"))]))
+                .with_return_values(mock_ddb::ReturnValues::AllOld),
+        )
+        .await
+        .unwrap();
+    assert!(
+        replaced.attributes.is_none(),
+        "the expired row is logically absent"
+    );
+    assert_eq!(mock.count("sessions"), 1);
+}
+
+#[tokio::test]
 async fn disabled_ttl_keeps_expired_items_visible() {
     let (mock, _clock) = clocked();
     mock.create_table(CreateTableRequest::new(

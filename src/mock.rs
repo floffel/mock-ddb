@@ -421,7 +421,9 @@ impl MockDdb {
         table.on_put(previous_live.as_ref(), &request.item);
         Ok(PutItemOutput {
             attributes: match request.return_values {
-                ReturnValues::AllOld => previous,
+                // An expired item is logically absent, so it is not "the old
+                // value" even though its row is still in the store.
+                ReturnValues::AllOld => previous_live,
                 _ => None,
             },
         })
