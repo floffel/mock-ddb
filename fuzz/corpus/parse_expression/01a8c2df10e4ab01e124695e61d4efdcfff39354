@@ -1,1 +1,0 @@
-SET c = v, b[0] = :w REMOVE c ADD d :n DELETE e AN

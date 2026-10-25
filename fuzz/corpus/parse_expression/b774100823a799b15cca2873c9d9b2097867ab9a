@@ -1,1 +1,0 @@
-NOT (e = :v OR  (e = :v OR NOT (e = :v OR  (e = :v OR b< > :w)
