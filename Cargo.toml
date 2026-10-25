@@ -1,0 +1,40 @@
+[package]
+name = "mock-ddb"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "Apache-2.0 OR MIT"
+description = "In-process DynamoDB mock for Rust tests: tables, expressions, queries, batches, transactions, TTL and streams"
+repository = "https://github.com/floffel/mock-ddb"
+documentation = "https://docs.rs/mock-ddb"
+keywords = ["dynamodb", "mock", "testing", "aws", "in-memory"]
+categories = ["development-tools::testing"]
+readme = "README.md"
+exclude = [".github/**", "deny.toml", "fuzz/**"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = ["streams"]
+# Emulation of DynamoDB Streams: stream ARNs on create, records on every
+# mutation, and a `get_records` reader. Off by default for callers that only
+# need the table surface.
+streams = []
+
+[dependencies]
+aws-sdk-dynamodb = { version = "1.51", default-features = false }
+parking_lot = "0.12"
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
