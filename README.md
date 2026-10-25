@@ -215,9 +215,11 @@ that changes what a caller must do is called out.
 12. **Parallel scan segments are hash-based.** Items are assigned to a segment
     by an FNV-1a hash of the primary key, so segments are disjoint and stable
     across runs; the service's split is internal.
-13. **Numbers are exact decimals.** 38 significant digits are enforced, `"1.0"`
-    and `"1"` are the same value (and the same key), and arithmetic is exact —
-    no `f64` rounding.
+13. **Numbers are exact decimals.** 38 significant digits and the documented
+    exponent range (`1E-130` … `9.99E+125`) are enforced, `"1.0"` and `"1"` are
+    the same value (and the same key), and arithmetic is exact — no `f64`
+    rounding. A number outside the range is a validation error, never an
+    oversized allocation.
 14. **Reserved-word quoting uses placeholders.** DynamoDB's reserved-word list
     is not modelled: a bare attribute name is accepted whenever it is not a
     keyword of the expression grammar itself (`AND`, `BETWEEN`, `SET`, …). Use
