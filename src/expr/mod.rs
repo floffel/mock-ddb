@@ -271,6 +271,23 @@ pub struct ProjectionExpression {
 }
 
 impl ProjectionExpression {
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use mock_ddb::{s, Error, Item, ProjectionExpression};
+    ///
+    /// let projection = ProjectionExpression::parse("pk, profile.city").unwrap();
+    /// let mut item = Item::new();
+    /// item.insert("pk".into(), s("u#1"));
+    /// item.insert("secret".into(), s("x"));
+    ///
+    /// let projected = projection.project(&item, &HashMap::new()).unwrap();
+    /// assert_eq!(projected.get("pk"), Some(&s("u#1")));
+    /// assert!(!projected.contains_key("secret"));
+    ///
+    /// let error = ProjectionExpression::parse("").unwrap_err();
+    /// assert!(matches!(error, Error::Validation { .. }));
+    /// ```
     /// Parse a comma-separated list of document paths.
     ///
     /// At most 100 paths are accepted (`MAX_PROJECTION_PATHS`); a longer list
