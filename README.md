@@ -227,6 +227,11 @@ that changes what a caller must do is called out.
 15. **Table names are validated** against the documented pattern and length
     (3–255 characters, `[a-zA-Z0-9_.-]+`), so a test cannot pass with a name the
     service would reject.
+16. **Expression text is capped at 4 KB, the operator ceiling is not.** A
+    `ConditionExpression`, `UpdateExpression` or `ProjectionExpression` longer
+    than the service's 4 KB is a `ValidationException` before it is parsed, so
+    one oversized parameter cannot make the mock do unbounded work. The separate
+    300-operator limit on an expression is not counted yet (#99).
 
 ## Not modelled at all
 

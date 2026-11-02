@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Every expression parameter is capped at the service's 4 KB of text, and the
+  overlap check on an update expression now sorts the written paths and compares
+  neighbours instead of every pair. A single `REMOVE a0, a1, …` naming 20 000
+  paths used to cost ~2·10^8 `is_prefix` calls and can no longer run a Lambda
+  out of time before any validation error is possible: the scan is `O(n log n)`
+  and an oversized expression is rejected before it is even tokenized.
 - A `ProjectionExpression` now follows a document path to its end instead of
   stopping at the first list index. `items[0].v` returns the element at index 0
   with only `v` instead of every element of `items` with every field, so a test

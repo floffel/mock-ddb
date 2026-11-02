@@ -5,7 +5,8 @@ mod common;
 use mock_ddb::{
     item, n, s, values, AttributeValue, Blob, ConditionExpression, CreateTableRequest,
     DeleteItemRequest, GetItemRequest, KeySchema, KeyType, ListTablesRequest, MockDdb,
-    PutItemRequest, QueryRequest, ReturnValues, ScanRequest, Select, UpdateItemRequest,
+    PutItemRequest, QueryRequest, ReturnValues, ScanRequest, Select, UpdateExpression,
+    UpdateItemRequest,
 };
 
 fn numbers() -> MockDdb {
@@ -336,6 +337,24 @@ async fn deeply_nested_maps_round_trip() {
     )
     .await
     .unwrap();
+}
+
+#[test]
+fn expression_size_cap_is_enforced() {
+    // The service caps one expression parameter at 4 KB of text: 4096 bytes is
+    // accepted, 4097 is not, and the bound holds for every expression type.
+    let names: Vec<String> = (0..600).map(|index| format!("a{index:03}")).collect();
+    let fitting = format!("REMOVE {}", names.join(", "));
+    let padded = format!("{fitting}{}", " ".repeat(4 * 1024 - fitting.len()));
+    assert_eq!(padded.len(), 4096);
+    assert!(UpdateExpression::parse(&padded).is_ok());
+    assert!(UpdateExpression::parse(&format!("{padded} ")).is_err());
+    assert!(ConditionExpression::parse(&" ".repeat(4 * 1024 + 1)).is_err());
+
+    // Paths that only share a prefix are siblings; a path that extends another
+    // one overlaps it, wherever the two sit in the expression.
+    assert!(UpdateExpression::parse("REMOVE ab, a, ac").is_ok());
+    assert!(UpdateExpression::parse("SET a.b = :v, c = :w REMOVE a").is_err());
 }
 
 #[tokio::test]
