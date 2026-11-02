@@ -176,8 +176,10 @@ pub(crate) enum SetValue {
     Minus(Box<Self>, Box<Self>),
     /// `if_not_exists(path, fallback)`
     IfNotExists(Path, Box<Self>),
-    /// `list_append(first, second)`
-    ListAppend(Operand, Operand),
+    /// `list_append(first, second)`. Both arguments are full set values, so
+    /// `list_append(if_not_exists(items, :empty), :more)` and nested
+    /// `list_append` calls parse the same way DynamoDB accepts them.
+    ListAppend(Box<Self>, Box<Self>),
 }
 
 /// One update clause.
@@ -700,11 +702,11 @@ impl<'a> Parser<'a> {
         if self.peek_keyword("list_append") && self.peek_at(1) == Some(&Token::LParen) {
             self.advance();
             self.advance();
-            let first = self.operand()?;
+            let first = self.term()?;
             self.expect(&Token::Comma)?;
-            let second = self.operand()?;
+            let second = self.term()?;
             self.expect(&Token::RParen)?;
-            return Ok(SetValue::ListAppend(first, second));
+            return Ok(SetValue::ListAppend(Box::new(first), Box::new(second)));
         }
         Ok(SetValue::Operand(self.operand()?))
     }

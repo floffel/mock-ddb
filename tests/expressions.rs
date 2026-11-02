@@ -451,6 +451,101 @@ fn arithmetic_and_list_append_type_errors() {
         .is_err());
 }
 
+#[tokio::test]
+async fn list_append_accepts_function_arguments() {
+    let mock = users();
+    mock.put_item(PutItemRequest::new("users", rich_item()))
+        .await
+        .unwrap();
+
+    // The list exists: `if_not_exists` keeps it and the append still happens.
+    mock.update_item(
+        UpdateItemRequest::new(
+            "users",
+            item([("pk", s("u#1"))]),
+            "SET items = list_append(if_not_exists(items, :empty), :more)",
+        )
+        .with_values(values([
+            (":empty", AttributeValue::L(Vec::new())),
+            (":more", AttributeValue::L(vec![s("third")])),
+        ])),
+    )
+    .await
+    .unwrap();
+    let stored = mock
+        .get_item(GetItemRequest::new("users", item([("pk", s("u#1"))])))
+        .await
+        .unwrap()
+        .item
+        .unwrap();
+    assert_eq!(
+        stored.get("items"),
+        Some(&AttributeValue::L(vec![
+            s("first"),
+            s("second"),
+            s("third")
+        ]))
+    );
+
+    // The list is missing: the fallback seeds it, so the append creates it.
+    mock.update_item(
+        UpdateItemRequest::new(
+            "users",
+            item([("pk", s("u#1"))]),
+            "SET created = list_append(if_not_exists(created, :empty), :more)",
+        )
+        .with_values(values([
+            (":empty", AttributeValue::L(Vec::new())),
+            (":more", AttributeValue::L(vec![s("fourth")])),
+        ])),
+    )
+    .await
+    .unwrap();
+    // Nested `list_append` calls append both lists in order.
+    mock.update_item(
+        UpdateItemRequest::new(
+            "users",
+            item([("pk", s("u#1"))]),
+            "SET items = list_append(list_append(items, :third), :more)",
+        )
+        .with_values(values([
+            (":more", AttributeValue::L(vec![s("fourth")])),
+            (":third", AttributeValue::L(vec![s("third")])),
+        ])),
+    )
+    .await
+    .unwrap();
+    let stored = mock
+        .get_item(GetItemRequest::new("users", item([("pk", s("u#1"))])))
+        .await
+        .unwrap()
+        .item
+        .unwrap();
+    assert_eq!(
+        stored.get("created"),
+        Some(&AttributeValue::L(vec![s("fourth")]))
+    );
+    assert_eq!(
+        stored.get("items"),
+        Some(&AttributeValue::L(vec![
+            s("first"),
+            s("second"),
+            s("third"),
+            s("third"),
+            s("fourth")
+        ]))
+    );
+}
+
+#[test]
+fn list_append_rejects_non_function_arguments() {
+    // Arithmetic is not a valid `list_append` argument.
+    assert!(UpdateExpression::parse("SET items = list_append(count + :one, :more)").is_err());
+    // Two arguments are required.
+    assert!(UpdateExpression::parse("SET items = list_append(items)").is_err());
+    assert!(UpdateExpression::parse("SET items = list_append(items, :more, :third)").is_err());
+}
+
 #[test]
 fn projection_expressions_keep_nested_and_list_paths() {
     let item = rich_item();
