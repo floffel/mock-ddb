@@ -309,3 +309,81 @@ fn binary_keys_round_trip() {
             .is_some());
     });
 }
+
+/// One step of a generated document path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TestStep {
+    Name(String),
+    Index(usize),
+}
+
+/// A generated document path; the first step is a name, as the grammar
+/// requires, and later steps may be list indices.
+fn document_path() -> impl Strategy<Value = Vec<TestStep>> {
+    let name = || prop::sample::select(vec!["a", "b", "ab", "ba"]);
+    (
+        name(),
+        prop::collection::vec(
+            prop_oneof![
+                name().prop_map(|word: &'static str| TestStep::Name(word.to_string())),
+                (0usize..3).prop_map(TestStep::Index),
+            ],
+            0..3,
+        ),
+    )
+        .prop_map(|(first, rest)| {
+            let mut steps = vec![TestStep::Name(first.to_string())];
+            steps.extend(rest);
+            steps
+        })
+}
+
+fn render_path(steps: &[TestStep]) -> String {
+    let mut text = String::new();
+    for step in steps {
+        match step {
+            TestStep::Name(name) => {
+                if !text.is_empty() {
+                    text.push('.');
+                }
+                text.push_str(name);
+            }
+            TestStep::Index(index) => {
+                text.push('[');
+                text.push_str(&index.to_string());
+                text.push(']');
+            }
+        }
+    }
+    text
+}
+
+fn is_path_prefix(prefix: &[TestStep], path: &[TestStep]) -> bool {
+    prefix.len() <= path.len() && prefix.iter().zip(path).all(|(left, right)| left == right)
+}
+
+proptest! {
+    /// However the target paths are ordered in the expression, the parser's
+    /// verdict matches an exhaustive pairwise scan — the overlap check is
+    /// allowed to be faster, not laxer.
+    #[test]
+    fn overlap_rejection_matches_a_brute_force_scan(
+        paths in prop::collection::vec(document_path(), 1..12),
+    ) {
+        let rendered: Vec<String> = paths.iter().map(|path| render_path(path)).collect();
+        let expression = format!("REMOVE {}", rendered.join(", "));
+        prop_assume!(expression.len() <= 4096);
+        let expected_overlap = (0..paths.len()).any(|left| {
+            (left + 1..paths.len()).any(|right| {
+                is_path_prefix(&paths[left], &paths[right])
+                    || is_path_prefix(&paths[right], &paths[left])
+            })
+        });
+        prop_assert_eq!(
+            UpdateExpression::parse(&expression).is_ok(),
+            !expected_overlap,
+            "expression `{}`",
+            expression
+        );
+    }
+}

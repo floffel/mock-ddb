@@ -91,8 +91,8 @@ impl ConditionExpression {
     /// # Errors
     ///
     /// Returns [`Error::Validation`](crate::Error::Validation) when the
-    /// expression is empty, malformed, nested too deeply or uses an unknown
-    /// function.
+    /// expression is empty, longer than the service's 4096-byte limit,
+    /// malformed, nested too deeply or uses an unknown function.
     pub fn parse(input: &str) -> Result<Self> {
         Ok(Self {
             condition: parse_condition(input)?,
@@ -172,8 +172,9 @@ impl UpdateExpression {
     /// # Errors
     ///
     /// Returns [`Error::Validation`](crate::Error::Validation) when the
-    /// expression is malformed, repeats a clause, or writes the same document
-    /// path twice.
+    /// expression is longer than the service's 4096-byte limit, malformed,
+    /// repeats a clause, or writes two document paths that overlap — the same
+    /// path, or an attribute and anything below it.
     pub fn parse(input: &str) -> Result<Self> {
         Ok(Self {
             update: parse_update(input)?,
@@ -267,8 +268,8 @@ impl ProjectionExpression {
     /// # Errors
     ///
     /// Returns [`Error::Validation`](crate::Error::Validation) when the
-    /// expression is empty, a path is malformed, or it names more than 100
-    /// document paths.
+    /// expression is empty, longer than the service's 4096-byte limit, a path
+    /// is malformed, or it names more than 100 document paths.
     pub fn parse(input: &str) -> Result<Self> {
         let paths = parse_projection(input)?;
         check_path_count(paths.len())?;

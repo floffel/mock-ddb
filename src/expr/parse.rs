@@ -14,8 +14,21 @@ use crate::{Error, Result};
 /// Maximum nesting depth, so a hostile expression cannot exhaust the stack.
 const MAX_DEPTH: u8 = 64;
 
+/// The most document paths one update expression may write.
+///
+/// The 4096-byte expression limit in `lex` already bounds this: the shortest
+/// entry is a one-character name plus its separator, so no accepted expression
+/// names more than about 2000 paths. The constant states that bound where the
+/// overlap check relies on it — and keeps the check bounded if the size limit
+/// is ever relaxed.
+const MAX_UPDATE_TARGETS: usize = 2048;
+
 /// One step of a document path.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+///
+/// The ordering exists for the overlap check, which sorts paths before
+/// comparing neighbours: it is lexicographic over the steps, so a path sorts
+/// before every longer path it is a prefix of.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum Segment {
     /// A map key or top-level attribute. `#alias` entries are unresolved
     /// placeholders until evaluation.
@@ -290,16 +303,28 @@ pub(crate) fn parse_projection(input: &str) -> Result<Vec<Path>> {
     Ok(paths)
 }
 
-/// Reject two clauses that write overlapping paths, as the service does.
+/// Reject two target paths where one is a prefix of the other, as the service
+/// does.
+///
+/// Sorting first turns this from a quadratic pairwise scan into one pass over
+/// the neighbours: a path that would sort between `a` and a longer path that
+/// starts with `a` has to agree with `a` on every one of its own steps, so it
+/// starts with `a` too and is caught just the same. Equal paths sort next to
+/// each other and are caught by the same test.
 fn validate_no_overlap(update: &Update) -> Result<()> {
-    let paths = update.target_paths();
-    for (index, left) in paths.iter().enumerate() {
-        for right in paths.iter().skip(index + 1) {
-            if is_prefix(left, right) || is_prefix(right, left) {
-                return Err(Error::validation(
-                    "Invalid UpdateExpression: Two document paths overlap with each other; must remove or rewrite one of these paths",
-                ));
-            }
+    let mut paths = update.target_paths();
+    if paths.len() > MAX_UPDATE_TARGETS {
+        return Err(Error::validation(format!(
+            "Invalid UpdateExpression: The expression writes more than {MAX_UPDATE_TARGETS} document paths"
+        )));
+    }
+    paths.sort_unstable();
+    for pair in paths.windows(2) {
+        // Sorted, only the earlier path can prefix the later one.
+        if is_prefix(pair[0], pair[1]) {
+            return Err(Error::validation(
+                "Invalid UpdateExpression: Two document paths overlap with each other; must remove or rewrite one of these paths",
+            ));
         }
     }
     Ok(())
@@ -677,5 +702,73 @@ impl<'a> Parser<'a> {
             return Ok(SetValue::ListAppend(first, second));
         }
         Ok(SetValue::Operand(self.operand()?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `count` distinct top-level paths: `a0`, `a1`, ...
+    fn distinct_paths(count: usize) -> Vec<Path> {
+        (0..count)
+            .map(|index| vec![Segment::Name(format!("a{index}"))])
+            .collect()
+    }
+
+    fn overlap(paths: Vec<Path>) -> Result<()> {
+        validate_no_overlap(&Update {
+            clauses: vec![UpdateClause::Remove(paths)],
+        })
+    }
+
+    fn name(text: &str) -> Segment {
+        Segment::Name(text.to_string())
+    }
+
+    #[test]
+    fn accepts_the_target_path_limit_and_rejects_one_more() {
+        assert!(overlap(distinct_paths(MAX_UPDATE_TARGETS)).is_ok());
+
+        let error = overlap(distinct_paths(MAX_UPDATE_TARGETS + 1)).unwrap_err();
+        assert!(
+            error.to_string().contains("more than 2048 document paths"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn finds_an_overlap_that_is_not_a_neighbour_in_source_order() {
+        assert!(overlap(vec![
+            vec![name("a")],
+            vec![name("b")],
+            vec![name("a"), name("b")],
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn accepts_siblings_and_names_that_merely_share_a_string_prefix() {
+        assert!(overlap(vec![
+            vec![name("a"), name("b")],
+            vec![name("a"), name("c")],
+            vec![name("ab")],
+            vec![name("a"), Segment::Index(0)],
+            vec![name("a"), Segment::Index(1)],
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_a_path_and_anything_below_it_in_either_source_order() {
+        let child = vec![name("a"), name("b")];
+        assert!(overlap(vec![vec![name("a")], child.clone()]).is_err());
+        assert!(overlap(vec![child, vec![name("a")]]).is_err());
+        assert!(overlap(vec![
+            vec![name("a"), Segment::Index(0)],
+            vec![name("a"), Segment::Index(0), name("b")],
+        ])
+        .is_err());
+        assert!(overlap(vec![vec![name("a")], vec![name("a")]]).is_err());
     }
 }

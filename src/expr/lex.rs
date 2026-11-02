@@ -84,8 +84,22 @@ fn is_alias_character(character: char) -> bool {
     character.is_alphanumeric() || character == '_'
 }
 
+/// The service's limit on one expression string, in bytes.
+///
+/// The service rejects an oversized parameter before it parses it, and so does
+/// this: the check runs before the input is copied into a `Vec<char>`, so a
+/// hostile expression costs one comparison instead of an allocation. It also
+/// bounds everything the parser does per expression — at most one token per
+/// byte, and at most ~2000 document paths in an update clause.
+pub(crate) const MAX_EXPRESSION_BYTES: usize = 4096;
+
 /// Split an expression into tokens.
 pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>> {
+    if input.len() > MAX_EXPRESSION_BYTES {
+        return Err(Error::validation(format!(
+            "Invalid expression: Expression size has exceeded the maximum allowed size ({MAX_EXPRESSION_BYTES} bytes)"
+        )));
+    }
     let characters: Vec<char> = input.chars().collect();
     let mut tokens = Vec::new();
     let mut position = 0;
