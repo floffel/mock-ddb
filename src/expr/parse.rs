@@ -7,6 +7,9 @@
 //! `begins_with`, `contains` and `size` — and the four update clauses `SET`,
 //! `REMOVE`, `ADD` and `DELETE` with nested paths, list indices,
 //! `if_not_exists` and `list_append`.
+//!
+//! Hand-written rather than generated from a grammar; the note above
+//! `mod parse` in [`super`] records why.
 
 use super::lex::{tokenize, Token};
 use crate::{Error, Result};
