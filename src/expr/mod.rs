@@ -94,7 +94,9 @@ impl ConditionExpression {
     /// expression is empty, longer than the service's 4096-byte limit,
     /// malformed, nested too deeply or uses an unknown function. At most 64
     /// nesting constructs — `(` groups and `NOT` prefixes together — may
-    /// enclose a comparison; the 65th is rejected.
+    /// enclose a comparison; the 65th is rejected. Repetition is not nesting:
+    /// `a = :v AND a = :v AND …` builds one flat chain, so the 4096-byte limit
+    /// bounds the number of terms and no term costs stack depth.
     pub fn parse(input: &str) -> Result<Self> {
         Ok(Self {
             condition: parse_condition(input)?,
@@ -175,8 +177,11 @@ impl UpdateExpression {
     ///
     /// Returns [`Error::Validation`](crate::Error::Validation) when the
     /// expression is longer than the service's 4096-byte limit, malformed,
-    /// repeats a clause, or writes two document paths that overlap — the same
-    /// path, or an attribute and anything below it.
+    /// repeats a clause, nests `if_not_exists` or `list_append` more than 64
+    /// deep, or writes two document paths that overlap — the same path, or an
+    /// attribute and anything below it. A `+`/`-` chain is repetition, not
+    /// nesting: it is stored flat, so the 4096-byte limit bounds its length
+    /// and no term costs stack depth.
     ///
     /// Overlaps that only appear once `#alias` placeholders are resolved are
     /// rejected by [`UpdateExpression::apply`], the first point that has the
@@ -456,6 +461,110 @@ mod tests {
         assert!(condition
             .evaluate(Some(&item), &HashMap::new(), &values)
             .unwrap());
+    }
+
+    #[test]
+    fn repeated_chains_evaluate_on_a_small_stack() {
+        // Repetition is not nesting: 300 `AND` terms and 600 `+` terms are
+        // what the 4096-byte limit leaves, and neither may cost one stack
+        // frame per term — parse, evaluate, drop and the path collection all
+        // walk a flat `Vec`. 128 KiB catches a regression that recurses.
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let values = HashMap::from([(":v".to_string(), n("1"))]);
+                let mut item = Item::new();
+                item.insert("a".into(), n("1"));
+
+                let condition =
+                    ConditionExpression::parse(&vec!["a = :v"; 300].join(" AND ")).unwrap();
+                assert!(condition
+                    .evaluate(Some(&item), &HashMap::new(), &values)
+                    .unwrap());
+
+                let update =
+                    UpdateExpression::parse(&format!("SET v = {}", vec![":v"; 600].join(" + ")))
+                        .unwrap();
+                update.apply(&mut item, &HashMap::new(), &values).unwrap();
+                assert_eq!(item["v"].as_n().unwrap(), "600");
+
+                // 10^5 terms is not a crash: the 4096-byte limit rejects the
+                // expression before a single tree node is allocated.
+                let huge = vec!["a = :v"; 100_000].join(" AND ");
+                let error = ConditionExpression::parse(&huge).unwrap_err();
+                assert!(
+                    error.to_string().contains("maximum allowed size"),
+                    "unexpected error: {error}"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn a_mixed_arithmetic_chain_folds_left_to_right() {
+        let update = UpdateExpression::parse("SET v = :ten - :three - :two").unwrap();
+        let mut item = Item::new();
+        let values = HashMap::from([
+            (":ten".to_string(), n("10")),
+            (":three".to_string(), n("3")),
+            (":two".to_string(), n("2")),
+        ]);
+        update.apply(&mut item, &HashMap::new(), &values).unwrap();
+        // Left to right: (10 - 3) - 2. A right fold would give 9.
+        assert_eq!(item["v"].as_n().unwrap(), "5");
+
+        // Two terms are the smallest chain, three the next; the type error
+        // names the two operands of the step that fails.
+        assert!(UpdateExpression::parse("SET v = :ten + :two").is_ok());
+        let error = UpdateExpression::parse("SET v = :ten + :one + :two")
+            .unwrap()
+            .apply(
+                &mut item,
+                &HashMap::new(),
+                &HashMap::from([
+                    (":ten".to_string(), n("10")),
+                    (":one".to_string(), n("1")),
+                    (":two".to_string(), s("x")),
+                ]),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("operand type: N and S"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn update_function_nesting_counts_against_the_limit() {
+        // `if_not_exists` and `list_append` recurse, so each enclosing call is
+        // one level of the same budget `(` groups and `NOT` share.
+        let if_not_exists = |levels: usize| {
+            format!(
+                "SET v = {}:zero{}",
+                "if_not_exists(v, ".repeat(levels),
+                ")".repeat(levels)
+            )
+        };
+        assert!(UpdateExpression::parse(&if_not_exists(1)).is_ok());
+        assert!(UpdateExpression::parse(&if_not_exists(64)).is_ok());
+        let too_deep = UpdateExpression::parse(&if_not_exists(65)).unwrap_err();
+        assert!(
+            too_deep.to_string().contains("nested too deeply"),
+            "unexpected error: {too_deep}"
+        );
+
+        let list_append = |levels: usize| {
+            format!(
+                "SET v = {}:a{}",
+                "list_append(".repeat(levels),
+                ", :a)".repeat(levels)
+            )
+        };
+        assert!(UpdateExpression::parse(&list_append(1)).is_ok());
+        assert!(UpdateExpression::parse(&list_append(64)).is_ok());
+        assert!(UpdateExpression::parse(&list_append(65)).is_err());
     }
 
     #[test]

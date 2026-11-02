@@ -13,11 +13,18 @@ use crate::{Error, Result};
 
 /// Maximum nesting depth, so a hostile expression cannot exhaust the stack.
 ///
-/// One parenthesised group (`(` … `)`) or one `NOT` prefix costs exactly one
-/// level, so an expression may wrap its innermost comparison in
-/// [`MAX_DEPTH`] such constructs; the next one is rejected. The count is a
-/// value threaded through the recursion, never a counter that has to be
-/// restored, so no path can double-count a level or leak one.
+/// One parenthesised group (`(` … `)`), one `NOT` prefix, one `if_not_exists`
+/// and one `list_append` argument each cost exactly one level, so an
+/// expression may nest [`MAX_DEPTH`] such constructs; the next one is
+/// rejected. The count is a value threaded through the recursion, never a
+/// counter that has to be restored, so no path can double-count a level or
+/// leak one.
+///
+/// Repetition is not nesting and costs no level: `A AND A AND …` and
+/// `:v + :v + …` parse into the n-ary [`Condition::And`] /
+/// [`SetValue::Arithmetic`] chains, whose depth stays one no matter how many
+/// terms the 4096-byte expression limit allows. The only recursion left in
+/// the tree is the one this constant bounds.
 const MAX_DEPTH: u8 = 64;
 
 /// The most document paths one update expression may write.
@@ -103,10 +110,14 @@ pub(crate) enum Condition {
     Between(Operand, Operand, Operand),
     /// `value IN (:a, :b)`
     In(Operand, Vec<Operand>),
-    /// `left AND right`
-    And(Box<Condition>, Box<Condition>),
-    /// `left OR right`
-    Or(Box<Condition>, Box<Condition>),
+    /// `left AND right AND …`, in source order.
+    ///
+    /// N-ary on purpose: a `Vec` keeps `A AND A AND …` as flat as the source,
+    /// so neither evaluation, path collection nor the recursive drop has to
+    /// walk one stack frame per `AND`.
+    And(Vec<Condition>),
+    /// `left OR right OR …`, in source order.
+    Or(Vec<Condition>),
     /// `NOT condition`
     Not(Box<Condition>),
 }
@@ -143,9 +154,10 @@ impl Condition {
                     paths.extend(entry.paths());
                 }
             }
-            Self::And(left, right) | Self::Or(left, right) => {
-                left.collect_paths(paths);
-                right.collect_paths(paths);
+            Self::And(terms) | Self::Or(terms) => {
+                for term in terms {
+                    term.collect_paths(paths);
+                }
             }
             Self::Not(inner) => inner.collect_paths(paths),
         }
@@ -154,15 +166,25 @@ impl Condition {
     /// Split a top-level `AND` chain into its leaves. A condition with any
     /// `OR` or `NOT` at the top yields a single element: the whole condition.
     pub(crate) fn conjuncts(&self) -> Vec<&Condition> {
-        match self {
-            Self::And(left, right) => {
-                let mut conjuncts = left.conjuncts();
-                conjuncts.extend(right.conjuncts());
-                conjuncts
+        let mut conjuncts = Vec::new();
+        let mut pending = vec![self];
+        while let Some(condition) = pending.pop() {
+            match condition {
+                Self::And(terms) => pending.extend(terms.iter().rev()),
+                other => conjuncts.push(other),
             }
-            other => vec![other],
         }
+        conjuncts
     }
+}
+
+/// The operator that joins two terms in a `SET` arithmetic chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArithOp {
+    /// `+`
+    Add,
+    /// `-`
+    Sub,
 }
 
 /// The right-hand side of a `SET` assignment.
@@ -170,10 +192,19 @@ impl Condition {
 pub(crate) enum SetValue {
     /// A literal operand: an attribute path, a placeholder or `size(path)`.
     Operand(Operand),
-    /// `left + right`
-    Plus(Box<Self>, Box<Self>),
-    /// `left - right`
-    Minus(Box<Self>, Box<Self>),
+    /// A `+`/`-` chain: `first`, then one step per following term, applied
+    /// left to right. Always holds at least one step.
+    ///
+    /// N-ary on purpose: the chain stays as flat as the source, so a long
+    /// `:v + :v + …` or an alternating `+`/`-` run neither builds nor drops a
+    /// left-deep tree.
+    Arithmetic {
+        /// The leftmost term.
+        first: Box<SetValue>,
+        /// The remaining terms with the operator that joins them to the
+        /// running total.
+        rest: Vec<(ArithOp, SetValue)>,
+    },
     /// `if_not_exists(path, fallback)`
     IfNotExists(Path, Box<Self>),
     /// `list_append(first, second)`. Both arguments are full set values, so
@@ -356,8 +387,11 @@ fn is_prefix(prefix: &Path, path: &Path) -> bool {
 /// "nested too deeply" error once [`MAX_DEPTH`] constructs already enclose the
 /// comparison.
 ///
-/// Called exactly once per `(` group and once per `NOT` prefix — the two
-/// constructs that recurse — so a level is worth one unit and never two.
+/// Called exactly once per construct that recurses — a `(` group, a `NOT`
+/// prefix, an `if_not_exists` fallback and a `list_append` argument — so a
+/// level is worth one unit and never two. Chains (`AND`, `OR`, `+`, `-`) do
+/// not call it: they are parsed into flat `Vec`s, so repetition cannot deepen
+/// the tree.
 fn nested(level: u8) -> Result<u8> {
     match level.checked_add(1) {
         Some(inner) if inner <= MAX_DEPTH => Ok(inner),
@@ -456,21 +490,25 @@ impl<'a> Parser<'a> {
     // -- conditions ---------------------------------------------------------
 
     fn condition(&mut self, level: u8) -> Result<Condition> {
-        let mut left = self.and_condition(level)?;
+        let mut terms = vec![self.and_condition(level)?];
         while self.eat_keyword("OR") {
-            let right = self.and_condition(level)?;
-            left = Condition::Or(Box::new(left), Box::new(right));
+            terms.push(self.and_condition(level)?);
         }
-        Ok(left)
+        if terms.len() == 1 {
+            return Ok(terms.swap_remove(0));
+        }
+        Ok(Condition::Or(terms))
     }
 
     fn and_condition(&mut self, level: u8) -> Result<Condition> {
-        let mut left = self.not_condition(level)?;
+        let mut terms = vec![self.not_condition(level)?];
         while self.eat_keyword("AND") {
-            let right = self.not_condition(level)?;
-            left = Condition::And(Box::new(left), Box::new(right));
+            terms.push(self.not_condition(level)?);
         }
-        Ok(left)
+        if terms.len() == 1 {
+            return Ok(terms.swap_remove(0));
+        }
+        Ok(Condition::And(terms))
     }
 
     fn not_condition(&mut self, level: u8) -> Result<Condition> {
@@ -645,7 +683,7 @@ impl<'a> Parser<'a> {
         loop {
             let path = self.path()?;
             self.expect(&Token::Eq)?;
-            let value = self.set_value()?;
+            let value = self.set_value(0)?;
             assignments.push((path, value));
             if !self.eat(&Token::Comma) || self.at_clause_boundary() || self.at_end() {
                 break;
@@ -682,38 +720,52 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn set_value(&mut self) -> Result<SetValue> {
-        let mut value = self.term()?;
+    /// A `SET` right-hand side: a `+`/`-` chain of terms, flattened.
+    ///
+    /// The chain is parsed into one n-ary node instead of a left-deep binary
+    /// tree, so `set_value` costs one stack frame however many terms follow.
+    /// `level` counts the enclosing `if_not_exists` / `list_append`
+    /// constructs; the chain itself adds none.
+    fn set_value(&mut self, level: u8) -> Result<SetValue> {
+        let first = self.term(level)?;
+        let mut rest = Vec::new();
         loop {
-            if self.eat(&Token::Plus) {
-                let right = self.term()?;
-                value = SetValue::Plus(Box::new(value), Box::new(right));
+            let operator = if self.eat(&Token::Plus) {
+                ArithOp::Add
             } else if self.eat(&Token::Minus) {
-                let right = self.term()?;
-                value = SetValue::Minus(Box::new(value), Box::new(right));
+                ArithOp::Sub
             } else {
                 break;
-            }
+            };
+            rest.push((operator, self.term(level)?));
         }
-        Ok(value)
+        if rest.is_empty() {
+            return Ok(first);
+        }
+        Ok(SetValue::Arithmetic {
+            first: Box::new(first),
+            rest,
+        })
     }
 
-    fn term(&mut self) -> Result<SetValue> {
+    /// One `SET` term: an `if_not_exists` or `list_append` call, or an
+    /// operand.
+    fn term(&mut self, level: u8) -> Result<SetValue> {
         if self.peek_keyword("if_not_exists") && self.peek_at(1) == Some(&Token::LParen) {
             self.advance();
             self.advance();
             let path = self.path()?;
             self.expect(&Token::Comma)?;
-            let fallback = self.set_value()?;
+            let fallback = self.set_value(nested(level)?)?;
             self.expect(&Token::RParen)?;
             return Ok(SetValue::IfNotExists(path, Box::new(fallback)));
         }
         if self.peek_keyword("list_append") && self.peek_at(1) == Some(&Token::LParen) {
             self.advance();
             self.advance();
-            let first = self.term()?;
+            let first = self.term(nested(level)?)?;
             self.expect(&Token::Comma)?;
-            let second = self.term()?;
+            let second = self.term(nested(level)?)?;
             self.expect(&Token::RParen)?;
             return Ok(SetValue::ListAppend(Box::new(first), Box::new(second)));
         }
@@ -800,5 +852,60 @@ mod tests {
         // A level counter at its type's maximum reports the limit instead of
         // overflowing the `+=`.
         assert!(nested(u8::MAX).is_err());
+    }
+
+    #[test]
+    fn repeated_and_chains_parse_into_one_flat_node() {
+        // 300 terms is what the 4096-byte limit leaves for `a = :v AND …`
+        // (11 bytes per term); the shape, not the count, is what is asserted.
+        let text = vec!["a = :v"; 300].join(" AND ");
+        let Condition::And(terms) = parse_condition(&text).unwrap() else {
+            panic!("a pure AND chain must parse into the n-ary variant");
+        };
+        assert_eq!(terms.len(), 300);
+        // Repetition is not nesting, so every leaf stays a plain comparison.
+        assert!(terms
+            .iter()
+            .all(|term| matches!(term, Condition::Compare(..))));
+
+        // Two terms are the smallest chain, one term is not a chain at all.
+        assert!(matches!(
+            parse_condition("a = :v AND b = :w").unwrap(),
+            Condition::And(terms) if terms.len() == 2
+        ));
+        assert!(matches!(
+            parse_condition("a = :v").unwrap(),
+            Condition::Compare(..)
+        ));
+    }
+
+    #[test]
+    fn repeated_arithmetic_chains_parse_into_one_flat_node() {
+        let text = format!("SET v = {}", vec![":v"; 600].join(" + "));
+        let Update { clauses } = parse_update(&text).unwrap();
+        let Some(UpdateClause::Set(assignments)) = clauses.first() else {
+            panic!("expected one SET clause");
+        };
+        let (_, value) = assignments.first().expect("one assignment");
+        assert!(matches!(
+            value,
+            SetValue::Arithmetic { rest, .. } if rest.len() == 599
+        ));
+
+        // An alternating chain stays flat as well: one node, one step per
+        // operator, never a left-deep tree.
+        let mut alternating = String::from("SET v = :v");
+        for _ in 0..199 {
+            alternating.push_str(" + :v - :v");
+        }
+        let Update { clauses } = parse_update(&alternating).unwrap();
+        let Some(UpdateClause::Set(assignments)) = clauses.first() else {
+            panic!("expected one SET clause");
+        };
+        let (_, value) = assignments.first().expect("one assignment");
+        assert!(matches!(
+            value,
+            SetValue::Arithmetic { rest, .. } if rest.len() == 398
+        ));
     }
 }
