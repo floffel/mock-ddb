@@ -146,6 +146,28 @@ fn remove_in(target: &mut AttributeValue, segments: &[Segment]) {
     }
 }
 
+/// The most document paths one projection may name.
+///
+/// The service bounds the expression *text* (4 KB); a mock that held no bound
+/// of its own would let one request select an unbounded number of branches
+/// from a single stored item while the projection is built. A hundred paths is
+/// far more than a real projection names and keeps that work small.
+pub(crate) const MAX_PROJECTION_PATHS: usize = 100;
+
+/// Reject a projection that names more paths than [`MAX_PROJECTION_PATHS`].
+///
+/// The count is checked before an item is read or anything is cloned, so an
+/// oversized projection costs one comparison per path and no allocation
+/// against the stored value.
+pub(crate) fn check_path_count(count: usize) -> Result<()> {
+    if count > MAX_PROJECTION_PATHS {
+        return Err(Error::validation(format!(
+            "Invalid ProjectionExpression: The expression names {count} document paths; at most {MAX_PROJECTION_PATHS} are accepted"
+        )));
+    }
+    Ok(())
+}
+
 /// Build an item containing only the requested paths.
 ///
 /// Every path is followed to its end: a map keeps only the requested keys, and a
@@ -153,6 +175,11 @@ fn remove_in(target: &mut AttributeValue, segments: &[Segment]) {
 /// duplicates — the shape the service returns for `items[0]`, not the containing
 /// list. Indices the item does not have, keys it does not carry and paths that
 /// run through a scalar contribute nothing.
+///
+/// The paths are folded into one tree first, so each source attribute is read
+/// once however many paths reach into it and only the selected leaves are
+/// cloned. Callers reject a longer list than [`MAX_PROJECTION_PATHS`] before
+/// calling this (`check_path_count`).
 pub(crate) fn project(item: &Item, paths: &[&[Segment]]) -> Item {
     let shape = projection_shape(paths);
     let mut projected = Item::new();
@@ -740,5 +767,21 @@ mod tests {
             ]),
             "a.b[2]"
         );
+    }
+
+    #[test]
+    fn rejects_a_projection_above_the_path_cap() {
+        // Just inside and just outside the cap.
+        assert!(check_path_count(MAX_PROJECTION_PATHS).is_ok());
+        let error = check_path_count(MAX_PROJECTION_PATHS + 1).unwrap_err();
+        assert_eq!(error.code(), "ValidationException");
+        assert!(
+            error.to_string().contains("at most 100"),
+            "unexpected message: {error}"
+        );
+        // A path list that is short by many still passes: the cap is a
+        // maximum, not an exact count.
+        assert!(check_path_count(1).is_ok());
+        assert!(check_path_count(0).is_ok());
     }
 }

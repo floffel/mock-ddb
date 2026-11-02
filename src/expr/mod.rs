@@ -35,7 +35,7 @@ pub(crate) use parse::{
     parse_condition, parse_projection, parse_update, CmpOp, Condition, Operand, Path, Segment,
     Update,
 };
-pub(crate) use path::project;
+pub(crate) use path::{check_path_count, project};
 
 use crate::schema::KeySchema;
 use crate::{Item, Result};
@@ -260,14 +260,19 @@ pub struct ProjectionExpression {
 impl ProjectionExpression {
     /// Parse a comma-separated list of document paths.
     ///
+    /// At most 100 paths are accepted (`MAX_PROJECTION_PATHS`); a longer list
+    /// is rejected instead of letting one request select an unbounded number
+    /// of branches from a single stored item.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Validation`](crate::Error::Validation) when the
-    /// expression is empty or a path is malformed.
+    /// expression is empty, a path is malformed, or it names more than 100
+    /// document paths.
     pub fn parse(input: &str) -> Result<Self> {
-        Ok(Self {
-            paths: parse_projection(input)?,
-        })
+        let paths = parse_projection(input)?;
+        check_path_count(paths.len())?;
+        Ok(Self { paths })
     }
 
     ///
@@ -322,8 +327,10 @@ impl ProjectionExpression {
     /// # Errors
     ///
     /// Returns [`Error::Validation`](crate::Error::Validation) for an undefined
-    /// `#name` placeholder.
+    /// `#name` placeholder, or when the expression names more than 100
+    /// document paths.
     pub fn project(&self, item: &Item, names: &HashMap<String, String>) -> Result<Item> {
+        check_path_count(self.paths.len())?;
         let resolved = self.resolve(names)?;
         Ok(project(
             item,
