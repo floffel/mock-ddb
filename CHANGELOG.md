@@ -4,6 +4,17 @@ All notable changes to this crate are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the crate
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- A `ProjectionExpression` now follows a document path to its end instead of
+  stopping at the first list index. `items[0].v` returns the element at index 0
+  with only `v` instead of every element of `items` with every field, so a test
+  that asserts on a projected list element compares the same shape the service
+  returns. Named indices are kept in ascending order and without duplicates; an
+  index the list does not have contributes nothing.
+
 ## [0.1.1] - 2026-10-25
 
 ### Fixed
