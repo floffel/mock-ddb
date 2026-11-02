@@ -461,8 +461,11 @@ fn projection_expressions_keep_nested_and_list_paths() {
     let profile = projected.get("profile").unwrap().as_m().unwrap();
     assert_eq!(profile.get("city"), Some(&s("Berlin")));
     assert!(profile.get("zip").is_none());
-    // A list index projects the containing list.
-    assert!(projected.get("items").unwrap().as_l().is_ok());
+    // A list index projects the named element, not the containing list.
+    assert_eq!(
+        projected.get("items"),
+        Some(&AttributeValue::L(vec![s("first")]))
+    );
 
     assert!(ProjectionExpression::parse("").is_err());
     assert!(ProjectionExpression::parse("a,,b").is_err());

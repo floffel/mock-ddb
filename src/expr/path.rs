@@ -5,7 +5,7 @@
 //! `SET a.b = :v` when `a` does not exist — while removals are forgiving, since
 //! removing something that is not there is a no-op.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use aws_sdk_dynamodb::types::AttributeValue;
 
@@ -148,63 +148,92 @@ fn remove_in(target: &mut AttributeValue, segments: &[Segment]) {
 
 /// Build an item containing only the requested paths.
 ///
-/// A path that runs into a list index contributes the list up to that point:
-/// DynamoDB projects list elements, the mock projects the containing list.
+/// Every path is followed to its end: a map keeps only the requested keys, and a
+/// list is rebuilt from the requested indices in ascending order and without
+/// duplicates — the shape the service returns for `items[0]`, not the containing
+/// list. Indices the item does not have, keys it does not carry and paths that
+/// run through a scalar contribute nothing.
 pub(crate) fn project(item: &Item, paths: &[&[Segment]]) -> Item {
+    let shape = projection_shape(paths);
     let mut projected = Item::new();
-    for path in paths {
-        let effective = match path
-            .iter()
-            .position(|segment| matches!(segment, Segment::Index(_)))
+    for (name, branch) in &shape.keys {
+        if let Some(value) = item
+            .get(name)
+            .and_then(|value| project_value(value, branch))
         {
-            Some(index) => &path[..index],
-            None => path,
-        };
-        if let Some(value) = get_path(item, effective) {
-            insert_creating(&mut projected, effective, value.clone());
+            projected.insert(name.clone(), value);
         }
     }
     projected
 }
 
-/// Insert a value at a path, creating intermediate maps.
-fn insert_creating(item: &mut Item, path: &[Segment], value: AttributeValue) {
-    let Some((Segment::Name(root), rest)) = path.split_first() else {
-        return;
-    };
-    if rest.is_empty() {
-        item.insert(root.clone(), value);
-        return;
-    }
-    let entry = item
-        .entry(root.clone())
-        .or_insert_with(|| AttributeValue::M(HashMap::new()));
-    if let AttributeValue::M(map) = entry {
-        insert_into_map(map, rest, value);
-    }
+/// The branches of a document a projection keeps.
+#[derive(Debug, Default)]
+struct Shape {
+    /// Keep the value at this level whole.
+    whole: bool,
+    /// Keys to keep below a map.
+    keys: BTreeMap<String, Shape>,
+    /// Indices to keep below a list.
+    indices: BTreeMap<usize, Shape>,
 }
 
-/// Insert a value below a map, creating intermediate maps.
-fn insert_into_map(
-    map: &mut HashMap<String, AttributeValue>,
-    segments: &[Segment],
-    value: AttributeValue,
-) {
-    let Some((first, rest)) = segments.split_first() else {
-        return;
-    };
-    let Segment::Name(name) = first else {
-        return;
-    };
-    if rest.is_empty() {
-        map.insert(name.clone(), value);
-        return;
+/// Fold the requested paths into one shape tree.
+///
+/// Paths that do not start with a name are ignored, and a path that names a
+/// value whole wins over a path that reaches into it.
+fn projection_shape(paths: &[&[Segment]]) -> Shape {
+    fn merge(node: &mut Shape, path: &[Segment]) {
+        match path.split_first() {
+            None => node.whole = true,
+            Some(_) if node.whole => {}
+            Some((Segment::Name(name), rest)) => {
+                merge(node.keys.entry(name.clone()).or_default(), rest);
+            }
+            Some((Segment::Index(index), rest)) => {
+                merge(node.indices.entry(*index).or_default(), rest);
+            }
+        }
     }
-    let entry = map
-        .entry(name.clone())
-        .or_insert_with(|| AttributeValue::M(HashMap::new()));
-    if let AttributeValue::M(nested) = entry {
-        insert_into_map(nested, rest, value);
+
+    let mut root = Shape::default();
+    for path in paths {
+        if matches!(path.first(), Some(Segment::Name(_))) {
+            merge(&mut root, path);
+        }
+    }
+    root
+}
+
+/// Keep the requested branches of a value, or drop the value entirely when it
+/// carries none of them.
+fn project_value(value: &AttributeValue, shape: &Shape) -> Option<AttributeValue> {
+    if shape.whole {
+        return Some(value.clone());
+    }
+    match value {
+        AttributeValue::M(map) => {
+            let mut kept = HashMap::new();
+            for (name, branch) in &shape.keys {
+                if let Some(child) = map.get(name).and_then(|child| project_value(child, branch)) {
+                    kept.insert(name.clone(), child);
+                }
+            }
+            (!kept.is_empty()).then_some(AttributeValue::M(kept))
+        }
+        AttributeValue::L(list) => {
+            let mut kept = Vec::new();
+            for (index, branch) in &shape.indices {
+                if let Some(child) = list
+                    .get(*index)
+                    .and_then(|element| project_value(element, branch))
+                {
+                    kept.push(child);
+                }
+            }
+            (!kept.is_empty()).then_some(AttributeValue::L(kept))
+        }
+        _ => None,
     }
 }
 
@@ -514,6 +543,157 @@ mod tests {
         );
     }
 
+    fn name(value: &str) -> Segment {
+        Segment::Name(value.into())
+    }
+
+    fn index(value: usize) -> Segment {
+        Segment::Index(value)
+    }
+
+    fn element(fields: &[(&str, &str)]) -> AttributeValue {
+        AttributeValue::M(
+            fields
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), n(*value)))
+                .collect(),
+        )
+    }
+
+    /// `rows` holds two maps: `{v: 1, w: 9}` at index 0 and `{v: 2, w: 8}` at 1.
+    fn rows() -> Item {
+        let mut item = sample();
+        item.insert(
+            "rows".into(),
+            AttributeValue::L(vec![
+                element(&[("v", "1"), ("w", "9")]),
+                element(&[("v", "2"), ("w", "8")]),
+            ]),
+        );
+        item
+    }
+
+    #[test]
+    fn projection_descends_into_list_indices() {
+        let projected = project(&rows(), &[&[name("rows"), index(0), name("v")]]);
+        assert_eq!(
+            projected.get("rows"),
+            Some(&AttributeValue::L(vec![element(&[("v", "1")])]))
+        );
+    }
+
+    #[test]
+    fn projection_orders_and_deduplicates_list_indices() {
+        // Requested 1 before 0, and 1 twice: ascending, once.
+        let projected = project(
+            &rows(),
+            &[
+                &[name("rows"), index(1), name("v")],
+                &[name("rows"), index(0), name("v")],
+                &[name("rows"), index(1), name("v")],
+            ],
+        );
+        assert_eq!(
+            projected.get("rows"),
+            Some(&AttributeValue::L(vec![
+                element(&[("v", "1")]),
+                element(&[("v", "2")]),
+            ]))
+        );
+    }
+
+    #[test]
+    fn projection_keeps_a_whole_element_and_merges_shared_prefixes() {
+        let whole = project(&rows(), &[&[name("rows"), index(1)]]);
+        assert_eq!(
+            whole.get("rows"),
+            Some(&AttributeValue::L(vec![element(&[("v", "2"), ("w", "8")])]))
+        );
+
+        let merged = project(
+            &rows(),
+            &[
+                &[name("rows"), index(0), name("w")],
+                &[name("rows"), index(0), name("v")],
+            ],
+        );
+        assert_eq!(
+            merged.get("rows"),
+            Some(&AttributeValue::L(vec![element(&[("w", "9"), ("v", "1")])]))
+        );
+    }
+
+    #[test]
+    fn projection_keeps_indices_inside_the_list_and_drops_one_past_the_end() {
+        // Two elements: index 1 is the last one, index 2 is one past it.
+        assert!(project(&rows(), &[&[name("rows"), index(1), name("v")]]).contains_key("rows"));
+        assert!(project(&rows(), &[&[name("rows"), index(2), name("v")]]).is_empty());
+    }
+
+    #[test]
+    fn projection_follows_a_path_through_nested_lists() {
+        let mut item = Item::new();
+        item.insert(
+            "a".into(),
+            AttributeValue::M(HashMap::from([(
+                "b".to_string(),
+                AttributeValue::L(vec![
+                    AttributeValue::M(HashMap::new()),
+                    AttributeValue::M(HashMap::from([(
+                        "c".to_string(),
+                        AttributeValue::L(vec![element(&[("keep", "1"), ("drop", "2")])]),
+                    )])),
+                ]),
+            )])),
+        );
+
+        let projected = project(
+            &item,
+            &[
+                &[
+                    name("a"),
+                    name("b"),
+                    index(1),
+                    name("c"),
+                    index(0),
+                    name("keep"),
+                ],
+                // The map at index 0 of `b` has no `c`, so it contributes nothing.
+                &[
+                    name("a"),
+                    name("b"),
+                    index(0),
+                    name("c"),
+                    index(0),
+                    name("keep"),
+                ],
+            ],
+        );
+        assert_eq!(
+            get_path(
+                &projected,
+                &[
+                    name("a"),
+                    name("b"),
+                    index(0),
+                    name("c"),
+                    index(0),
+                    name("keep")
+                ]
+            ),
+            Some(&n("1"))
+        );
+        assert_eq!(
+            projected
+                .get("a")
+                .and_then(|value| value.as_m().ok())
+                .and_then(|map| map.get("b"))
+                .and_then(|value| value.as_l().ok())
+                .map(Vec::len),
+            Some(1)
+        );
+    }
+
     #[test]
     fn projection_ignores_unreachable_and_scalar_paths() {
         let mut item = sample();
@@ -524,19 +704,30 @@ mod tests {
         let projected = project(
             &item,
             &[
-                &[Segment::Name("pk".into()), Segment::Name("nested".into())],
-                &[
-                    Segment::Name("rows".into()),
-                    Segment::Index(0),
-                    Segment::Name("v".into()),
-                ],
-                &[Segment::Name("unknown".into()), Segment::Name("x".into())],
+                &[name("pk"), name("nested")],
+                &[name("rows"), index(0), name("v")],
+                &[name("unknown"), name("x")],
             ],
         );
-        // `pk.nested` is unreachable (pk is a scalar) and `unknown.x` has no
-        // root, so only the list prefix of `rows[0]` survives.
-        assert_eq!(projected.len(), 1);
-        assert!(projected.contains_key("rows"));
+        // `pk.nested` is unreachable (pk is a scalar), `unknown.x` has no root
+        // and the element at `rows[0]` does not carry `v`.
+        assert!(projected.is_empty());
+    }
+
+    #[test]
+    fn projection_takes_the_branch_the_value_actually_has() {
+        // `rows` is a list, so the map branch of the second path is ignored.
+        let projected = project(
+            &rows(),
+            &[
+                &[name("rows"), name("v")],
+                &[name("rows"), index(1), name("v")],
+            ],
+        );
+        assert_eq!(
+            projected.get("rows"),
+            Some(&AttributeValue::L(vec![element(&[("v", "2")])]))
+        );
     }
 
     #[test]

@@ -284,9 +284,41 @@ impl ProjectionExpression {
     /// ```
     /// Keep only the projected attributes.
     ///
-    /// A path that runs into a list index contributes the whole list, because
-    /// the mock does not rebuild a list from a single element.
+    /// Document paths are followed to their end: a map keeps only the requested
+    /// keys, and a list keeps only the elements named by an index, in ascending
+    /// order — the shape the service returns for `items[0]`, not the containing
+    /// list. A path the item does not reach contributes nothing.
     ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use mock_ddb::{s, AttributeValue, Item, ProjectionExpression};
+    ///
+    /// let projection = ProjectionExpression::parse("pk, rows[0].v").unwrap();
+    /// let mut item = Item::new();
+    /// item.insert("pk".into(), s("u#1"));
+    /// item.insert("secret".into(), s("x"));
+    /// item.insert(
+    ///     "rows".into(),
+    ///     AttributeValue::L(vec![
+    ///         AttributeValue::M(HashMap::from([
+    ///             ("v".to_string(), s("1")),
+    ///             ("w".to_string(), s("9")),
+    ///         ])),
+    ///         AttributeValue::M(HashMap::from([("v".to_string(), s("2"))])),
+    ///     ]),
+    /// );
+    ///
+    /// let projected = projection.project(&item, &HashMap::new()).unwrap();
+    /// assert_eq!(projected.len(), 2);
+    /// // Only the first element, and only its `v`.
+    /// assert_eq!(
+    ///     projected.get("rows"),
+    ///     Some(&AttributeValue::L(vec![AttributeValue::M(HashMap::from([(
+    ///         "v".to_string(),
+    ///         s("1")
+    ///     )]))]))
+    /// );
+    /// ```
     /// # Errors
     ///
     /// Returns [`Error::Validation`](crate::Error::Validation) for an undefined

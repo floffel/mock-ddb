@@ -140,7 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | Paths | nested maps (`profile.city`), list indices (`items[0]`), `#aliased` and `#aliased.path` |
 | Update clauses | `SET` (with `+`, `-`, `if_not_exists`, `list_append`), `REMOVE`, `ADD` (numbers and sets), `DELETE` (sets) |
 | Update safety | key attributes cannot be rewritten; overlapping paths, repeated clauses and malformed syntax are rejected before any write |
-| Projections | comma-separated paths with aliases; projecting a list index returns the containing list |
+| Projections | comma-separated paths with aliases; a list index keeps the named elements, in ascending order |
 
 Condition and update expressions can also be parsed and evaluated directly,
 without executing an operation — useful for asserting on the expression a
@@ -236,7 +236,6 @@ that changes what a caller must do is called out.
 - `ConditionExpression` on `BatchWriteItem` (the service does not have one
   either) and `ReturnValues` on `BatchGetItem`.
 - `ConsumedCapacity` and `ItemCollectionMetrics` in every response.
-- List-element projection: `items[0]` projects the whole list.
 
 If you need one of these for a test, the mock is the wrong tool for that
 assertion — integration tests against DynamoDB Local or a real account still
