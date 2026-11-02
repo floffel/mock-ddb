@@ -313,12 +313,6 @@ pub(crate) fn parse_projection(input: &str) -> Result<Vec<Path>> {
 
 /// Reject two target paths where one is a prefix of the other, as the service
 /// does.
-///
-/// Sorting first turns this from a quadratic pairwise scan into one pass over
-/// the neighbours: a path that would sort between `a` and a longer path that
-/// starts with `a` has to agree with `a` on every one of its own steps, so it
-/// starts with `a` too and is caught just the same. Equal paths sort next to
-/// each other and are caught by the same test.
 fn validate_no_overlap(update: &Update) -> Result<()> {
     let mut paths = update.target_paths();
     if paths.len() > MAX_UPDATE_TARGETS {
@@ -326,6 +320,21 @@ fn validate_no_overlap(update: &Update) -> Result<()> {
             "Invalid UpdateExpression: The expression writes more than {MAX_UPDATE_TARGETS} document paths"
         )));
     }
+    reject_overlapping(&mut paths)
+}
+
+/// Reject two paths where one is a prefix of the other (or equal).
+///
+/// Sorting first turns this from a quadratic pairwise scan into one pass over
+/// the neighbours: a path that would sort between `a` and a longer path that
+/// starts with `a` has to agree with `a` on every one of its own steps, so it
+/// starts with `a` too and is caught just the same. Equal paths sort next to
+/// each other and are caught by the same test.
+///
+/// The parser can only compare the spellings it holds, so `#alias` segments
+/// make two spellings of one attribute look distinct here; the update applier
+/// runs the same scan again on resolved paths.
+pub(crate) fn reject_overlapping(paths: &mut [&Path]) -> Result<()> {
     paths.sort_unstable();
     for pair in paths.windows(2) {
         // Sorted, only the earlier path can prefix the later one.

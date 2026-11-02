@@ -266,6 +266,63 @@ async fn update_clauses_apply_in_one_expression() {
 }
 
 #[tokio::test]
+async fn an_alias_and_a_literal_spelling_cannot_target_one_path() {
+    let mock = users();
+    mock.put_item(PutItemRequest::new("users", rich_item()))
+        .await
+        .unwrap();
+
+    // `#n` and `name` name the same attribute, so this is one path written
+    // twice — the service rejects it instead of letting the last write win.
+    let error = mock
+        .update_item(
+            UpdateItemRequest::new(
+                "users",
+                item([("pk", s("u#1"))]),
+                "SET #n = :first, name = :second",
+            )
+            .with_names(mock_ddb::names([("#n", "name")]))
+            .with_values(values([(":first", s("one")), (":second", s("two"))])),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("Two document paths overlap"),
+        "unexpected error: {error}"
+    );
+
+    // Nothing was written: the error comes before the first mutation.
+    let stored = mock
+        .get_item(GetItemRequest::new("users", item([("pk", s("u#1"))])))
+        .await
+        .unwrap()
+        .item
+        .unwrap();
+    assert_eq!(stored.get("name"), Some(&s("Alpha Bravo")));
+
+    // The same expression with an unaliased sibling is accepted.
+    mock.update_item(
+        UpdateItemRequest::new(
+            "users",
+            item([("pk", s("u#1"))]),
+            "SET #n = :first, nickname = :second",
+        )
+        .with_names(mock_ddb::names([("#n", "name")]))
+        .with_values(values([(":first", s("one")), (":second", s("two"))])),
+    )
+    .await
+    .unwrap();
+    let stored = mock
+        .get_item(GetItemRequest::new("users", item([("pk", s("u#1"))])))
+        .await
+        .unwrap()
+        .item
+        .unwrap();
+    assert_eq!(stored.get("name"), Some(&s("one")));
+    assert_eq!(stored.get("nickname"), Some(&s("two")));
+}
+
+#[tokio::test]
 async fn nested_writes_and_list_indices() {
     let mock = users();
     mock.put_item(PutItemRequest::new("users", rich_item()))

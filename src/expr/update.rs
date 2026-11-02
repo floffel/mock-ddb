@@ -3,15 +3,16 @@
 //! All right-hand sides are evaluated against a snapshot of the item taken
 //! before the first clause, so `SET a = b, b = a` swaps the two attributes, as
 //! DynamoDB's single atomic update does. Writes are then applied in source
-//! order; the parsed expression has already rejected overlapping paths, so the
-//! order cannot change the result.
+//! order; overlapping paths were rejected before the first write — by the
+//! parser where the spellings already collide, and by the alias-resolved check
+//! here for the rest — so the order cannot change the result.
 
 use std::collections::BTreeSet;
 
 use aws_sdk_dynamodb::types::AttributeValue;
 
 use super::eval::Ctx;
-use super::parse::{Operand, Path, SetValue, Update, UpdateClause};
+use super::parse::{reject_overlapping, Operand, Path, SetValue, Update, UpdateClause};
 use super::path::{get_path, remove_path, render, root, set_path};
 use crate::number::Number;
 use crate::schema::KeySchema;
@@ -22,6 +23,23 @@ use crate::{Error, Item, Result};
 enum Mutation {
     Set(Path, AttributeValue),
     Remove(Path),
+}
+
+/// Reject an update whose target paths overlap once `#alias` segments are
+/// resolved.
+///
+/// The parser compares the spellings it holds, so `SET #n = :a, n = :b` — or
+/// two aliases that name one attribute — gets past it and would leave the item
+/// with whichever write came last. Resolving first makes those spellings
+/// collide, which is what the service reports instead.
+fn reject_overlapping_targets(update: &Update, ctx: &Ctx<'_>) -> Result<()> {
+    let resolved = update
+        .target_paths()
+        .into_iter()
+        .map(|path| ctx.resolve(path))
+        .collect::<Result<Vec<Path>>>()?;
+    let mut paths: Vec<&Path> = resolved.iter().collect();
+    reject_overlapping(&mut paths)
 }
 
 /// Apply an update expression, returning the top-level attributes it touched.
@@ -35,6 +53,7 @@ pub(crate) fn apply(
     ctx: &Ctx<'_>,
     key_schema: &KeySchema,
 ) -> Result<BTreeSet<String>> {
+    reject_overlapping_targets(update, ctx)?;
     let snapshot = item.clone();
     let mut mutations: Vec<Mutation> = Vec::new();
     let mut touched: BTreeSet<String> = BTreeSet::new();
@@ -268,6 +287,8 @@ fn is_empty_set(value: &AttributeValue) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::expr::parse::{parse_update, Operand, Segment, SetValue};
     use crate::expr::{NameMap, ValueMap};
@@ -278,13 +299,90 @@ mod tests {
     }
 
     fn apply(expression: &str, item: &mut Item, values: &ValueMap) -> Result<BTreeSet<String>> {
+        apply_named(expression, item, &NameMap::new(), values)
+    }
+
+    fn apply_named(
+        expression: &str,
+        item: &mut Item,
+        names: &NameMap,
+        values: &ValueMap,
+    ) -> Result<BTreeSet<String>> {
         let update = parse_update(expression).unwrap();
-        let names = NameMap::new();
-        let context = Ctx {
-            names: &names,
-            values,
-        };
+        let context = Ctx { names, values };
         super::apply(&update, item, &context, &key_schema())
+    }
+
+    #[test]
+    fn rejects_a_placeholder_and_its_literal_spelling() {
+        let names = NameMap::from([("#n".to_string(), "n".to_string())]);
+        let values = crate::values([(":a", s("first")), (":b", s("second"))]);
+        let mut target = item([("pk", s("a"))]);
+        let error = apply_named("SET #n = :a, n = :b", &mut target, &names, &values).unwrap_err();
+        assert!(
+            error.to_string().contains("Two document paths overlap"),
+            "unexpected error: {error}"
+        );
+        assert!(!target.contains_key("n"));
+
+        // Just inside: a name that merely shares a prefix is a second path.
+        let mut target = item([("pk", s("a"))]);
+        apply_named("SET #n = :a, nn = :b", &mut target, &names, &values).unwrap();
+        assert_eq!(target.get("n"), Some(&s("first")));
+        assert_eq!(target.get("nn"), Some(&s("second")));
+    }
+
+    #[test]
+    fn rejects_two_placeholders_that_name_one_attribute() {
+        let names = NameMap::from([
+            ("#a".to_string(), "n".to_string()),
+            ("#b".to_string(), "n".to_string()),
+        ]);
+        let values = crate::values([(":x", s("x")), (":y", s("y"))]);
+        let mut target = item([("pk", s("a"))]);
+        let error = apply_named("SET #a = :x, #b = :y", &mut target, &names, &values).unwrap_err();
+        assert!(
+            error.to_string().contains("Two document paths overlap"),
+            "unexpected error: {error}"
+        );
+
+        // Just outside: the same expression with the second alias pointing at
+        // another attribute is two distinct paths.
+        let names = NameMap::from([
+            ("#a".to_string(), "n".to_string()),
+            ("#b".to_string(), "m".to_string()),
+        ]);
+        let mut target = item([("pk", s("a"))]);
+        apply_named("SET #a = :x, #b = :y", &mut target, &names, &values).unwrap();
+        assert_eq!(target.get("n"), Some(&s("x")));
+        assert_eq!(target.get("m"), Some(&s("y")));
+    }
+
+    #[test]
+    fn rejects_nested_paths_that_collide_only_once_resolved() {
+        let names = NameMap::from([
+            ("#n".to_string(), "n".to_string()),
+            ("#m".to_string(), "m".to_string()),
+        ]);
+        let values = crate::values([(":x", s("x")), (":y", s("y"))]);
+        let mut target = item([("pk", s("a"))]);
+        let error =
+            apply_named("SET #n.#m = :x, n.m = :y", &mut target, &names, &values).unwrap_err();
+        assert!(
+            error.to_string().contains("Two document paths overlap"),
+            "unexpected error: {error}"
+        );
+
+        // Just inside: the literal spelling is a sibling, not the same path.
+        let mut target = item([("pk", s("a")), ("n", AttributeValue::M(HashMap::new()))]);
+        apply_named("SET #n.#m = :x, n.mm = :y", &mut target, &names, &values).unwrap();
+        assert_eq!(
+            target.get("n"),
+            Some(&AttributeValue::M(HashMap::from([
+                ("m".to_string(), s("x")),
+                ("mm".to_string(), s("y")),
+            ])))
+        );
     }
 
     #[test]

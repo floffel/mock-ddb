@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Overlap validation for update target paths now resolves `#alias` segments
+  first: `SET #n = :a, n = :b`, `SET #a = :x, #b = :y` with both aliases naming
+  one attribute, and `SET #n.#m = :x, n.m = :y` are rejected with the service's
+  ValidationException instead of silently discarding one of the writes. The
+  check runs before the first mutation, so a rejected update leaves the item
+  untouched.
 - `list_append` now accepts the function forms the service accepts in its
   arguments: `list_append(if_not_exists(items, :empty), :more)` and nested
   `list_append` calls parse instead of failing with "expected an attribute path
