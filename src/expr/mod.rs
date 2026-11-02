@@ -92,7 +92,9 @@ impl ConditionExpression {
     ///
     /// Returns [`Error::Validation`](crate::Error::Validation) when the
     /// expression is empty, longer than the service's 4096-byte limit,
-    /// malformed, nested too deeply or uses an unknown function.
+    /// malformed, nested too deeply or uses an unknown function. At most 64
+    /// nesting constructs — `(` groups and `NOT` prefixes together — may
+    /// enclose a comparison; the 65th is rejected.
     pub fn parse(input: &str) -> Result<Self> {
         Ok(Self {
             condition: parse_condition(input)?,
@@ -403,6 +405,52 @@ mod tests {
         assert!(ConditionExpression::parse(&deep).is_err());
         let negations = format!("{}a = :v", "NOT ".repeat(500));
         assert!(ConditionExpression::parse(&negations).is_err());
+    }
+
+    /// `groups` parenthesised groups around a comparison.
+    fn parenthesised(groups: usize) -> String {
+        format!("{}a = :v{}", "(".repeat(groups), ")".repeat(groups))
+    }
+
+    #[test]
+    fn nesting_limit_counts_one_level_per_construct() {
+        // One `(` group is one level, so the documented 64 levels are usable:
+        // a group used to cost two, which made 32 the real ceiling.
+        assert!(ConditionExpression::parse(&parenthesised(1)).is_ok());
+        assert!(ConditionExpression::parse(&parenthesised(64)).is_ok());
+        let too_deep = ConditionExpression::parse(&parenthesised(65)).unwrap_err();
+        assert!(too_deep.to_string().contains("nested too deeply"));
+
+        // A `NOT` prefix is one level as well.
+        let negations = |count: usize| format!("{}a = :v", "NOT ".repeat(count));
+        assert!(ConditionExpression::parse(&negations(64)).is_ok());
+        assert!(ConditionExpression::parse(&negations(65)).is_err());
+
+        // Groups and negations share the budget level for level.
+        let mixed = |groups: usize, count: usize| {
+            format!(
+                "{}{}a = :v{}",
+                "(".repeat(groups),
+                "NOT ".repeat(count),
+                ")".repeat(groups)
+            )
+        };
+        assert!(ConditionExpression::parse(&mixed(32, 32)).is_ok());
+        assert!(ConditionExpression::parse(&mixed(33, 32)).is_err());
+        assert!(ConditionExpression::parse(&mixed(32, 33)).is_err());
+    }
+
+    #[test]
+    fn a_deep_expression_still_parses_its_condition() {
+        // The guard must not swallow the innermost comparison: 64 levels wrap
+        // a condition that evaluates.
+        let condition = ConditionExpression::parse(&parenthesised(64)).unwrap();
+        let values = HashMap::from([(":v".to_string(), n("1"))]);
+        let mut item = Item::new();
+        item.insert("a".into(), n("1"));
+        assert!(condition
+            .evaluate(Some(&item), &HashMap::new(), &values)
+            .unwrap());
     }
 
     #[test]
