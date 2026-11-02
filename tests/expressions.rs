@@ -475,6 +475,30 @@ fn projection_expressions_keep_nested_and_list_paths() {
         .is_err());
 }
 
+#[test]
+fn projection_expressions_reject_more_paths_than_the_cap() {
+    let expression = |count: usize| {
+        (0..count)
+            .map(|index| format!("a{index}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    // Just inside and just outside the documented cap.
+    let mut item = Item::new();
+    for index in 0..100 {
+        item.insert(format!("a{index}"), n("1"));
+    }
+    let at_cap = ProjectionExpression::parse(&expression(100)).unwrap();
+    assert_eq!(at_cap.project(&item, &HashMap::new()).unwrap().len(), 100);
+
+    let error = ProjectionExpression::parse(&expression(101)).unwrap_err();
+    assert_eq!(error.code(), "ValidationException");
+    assert!(
+        error.to_string().contains("at most 100"),
+        "unexpected message: {error}"
+    );
+}
+
 #[tokio::test]
 async fn conditions_apply_to_creation_and_deletion() {
     let mock = MockDdb::with_table(
