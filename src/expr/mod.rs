@@ -177,6 +177,10 @@ impl UpdateExpression {
     /// expression is longer than the service's 4096-byte limit, malformed,
     /// repeats a clause, or writes two document paths that overlap — the same
     /// path, or an attribute and anything below it.
+    ///
+    /// Overlaps that only appear once `#alias` placeholders are resolved are
+    /// rejected by [`UpdateExpression::apply`], the first point that has the
+    /// expression-attribute-names map.
     pub fn parse(input: &str) -> Result<Self> {
         Ok(Self {
             update: parse_update(input)?,
@@ -208,8 +212,9 @@ impl UpdateExpression {
     ///
     /// Returns [`Error::Validation`](crate::Error::Validation) when a
     /// right-hand side refers to a missing attribute, a nested path's parent
-    /// does not exist, a list index is out of range, or an operand has the
-    /// wrong type for the operator.
+    /// does not exist, a list index is out of range, an operand has the wrong
+    /// type for the operator, or the target paths overlap once `#alias`
+    /// placeholders are resolved.
     pub fn apply(
         &self,
         item: &mut Item,
