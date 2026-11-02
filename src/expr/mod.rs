@@ -20,6 +20,37 @@
 //! assert!(!condition.evaluate(Some(&item), &HashMap::new(), &HashMap::new()).unwrap());
 //! ```
 
+// `lex` and `parse` are hand-written rather than generated from a `pest` or
+// `lalrpop` grammar, against the reuse-before-build default. Three
+// requirements of this crate make a generated parser a net loss:
+//
+// * The error strings are the contract. This is a mock, so callers assert on
+//   the wording the service returns — for example "Invalid UpdateExpression:
+//   Syntax error; token: `AND`, expected SET, REMOVE, ADD or DELETE", "Two
+//   document paths overlap with each other; must remove or rewrite one of
+//   these paths", "The expression can not be empty", and the lexical
+//   "unexpected character '!' at position 7", where the position counts
+//   characters, not bytes. A generated parser reports its own error type and
+//   byte spans, so every message would still be a case-by-case mapping off its
+//   tree: the grammar buys a dependency and a second error model without
+//   removing that work. `tests/expressions.rs::syntax_errors_keep_the_service_wording`
+//   pins the strings so a replacement cannot silently change them.
+// * The size limit must be enforced before anything is allocated: the
+//   4096-byte check in `lex::tokenize` runs on the `&str` before it becomes a
+//   `Vec<char>`. A generated parser builds its tree first, so that check stays
+//   outside it either way.
+// * The depth limit is semantic, not syntactic: one level per `(` group, one
+//   per `NOT`, one per `if_not_exists` fallback, one per `list_append`
+//   argument — while repetition stays free because `AND`/`OR` and `+`/`-`
+//   chains are stored flat. No grammar expresses "this construct costs a
+//   level, that repetition does not"; it would move into hand-written tree
+//   validation after parsing.
+//
+// The grammar is also small and closed — no literals, a fixed keyword set, no
+// upstream version to track — so the maintenance a generated parser saves is
+// small, and `fuzz/fuzz_targets/parse_expression.rs` holds the hand-written
+// pair to the hostile-input bar a generated one would get.
+
 mod eval;
 mod lex;
 mod parse;

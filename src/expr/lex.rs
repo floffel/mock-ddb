@@ -3,6 +3,9 @@
 //! The grammar has no literals: every value is a `:placeholder`, every aliased
 //! name a `#placeholder`, and everything else is an attribute path, a function
 //! name or a keyword.
+//!
+//! Hand-written rather than generated from a grammar; the note above `mod lex`
+//! in [`super`] records why.
 
 use crate::{Error, Result};
 

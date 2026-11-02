@@ -674,3 +674,68 @@ async fn conditions_apply_to_creation_and_deletion() {
     .unwrap();
     assert_eq!(mock.count("users"), 0);
 }
+
+/// The wording of a syntax error is part of what the mock promises, and the
+/// hand-written lexer/parser is kept partly to match it (`src/expr/mod.rs`
+/// documents the reuse decision). A generated parser would have to reproduce
+/// every string below, so they are asserted verbatim rather than by substring.
+#[test]
+fn syntax_errors_keep_the_service_wording() {
+    let cases = [
+        (
+            "a = :v ! b",
+            "Invalid expression: unexpected character '!' at position 7",
+        ),
+        (
+            "a BETWEEN :x",
+            "Invalid expression: Syntax error; the expression ended, expected AND",
+        ),
+        (
+            "a == :v",
+            "Invalid expression: Syntax error; found `:v`, expected an attribute path or a value placeholder",
+        ),
+        (
+            "",
+            "Invalid ConditionExpression: The expression can not be empty",
+        ),
+    ];
+    for (expression, expected) in cases {
+        let error = ConditionExpression::parse(expression).expect_err(expression);
+        assert_eq!(error.to_string(), expected, "{expression}");
+    }
+
+    let cases = [
+        (
+            "SET a = :v SET b = :w",
+            "Invalid UpdateExpression: The \"SET\" section can only be used once in an update expression",
+        ),
+        (
+            "SET a = :v, a.b = :w",
+            "Invalid UpdateExpression: Two document paths overlap with each other; must remove or rewrite one of these paths",
+        ),
+        (
+            "SET a = :v AND b = :w",
+            "Invalid UpdateExpression: Syntax error; token: `AND`, expected SET, REMOVE, ADD or DELETE",
+        ),
+    ];
+    for (expression, expected) in cases {
+        let error = UpdateExpression::parse(expression).expect_err(expression);
+        assert_eq!(error.to_string(), expected, "{expression}");
+    }
+}
+
+/// Positions in a lexical error count characters, not bytes — the service
+/// reports the former, and `größe` is six characters but seven bytes.
+#[test]
+fn lexical_error_positions_count_characters() {
+    let ascii = ConditionExpression::parse("a = :v !").expect_err("unexpected character");
+    assert_eq!(
+        ascii.to_string(),
+        "Invalid expression: unexpected character '!' at position 7"
+    );
+    let unicode = ConditionExpression::parse("größe = :v !").expect_err("unexpected character");
+    assert_eq!(
+        unicode.to_string(),
+        "Invalid expression: unexpected character '!' at position 11"
+    );
+}
