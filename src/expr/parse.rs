@@ -12,6 +12,12 @@ use super::lex::{tokenize, Token};
 use crate::{Error, Result};
 
 /// Maximum nesting depth, so a hostile expression cannot exhaust the stack.
+///
+/// One parenthesised group (`(` … `)`) or one `NOT` prefix costs exactly one
+/// level, so an expression may wrap its innermost comparison in
+/// [`MAX_DEPTH`] such constructs; the next one is rejected. The count is a
+/// value threaded through the recursion, never a counter that has to be
+/// restored, so no path can double-count a level or leak one.
 const MAX_DEPTH: u8 = 64;
 
 /// The most document paths one update expression may write.
@@ -234,7 +240,7 @@ pub(crate) fn parse_condition(input: &str) -> Result<Condition> {
         ));
     }
     let mut parser = Parser::new(&tokens);
-    let condition = parser.condition()?;
+    let condition = parser.condition(0)?;
     if !parser.at_end() {
         return Err(parser.unexpected("end of expression"));
     }
@@ -335,10 +341,24 @@ fn is_prefix(prefix: &Path, path: &Path) -> bool {
     prefix.len() <= path.len() && path.iter().zip(prefix).all(|(a, b)| a == b)
 }
 
+/// The level one syntactic nesting construct deeper than `level`, or the
+/// "nested too deeply" error once [`MAX_DEPTH`] constructs already enclose the
+/// comparison.
+///
+/// Called exactly once per `(` group and once per `NOT` prefix — the two
+/// constructs that recurse — so a level is worth one unit and never two.
+fn nested(level: u8) -> Result<u8> {
+    match level.checked_add(1) {
+        Some(inner) if inner <= MAX_DEPTH => Ok(inner),
+        _ => Err(Error::validation(
+            "Invalid expression: the expression is nested too deeply",
+        )),
+    }
+}
+
 struct Parser<'a> {
     tokens: &'a [Token],
     position: usize,
-    depth: u8,
 }
 
 impl<'a> Parser<'a> {
@@ -346,7 +366,6 @@ impl<'a> Parser<'a> {
         Self {
             tokens,
             position: 0,
-            depth: 0,
         }
     }
 
@@ -423,53 +442,39 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn enter(&mut self) -> Result<()> {
-        if self.depth >= MAX_DEPTH {
-            return Err(Error::validation(
-                "Invalid expression: the expression is nested too deeply",
-            ));
-        }
-        self.depth += 1;
-        Ok(())
-    }
-
     // -- conditions ---------------------------------------------------------
 
-    fn condition(&mut self) -> Result<Condition> {
-        self.enter()?;
-        let mut left = self.and_condition()?;
+    fn condition(&mut self, level: u8) -> Result<Condition> {
+        let mut left = self.and_condition(level)?;
         while self.eat_keyword("OR") {
-            let right = self.and_condition()?;
+            let right = self.and_condition(level)?;
             left = Condition::Or(Box::new(left), Box::new(right));
         }
-        self.depth -= 1;
         Ok(left)
     }
 
-    fn and_condition(&mut self) -> Result<Condition> {
-        let mut left = self.not_condition()?;
+    fn and_condition(&mut self, level: u8) -> Result<Condition> {
+        let mut left = self.not_condition(level)?;
         while self.eat_keyword("AND") {
-            let right = self.not_condition()?;
+            let right = self.not_condition(level)?;
             left = Condition::And(Box::new(left), Box::new(right));
         }
         Ok(left)
     }
 
-    fn not_condition(&mut self) -> Result<Condition> {
-        self.enter()?;
+    fn not_condition(&mut self, level: u8) -> Result<Condition> {
         let condition = if self.eat_keyword("NOT") {
-            Condition::Not(Box::new(self.not_condition()?))
+            Condition::Not(Box::new(self.not_condition(nested(level)?)?))
         } else {
-            self.primary_condition()?
+            self.primary_condition(level)?
         };
-        self.depth -= 1;
         Ok(condition)
     }
 
-    fn primary_condition(&mut self) -> Result<Condition> {
+    fn primary_condition(&mut self, level: u8) -> Result<Condition> {
         if self.peek() == Some(&Token::LParen) {
             self.advance();
-            let inner = self.condition()?;
+            let inner = self.condition(nested(level)?)?;
             self.expect(&Token::RParen)?;
             return Ok(inner);
         }
@@ -770,5 +775,19 @@ mod tests {
         ])
         .is_err());
         assert!(overlap(vec![vec![name("a")], vec![name("a")]]).is_err());
+    }
+
+    #[test]
+    fn nested_counts_one_level_and_stops_at_the_maximum() {
+        for level in 0..MAX_DEPTH {
+            assert_eq!(nested(level), Ok(level + 1));
+        }
+        assert_eq!(
+            nested(MAX_DEPTH).unwrap_err().to_string(),
+            "Invalid expression: the expression is nested too deeply"
+        );
+        // A level counter at its type's maximum reports the limit instead of
+        // overflowing the `+=`.
+        assert!(nested(u8::MAX).is_err());
     }
 }
