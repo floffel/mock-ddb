@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 use aws_sdk_dynamodb::types::AttributeValue;
 
 use super::eval::Ctx;
-use super::parse::{reject_overlapping, Operand, Path, SetValue, Update, UpdateClause};
+use super::parse::{reject_overlapping, ArithOp, Operand, Path, SetValue, Update, UpdateClause};
 use super::path::{get_path, remove_path, render, root, set_path};
 use crate::number::Number;
 use crate::schema::KeySchema;
@@ -177,27 +177,30 @@ fn evaluate_set_value(value: &SetValue, item: &Item, ctx: &Ctx<'_>) -> Result<At
                 ))),
             }
         }
-        SetValue::Plus(left, right) => arithmetic(left, right, item, ctx, false),
-        SetValue::Minus(left, right) => arithmetic(left, right, item, ctx, true),
+        SetValue::Arithmetic { first, rest } => {
+            let mut value = evaluate_set_value(first, item, ctx)?;
+            for (operator, term) in rest {
+                let right = evaluate_set_value(term, item, ctx)?;
+                value = arithmetic(&value, &right, *operator)?;
+            }
+            Ok(value)
+        }
     }
 }
 
-/// Evaluate an arithmetic `SET` right-hand side.
+/// Apply one arithmetic step of a `SET` chain to the running total.
 fn arithmetic(
-    left: &SetValue,
-    right: &SetValue,
-    item: &Item,
-    ctx: &Ctx<'_>,
-    subtract: bool,
+    left: &AttributeValue,
+    right: &AttributeValue,
+    operator: ArithOp,
 ) -> Result<AttributeValue> {
-    let left = evaluate_set_value(left, item, ctx)?;
-    let right = evaluate_set_value(right, item, ctx)?;
-    let (AttributeValue::N(left), AttributeValue::N(right)) = (&left, &right) else {
+    let subtract = operator == ArithOp::Sub;
+    let (AttributeValue::N(left), AttributeValue::N(right)) = (left, right) else {
         return Err(Error::validation(format!(
             "Invalid UpdateExpression: Incorrect operand type for operator or function; operator: {}, operand type: {} and {}",
             if subtract { "-" } else { "+" },
-            type_name(&left),
-            type_name(&right)
+            type_name(left),
+            type_name(right)
         )));
     };
     let (Some(left), Some(right)) = (Number::parse(left), Number::parse(right)) else {

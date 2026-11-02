@@ -166,10 +166,22 @@ pub(crate) fn evaluate(condition: &Condition, item: Option<&Item>, ctx: &Ctx<'_>
             }
             Ok(false)
         }
-        Condition::And(left, right) => {
-            Ok(evaluate(left, item, ctx)? && evaluate(right, item, ctx)?)
+        Condition::And(terms) => {
+            for term in terms {
+                if !evaluate(term, item, ctx)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
         }
-        Condition::Or(left, right) => Ok(evaluate(left, item, ctx)? || evaluate(right, item, ctx)?),
+        Condition::Or(terms) => {
+            for term in terms {
+                if evaluate(term, item, ctx)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
         Condition::Not(inner) => Ok(!evaluate(inner, item, ctx)?),
     }
 }
