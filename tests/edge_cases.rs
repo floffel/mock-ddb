@@ -569,3 +569,93 @@ async fn deleting_a_table_removes_its_stream_and_items() {
         0
     );
 }
+
+/// The service's 4096-byte limit on an expression string, just inside and just
+/// outside, on all three expression kinds.
+#[test]
+fn expression_size_limit_is_enforced_before_parsing() {
+    fn padded(expression: &str, size: usize) -> String {
+        let mut text = String::from(expression);
+        text.push_str(&" ".repeat(size - expression.len()));
+        text
+    }
+
+    let at_limit = padded("REMOVE a", 4096);
+    assert_eq!(at_limit.len(), 4096);
+    assert!(mock_ddb::UpdateExpression::parse(&at_limit).is_ok());
+    let over_limit = padded("REMOVE a", 4097);
+    assert_eq!(over_limit.len(), 4097);
+    let error = mock_ddb::UpdateExpression::parse(&over_limit).unwrap_err();
+    assert!(
+        error.to_string().contains("maximum allowed size"),
+        "unexpected error: {error}"
+    );
+
+    assert!(ConditionExpression::parse(&padded("attribute_exists(pk)", 4096)).is_ok());
+    assert!(ConditionExpression::parse(&padded("attribute_exists(pk)", 4097)).is_err());
+    assert!(mock_ddb::ProjectionExpression::parse(&padded("pk, profile.city", 4096)).is_ok());
+    assert!(mock_ddb::ProjectionExpression::parse(&padded("pk, profile.city", 4097)).is_err());
+}
+
+/// The limit counts bytes of the expression as sent, not characters.
+#[test]
+fn expression_size_limit_counts_bytes() {
+    let name = "ü".repeat(2048);
+    assert_eq!(name.len(), 4096);
+    assert!(mock_ddb::ProjectionExpression::parse(&name).is_ok());
+    assert!(mock_ddb::ProjectionExpression::parse(&format!("{name}ü")).is_err());
+}
+
+/// An oversized expression is rejected for its size, not for its syntax: the
+/// check runs before the text is tokenized.
+#[test]
+fn an_oversized_expression_is_rejected_before_it_is_parsed() {
+    let expression = format!("REMOVE {}%%%", "a".repeat(4090));
+    assert!(expression.len() > 4096);
+    let error = mock_ddb::UpdateExpression::parse(&expression).unwrap_err();
+    assert!(
+        error.to_string().contains("maximum allowed size"),
+        "unexpected error: {error}"
+    );
+}
+
+/// A `REMOVE` naming twenty thousand paths is rejected up front instead of
+/// costing a quadratic overlap scan first.
+#[test]
+fn oversized_remove_list_is_rejected() {
+    let paths: Vec<String> = (0..20_000).map(|index| format!("a{index}")).collect();
+    let expression = format!("REMOVE {}", paths.join(","));
+    assert!(expression.len() > 100_000);
+    let error = mock_ddb::UpdateExpression::parse(&expression).unwrap_err();
+    assert!(
+        error.to_string().contains("maximum allowed size"),
+        "unexpected error: {error}"
+    );
+}
+
+/// A list of paths the service accepts is parsed and applied in full, and the
+/// overlap check still finds a duplicate among hundreds of paths.
+#[test]
+fn a_large_remove_list_within_the_limit_is_applied() {
+    use std::collections::HashMap;
+
+    let paths: Vec<String> = (0..300).map(|index| format!("a{index}")).collect();
+    let expression = format!("REMOVE {}", paths.join(","));
+    assert!(expression.len() < 4096);
+
+    let update = mock_ddb::UpdateExpression::parse(&expression).unwrap();
+    let mut stored = item([("pk", s("u#1"))]);
+    for path in &paths {
+        stored.insert(path.clone(), n("1"));
+    }
+    let touched = update
+        .apply(&mut stored, &HashMap::new(), &HashMap::new())
+        .unwrap();
+    assert_eq!(touched.len(), paths.len());
+    assert!(paths.iter().all(|path| !stored.contains_key(path)));
+    assert!(stored.contains_key("pk"));
+
+    let duplicated = format!("{expression},a0");
+    assert!(duplicated.len() < 4096);
+    assert!(mock_ddb::UpdateExpression::parse(&duplicated).is_err());
+}

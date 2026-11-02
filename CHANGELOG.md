@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- An expression string longer than the service's 4096-byte limit is now rejected
+  before it is tokenized: no `ConditionExpression`, `UpdateExpression` or
+  `ProjectionExpression` above 4096 bytes is accepted, and the oversized text is
+  never copied or parsed. One `REMOVE` naming tens of thousands of paths can no
+  longer burn a Lambda's CPU budget before it fails.
+- The overlap check for update target paths is `O(n log n)`: the paths are
+  sorted and only neighbours are compared, instead of comparing every pair
+  (which cost `n²` `Vec` walks for one large `REMOVE`/`SET` clause). The
+  verdict is unchanged — same path, or an attribute and anything below it — and
+  a property test pins it to an exhaustive pairwise scan.
 - A `ProjectionExpression` now follows a document path to its end instead of
   stopping at the first list index. `items[0].v` returns the element at index 0
   with only `v` instead of every element of `items` with every field, so a test
