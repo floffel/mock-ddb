@@ -144,12 +144,8 @@ fn evaluate_set_value(value: &SetValue, item: &Item, ctx: &Ctx<'_>) -> Result<At
             None => evaluate_set_value(fallback, item, ctx),
         },
         SetValue::ListAppend(first, second) => {
-            let first = ctx
-                .operand_value(first, Some(item))?
-                .ok_or_else(|| undefined_operand(first))?;
-            let second = ctx
-                .operand_value(second, Some(item))?
-                .ok_or_else(|| undefined_operand(second))?;
+            let first = evaluate_set_value(first, item, ctx)?;
+            let second = evaluate_set_value(second, item, ctx)?;
             match (first, second) {
                 (AttributeValue::L(mut left), AttributeValue::L(right)) => {
                     left.extend(right);

@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `list_append` now accepts the function forms the service accepts in its
+  arguments: `list_append(if_not_exists(items, :empty), :more)` and nested
+  `list_append` calls parse instead of failing with "expected an attribute path
+  or a value placeholder", so appending to a list that may not exist yet works.
+  Both arguments are parsed as full set values; arithmetic inside them is still
+  rejected.
 - An expression string longer than the service's 4096-byte limit is now rejected
   before it is tokenized: no `ConditionExpression`, `UpdateExpression` or
   `ProjectionExpression` above 4096 bytes is accepted, and the oversized text is
