@@ -14,8 +14,33 @@ use crate::{Error, Result};
 /// Maximum nesting depth, so a hostile expression cannot exhaust the stack.
 const MAX_DEPTH: u8 = 64;
 
+/// The service's cap on one expression parameter, in UTF-8 bytes of raw text:
+/// "The maximum length of any expression string is 4 KB" — [Constraints in
+/// Amazon DynamoDB](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Constraints.html#limits-expression-parameters).
+///
+/// Checking it before the text is tokenized bounds everything downstream. Four
+/// kilobytes cannot name more than a few thousand document paths (`REMOVE a,b`
+/// is two bytes per path), so neither the parse, the overlap scan nor the item
+/// rewrite can be asked to work on input the service would reject.
+pub(crate) const MAX_EXPRESSION_BYTES: usize = 4096;
+
+/// The most document paths one update expression may write.
+///
+/// The service bounds the text (above) and documents an operator ceiling of 300
+/// per update expression — "the maximum number of operators or functions
+/// allowed in an update expression is 300"
+/// ([Quotas in Amazon DynamoDB](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ServiceQuotas.html#limits-expression-parameters)).
+/// One written path is one node of that tree, so the same number bounds the
+/// paths: it keeps the overlap scan and the item rewrite small even for an
+/// expression that still fits the text cap.
+pub(crate) const MAX_TARGET_PATHS: usize = 300;
+
 /// One step of a document path.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+///
+/// The ordering is only used to group a path with the paths that extend it:
+/// [`validate_no_overlap`] sorts by it, so `Name` and `Index` need a total
+/// order but no meaning beyond that.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Segment {
     /// A map key or top-level attribute. `#alias` entries are unresolved
     /// placeholders until evaluation.
@@ -184,6 +209,15 @@ impl UpdateClause {
         }
     }
 
+    /// The number of paths this clause writes.
+    pub(crate) fn target_count(&self) -> usize {
+        match self {
+            Self::Set(assignments) => assignments.len(),
+            Self::Remove(paths) => paths.len(),
+            Self::Add(pairs) | Self::Delete(pairs) => pairs.len(),
+        }
+    }
+
     /// The clause keyword, for error messages.
     pub(crate) fn keyword(&self) -> &'static str {
         match self {
@@ -210,10 +244,16 @@ impl Update {
             .flat_map(UpdateClause::target_paths)
             .collect()
     }
+
+    /// How many paths the update writes, across all clauses.
+    pub(crate) fn target_count(&self) -> usize {
+        self.clauses.iter().map(UpdateClause::target_count).sum()
+    }
 }
 
 /// Parse a condition expression.
 pub(crate) fn parse_condition(input: &str) -> Result<Condition> {
+    check_size(input, "ConditionExpression")?;
     let tokens = tokenize(input)?;
     if tokens.is_empty() {
         return Err(Error::validation(
@@ -230,6 +270,7 @@ pub(crate) fn parse_condition(input: &str) -> Result<Condition> {
 
 /// Parse an update expression.
 pub(crate) fn parse_update(input: &str) -> Result<Update> {
+    check_size(input, "UpdateExpression")?;
     let tokens = tokenize(input)?;
     if tokens.is_empty() {
         return Err(Error::validation(
@@ -267,12 +308,14 @@ pub(crate) fn parse_update(input: &str) -> Result<Update> {
         clauses.push(clause);
     }
     let update = Update { clauses };
+    validate_target_count(&update)?;
     validate_no_overlap(&update)?;
     Ok(update)
 }
 
 /// Parse a projection expression: a comma-separated list of document paths.
 pub(crate) fn parse_projection(input: &str) -> Result<Vec<Path>> {
+    check_size(input, "ProjectionExpression")?;
     let tokens = tokenize(input)?;
     if tokens.is_empty() {
         return Err(Error::validation(
@@ -290,17 +333,53 @@ pub(crate) fn parse_projection(input: &str) -> Result<Vec<Path>> {
     Ok(paths)
 }
 
+/// Reject an update that writes more paths than [`MAX_TARGET_PATHS`].
+///
+/// The count is one addition per clause and runs before the overlap scan, so an
+/// expression that lists a thousand paths is rejected without comparing any of
+/// them.
+fn validate_target_count(update: &Update) -> Result<()> {
+    let count = update.target_count();
+    if count > MAX_TARGET_PATHS {
+        return Err(Error::validation(format!(
+            "Invalid UpdateExpression: The expression writes {count} document paths; at most {MAX_TARGET_PATHS} are accepted"
+        )));
+    }
+    Ok(())
+}
+
 /// Reject two clauses that write overlapping paths, as the service does.
+///
+/// Every path is compared with its neighbours in lexicographic order only: if
+/// `p` is a prefix of `q`, any path that sorts between them starts with `p` as
+/// well, so the first overlapping pair is always adjacent in sorted order. That
+/// makes the check `O(n log n)` in the number of paths instead of the quadratic
+/// product, and [`MAX_TARGET_PATHS`] bounds `n` at the only entry point that
+/// scans paths.
 fn validate_no_overlap(update: &Update) -> Result<()> {
-    let paths = update.target_paths();
-    for (index, left) in paths.iter().enumerate() {
-        for right in paths.iter().skip(index + 1) {
-            if is_prefix(left, right) || is_prefix(right, left) {
-                return Err(Error::validation(
-                    "Invalid UpdateExpression: Two document paths overlap with each other; must remove or rewrite one of these paths",
-                ));
-            }
+    let mut paths = update.target_paths();
+    paths.sort_unstable();
+    for index in 1..paths.len() {
+        // Only the shorter (= earlier) path can be the prefix here, so the
+        // reverse direction needs no separate test.
+        if is_prefix(paths[index - 1], paths[index]) {
+            return Err(Error::validation(
+                "Invalid UpdateExpression: Two document paths overlap with each other; must remove or rewrite one of these paths",
+            ));
         }
+    }
+    Ok(())
+}
+
+/// Reject an expression parameter longer than [`MAX_EXPRESSION_BYTES`].
+///
+/// The service validates the raw text before it parses anything, so an oversized
+/// clause is a size error even when the rest of it is well formed.
+fn check_size(input: &str, class: &str) -> Result<()> {
+    if input.len() > MAX_EXPRESSION_BYTES {
+        return Err(Error::validation(format!(
+            "Invalid {class}: Expression size has exceeded the maximum allowed size of {MAX_EXPRESSION_BYTES} bytes"
+        )));
     }
     Ok(())
 }
@@ -677,5 +756,181 @@ impl<'a> Parser<'a> {
             return Ok(SetValue::ListAppend(first, second));
         }
         Ok(SetValue::Operand(self.operand()?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// The quadratic check the sorted one replaced. It is the reference the
+    /// property test compares against: the two must agree on every input.
+    fn any_pair_overlaps(paths: &[Path]) -> bool {
+        for (index, left) in paths.iter().enumerate() {
+            for right in paths.iter().skip(index + 1) {
+                if is_prefix(left, right) || is_prefix(right, left) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn removal(paths: Vec<Path>) -> Update {
+        Update {
+            clauses: vec![UpdateClause::Remove(paths)],
+        }
+    }
+
+    /// Pad `expression` with spaces to exactly `size` bytes.
+    fn padded(expression: &str, size: usize) -> String {
+        let mut text = String::from(expression);
+        text.push_str(&" ".repeat(size - expression.len()));
+        text
+    }
+
+    #[test]
+    fn the_size_limit_rejects_4097_bytes_on_every_entry_point() {
+        assert_eq!(padded("REMOVE a", MAX_EXPRESSION_BYTES).len(), 4096);
+        assert!(parse_update(&padded("REMOVE a", MAX_EXPRESSION_BYTES)).is_ok());
+        assert!(parse_condition(&padded("attribute_exists(pk)", MAX_EXPRESSION_BYTES)).is_ok());
+        assert!(parse_projection(&padded("pk, city", MAX_EXPRESSION_BYTES)).is_ok());
+
+        for error in [
+            parse_update(&padded("REMOVE a", MAX_EXPRESSION_BYTES + 1)).unwrap_err(),
+            parse_condition(&padded("attribute_exists(pk)", MAX_EXPRESSION_BYTES + 1)).unwrap_err(),
+            parse_projection(&padded("pk, city", MAX_EXPRESSION_BYTES + 1)).unwrap_err(),
+        ] {
+            assert_eq!(error.code(), "ValidationException");
+            assert!(error.to_string().contains("4096"), "{error}");
+        }
+    }
+
+    #[test]
+    fn the_size_limit_counts_bytes_of_the_parameter() {
+        // 2048 two-byte characters are exactly 4096 bytes.
+        let name = "ü".repeat(MAX_EXPRESSION_BYTES / 2);
+        assert_eq!(name.len(), MAX_EXPRESSION_BYTES);
+        assert!(parse_projection(&name).is_ok());
+        assert!(parse_projection(&format!("{name}ü")).is_err());
+    }
+
+    /// `REMOVE a0, a1, …` with `count` distinct top-level paths.
+    fn removals(count: usize) -> String {
+        let paths: Vec<String> = (0..count).map(|index| format!("a{index}")).collect();
+        format!("REMOVE {}", paths.join(", "))
+    }
+
+    #[test]
+    fn the_path_cap_accepts_300_paths_and_rejects_301() {
+        let fitting = removals(MAX_TARGET_PATHS);
+        assert!(fitting.len() < MAX_EXPRESSION_BYTES, "{fitting}");
+        assert!(parse_update(&fitting).is_ok());
+
+        let error = parse_update(&removals(MAX_TARGET_PATHS + 1)).unwrap_err();
+        assert_eq!(error.code(), "ValidationException");
+        assert!(error.to_string().contains("301"), "{error}");
+    }
+
+    #[test]
+    fn the_path_cap_counts_the_paths_of_every_clause() {
+        let sets: Vec<String> = (0..150).map(|index| format!("s{index} = :v")).collect();
+        let removals: Vec<String> = (0..151).map(|index| format!("r{index}")).collect();
+        let expression = format!("SET {} REMOVE {}", sets.join(", "), removals.join(", "));
+        assert!(expression.len() < MAX_EXPRESSION_BYTES, "{expression}");
+
+        // 150 + 151 = 301 across two clauses is over the cap.
+        let error = parse_update(&expression).unwrap_err();
+        assert!(error.to_string().contains("301"), "{error}");
+
+        // 150 + 150 = 300 is inside it.
+        let removals: Vec<String> = (0..150).map(|index| format!("r{index}")).collect();
+        let expression = format!("SET {} REMOVE {}", sets.join(", "), removals.join(", "));
+        assert!(parse_update(&expression).is_ok());
+    }
+
+    #[test]
+    fn a_path_that_extends_a_sibling_in_source_order_is_still_caught() {
+        // The overlapping pair is not adjacent in the expression, only in the
+        // sorted order the check works on.
+        assert!(parse_update("SET a.b = :v, c = :w REMOVE a").is_err());
+        assert!(parse_update("REMOVE b, a.c, a").is_err());
+        // Siblings that merely share a prefix are not an overlap.
+        assert!(parse_update("REMOVE ab, a, ac").is_ok());
+    }
+
+    #[test]
+    fn adjacent_paths_in_sorted_order_are_the_overlapping_ones() {
+        let path = |segments: &[Segment]| segments.to_vec();
+        // `a` sorts before its own extension, so the pair is adjacent even
+        // though the source order lists them far apart.
+        let update = removal(vec![
+            path(&[Segment::Name("a".into())]),
+            path(&[Segment::Name("b".into())]),
+            path(&[Segment::Name("a".into()), Segment::Name("b".into())]),
+            path(&[Segment::Name("c".into())]),
+        ]);
+        assert!(validate_no_overlap(&update).is_err());
+
+        // A list index is an extension of the attribute, not a sibling.
+        let update = removal(vec![
+            path(&[Segment::Name("ab".into())]),
+            path(&[Segment::Name("a".into())]),
+            path(&[Segment::Name("a".into()), Segment::Index(0)]),
+            path(&[Segment::Name("a".into()), Segment::Index(1)]),
+        ]);
+        assert!(validate_no_overlap(&update).is_err());
+
+        // Names that merely share a prefix are unrelated paths.
+        let update = removal(vec![
+            path(&[Segment::Name("ab".into())]),
+            path(&[Segment::Name("a".into())]),
+            path(&[Segment::Name("c".into())]),
+            path(&[Segment::Name("b".into()), Segment::Index(0)]),
+        ]);
+        assert!(validate_no_overlap(&update).is_ok());
+    }
+
+    fn segment() -> impl Strategy<Value = Segment> {
+        prop_oneof![
+            prop::sample::select(vec!["a", "ab", "b"])
+                .prop_map(|name| Segment::Name(name.to_string())),
+            (0_usize..3).prop_map(Segment::Index),
+        ]
+    }
+
+    proptest! {
+        /// The sorted check must find exactly the overlaps the quadratic one
+        /// finds — no input may slip through and none may be rejected wrongly.
+        #[test]
+        fn the_sorted_check_agrees_with_the_quadratic_one(
+            paths in prop::collection::vec(prop::collection::vec(segment(), 1..3), 0..7),
+        ) {
+            let expected = any_pair_overlaps(&paths);
+            prop_assert_eq!(validate_no_overlap(&removal(paths)).is_err(), expected);
+        }
+
+        /// Parsing never panics on arbitrary path lists that fit the size cap.
+        #[test]
+        fn parsing_a_path_list_never_panics(
+            paths in prop::collection::vec(prop::collection::vec(segment(), 1..3), 0..5),
+        ) {
+            let rendered: Vec<String> = paths
+                .iter()
+                .map(|path| {
+                    path.iter()
+                        .map(|segment| match segment {
+                            Segment::Name(name) => name.clone(),
+                            Segment::Index(index) => format!("[{index}]"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(".")
+                        .replace(".[", "[")
+                })
+                .collect();
+            let _ = parse_update(&format!("REMOVE {}", rendered.join(", ")));
+            let _ = parse_projection(&rendered.join(", "));
+        }
     }
 }

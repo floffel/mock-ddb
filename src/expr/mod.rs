@@ -91,8 +91,8 @@ impl ConditionExpression {
     /// # Errors
     ///
     /// Returns [`Error::Validation`](crate::Error::Validation) when the
-    /// expression is empty, malformed, nested too deeply or uses an unknown
-    /// function.
+    /// expression is empty, longer than the service's 4 KB ceiling, malformed,
+    /// nested too deeply or uses an unknown function.
     pub fn parse(input: &str) -> Result<Self> {
         Ok(Self {
             condition: parse_condition(input)?,
@@ -169,11 +169,16 @@ impl UpdateExpression {
     /// Parse an update expression with `SET`, `REMOVE`, `ADD` and `DELETE`
     /// clauses.
     ///
+    /// At most 300 document paths are accepted across all clauses
+    /// (`MAX_TARGET_PATHS`), and the expression text is capped at the service's
+    /// 4 KB, so neither the overlap check nor the item rewrite can be made to
+    /// grow with the square of an attacker-chosen input.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Validation`](crate::Error::Validation) when the
-    /// expression is malformed, repeats a clause, or writes the same document
-    /// path twice.
+    /// expression is longer than 4 KB, malformed, repeats a clause, writes more
+    /// than 300 document paths, or writes the same document path twice.
     pub fn parse(input: &str) -> Result<Self> {
         Ok(Self {
             update: parse_update(input)?,
@@ -267,8 +272,8 @@ impl ProjectionExpression {
     /// # Errors
     ///
     /// Returns [`Error::Validation`](crate::Error::Validation) when the
-    /// expression is empty, a path is malformed, or it names more than 100
-    /// document paths.
+    /// expression is empty, longer than the service's 4 KB ceiling, a path is
+    /// malformed, or it names more than 100 document paths.
     pub fn parse(input: &str) -> Result<Self> {
         let paths = parse_projection(input)?;
         check_path_count(paths.len())?;
