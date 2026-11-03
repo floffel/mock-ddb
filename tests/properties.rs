@@ -176,7 +176,14 @@ proptest! {
         let attribute_values = values([(":v", s(value.clone()))]);
         let mut item = item([("pk", s("u#1"))]);
         for _ in 0..rounds {
-            expression.apply(&mut item, &names, &attribute_values).unwrap();
+            expression
+                .apply(
+                    &mut item,
+                    &KeySchema::hash("pk", KeyType::String),
+                    &names,
+                    &attribute_values,
+                )
+                .unwrap();
         }
         assert_eq!(item.get("state"), Some(&s(value)));
     }

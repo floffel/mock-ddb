@@ -6,9 +6,14 @@ use std::collections::HashMap;
 
 use common::users;
 use mock_ddb::{
-    item, n, s, values, AttributeValue, ConditionExpression, GetItemRequest, Item, MockDdb,
-    ProjectionExpression, PutItemRequest, UpdateExpression, UpdateItemRequest,
+    item, n, s, values, AttributeValue, ConditionExpression, GetItemRequest, Item, KeySchema,
+    KeyType, MockDdb, ProjectionExpression, PutItemRequest, UpdateExpression, UpdateItemRequest,
 };
+
+/// The key schema of the `users` table these expressions are applied to.
+fn users_schema() -> KeySchema {
+    KeySchema::hash("pk", KeyType::String)
+}
 
 /// An item exercising every value shape the expression evaluator handles.
 fn rich_item() -> Item {
@@ -471,9 +476,12 @@ fn update_expressions_are_idempotent_where_semantics_say_so() {
     let once = UpdateExpression::parse("SET state = :v, version = :one").unwrap();
     let twice = once.clone();
     let mut item = item([("pk", s("u#1"))]);
-    once.apply(&mut item, &names, &attribute_values).unwrap();
+    once.apply(&mut item, &users_schema(), &names, &attribute_values)
+        .unwrap();
     let after_once = item.clone();
-    twice.apply(&mut item, &names, &attribute_values).unwrap();
+    twice
+        .apply(&mut item, &users_schema(), &names, &attribute_values)
+        .unwrap();
     assert_eq!(item, after_once);
 
     // Orphaned Idempotent invariants are exactly what the mock must preserve.
@@ -490,22 +498,78 @@ fn arithmetic_and_list_append_type_errors() {
     let attribute_values = values([(":two", n("2")), (":list", AttributeValue::L(vec![s("a")]))]);
 
     let add = UpdateExpression::parse("SET count = count + :two").unwrap();
-    add.apply(&mut item, &names, &attribute_values).unwrap();
+    add.apply(&mut item, &users_schema(), &names, &attribute_values)
+        .unwrap();
     assert_eq!(item.get("count"), Some(&n("3")));
 
     let sub = UpdateExpression::parse("SET count = count - :two").unwrap();
-    sub.apply(&mut item, &names, &attribute_values).unwrap();
+    sub.apply(&mut item, &users_schema(), &names, &attribute_values)
+        .unwrap();
     assert_eq!(item.get("count"), Some(&n("1")));
 
     let bad_add = UpdateExpression::parse("SET name = name + :two").unwrap();
     assert!(bad_add
-        .apply(&mut item.clone(), &names, &attribute_values)
+        .apply(
+            &mut item.clone(),
+            &users_schema(),
+            &names,
+            &attribute_values
+        )
         .is_err());
 
     let bad_append = UpdateExpression::parse("SET name = list_append(name, :list)").unwrap();
     assert!(bad_append
-        .apply(&mut item.clone(), &names, &attribute_values)
+        .apply(
+            &mut item.clone(),
+            &users_schema(),
+            &names,
+            &attribute_values
+        )
         .is_err());
+}
+
+/// Applying an update expression validates against the caller's key schema,
+/// not against a built-in guess: an expression that rewrites a key attribute is
+/// rejected, and the item is left as it was.
+#[test]
+fn apply_rejects_an_update_that_rewrites_a_key() {
+    let names = HashMap::new();
+    let attribute_values = values([(":moved", s("moved"))]);
+    let composite = KeySchema::hash_and_range("pk", KeyType::String, "sk", KeyType::String);
+
+    let expression = UpdateExpression::parse("SET sk = :moved").unwrap();
+    let mut item = item([("pk", s("u#1")), ("sk", s("1"))]);
+    let error = expression
+        .apply(&mut item, &composite, &names, &attribute_values)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("part of the key"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(item.get("sk"), Some(&s("1")), "no key was rewritten");
+
+    // The partition key is protected the same way.
+    let expression = UpdateExpression::parse("SET pk = :moved").unwrap();
+    assert!(expression
+        .apply(&mut item, &composite, &names, &attribute_values)
+        .is_err());
+
+    // Just inside the boundary: `sk` is only a key where the schema says so.
+    // A hash-only table has no sort key, so the same write is a plain attribute
+    // update.
+    let expression = UpdateExpression::parse("SET sk = :moved").unwrap();
+    let hash_only = KeySchema::hash("pk", KeyType::String);
+    expression
+        .apply(&mut item, &hash_only, &names, &attribute_values)
+        .unwrap();
+    assert_eq!(item.get("sk"), Some(&s("moved")));
+
+    // A name that merely shares a prefix with a key is not a key.
+    let expression = UpdateExpression::parse("SET pks = :moved").unwrap();
+    expression
+        .apply(&mut item, &composite, &names, &attribute_values)
+        .unwrap();
+    assert_eq!(item.get("pks"), Some(&s("moved")));
 }
 
 #[tokio::test]

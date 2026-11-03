@@ -141,8 +141,14 @@ impl KeySchema {
 }
 
 impl Default for KeySchema {
-    /// `pk` of type `S`, with no sort key — the layout most hand-written
-    /// tables use, and the one the pre-extraction mock hard-coded.
+    /// `pk` of type `S`, with no sort key.
+    ///
+    /// This exists so that request types holding a key schema can derive
+    /// `Default`; it is not a table's schema and is never a substitute for one.
+    /// Nothing in this crate validates against a defaulted schema — see
+    /// [`UpdateExpression::apply`](crate::UpdateExpression::apply), which
+    /// requires the caller's schema — so a caller with a table passes
+    /// `table.key_schema()` or the schema it created the table with.
     fn default() -> Self {
         Self::hash("pk", KeyType::String)
     }

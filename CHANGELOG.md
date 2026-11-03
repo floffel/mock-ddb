@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `UpdateExpression::apply` now takes the table's `KeySchema` and validates
+  against it, instead of substituting a defaulted `pk`-only schema: an
+  expression that rewrites a key attribute of the table it belongs to is
+  rejected wherever it is applied, not only through `MockDdb`. The previous
+  signature accepted `SET sk = :v` on a `pk`/`sk` table and let the write reach
+  the item, so an expression a test called valid could be rejected at runtime.
+  `apply_to_table` is gone — `apply` is the one entry point and it is the
+  protected one.
 - Overlap validation for update target paths now resolves `#alias` segments
   first: `SET #n = :a, n = :b`, `SET #a = :x, #b = :y` with both aliases naming
   one attribute, and `SET #n.#m = :x, n.m = :y` are rejected with the service's

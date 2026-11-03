@@ -10,7 +10,8 @@ use std::collections::HashMap;
 
 use libfuzzer_sys::fuzz_target;
 use mock_ddb::{
-    n, s, AttributeValue, Blob, ConditionExpression, Item, ProjectionExpression, UpdateExpression,
+    n, s, AttributeValue, Blob, ConditionExpression, Item, KeySchema, KeyType, ProjectionExpression,
+    UpdateExpression,
 };
 
 /// Turn a byte slice into an item with string, number, binary, list and map
@@ -61,6 +62,7 @@ fuzz_target!(|data: &[u8]| {
         let _ = condition.evaluate(Some(&item), &names, &values);
     }
 
+    let schema = KeySchema::hash("pk", KeyType::String);
     for expression in [
         "SET #a = :v",
         "SET #c[0] = :v",
@@ -74,7 +76,7 @@ fuzz_target!(|data: &[u8]| {
     ] {
         let update = UpdateExpression::parse(expression).expect("fixed update parses");
         let mut copy = item.clone();
-        let _ = update.apply(&mut copy, &names, &values);
+        let _ = update.apply(&mut copy, &schema, &names, &values);
     }
 
     let projection = ProjectionExpression::parse("#a, #c[0]").expect("fixed projection parses");
