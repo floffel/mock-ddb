@@ -13,6 +13,7 @@
 //! service writes nothing at all when it rejects an update. A caller that gets
 //! an error therefore keeps exactly the item it passed in.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -42,7 +43,7 @@ fn reject_overlapping_targets(update: &Update, ctx: &Ctx<'_>) -> Result<()> {
     let resolved = update
         .target_paths()
         .into_iter()
-        .map(|path| ctx.resolve(path))
+        .map(|path| ctx.resolve(path).map(Cow::into_owned))
         .collect::<Result<Vec<Path>>>()?;
     let mut paths: Vec<&Path> = resolved.iter().collect();
     reject_overlapping(&mut paths)
@@ -71,7 +72,7 @@ pub(crate) fn apply(
         match clause {
             UpdateClause::Set(assignments) => {
                 for (path, value) in assignments {
-                    let resolved = ctx.resolve(path)?;
+                    let resolved = ctx.resolve(path)?.into_owned();
                     let name = root(&resolved)
                         .ok_or_else(|| invalid_path(&resolved))?
                         .to_string();
@@ -83,7 +84,7 @@ pub(crate) fn apply(
             }
             UpdateClause::Remove(paths) => {
                 for path in paths {
-                    let resolved = ctx.resolve(path)?;
+                    let resolved = ctx.resolve(path)?.into_owned();
                     let name = root(&resolved)
                         .ok_or_else(|| invalid_path(&resolved))?
                         .to_string();
@@ -94,13 +95,14 @@ pub(crate) fn apply(
             }
             UpdateClause::Add(pairs) => {
                 for (path, operand) in pairs {
-                    let resolved = ctx.resolve(path)?;
+                    let resolved = ctx.resolve(path)?.into_owned();
                     let name = root(&resolved)
                         .ok_or_else(|| invalid_path(&resolved))?
                         .to_string();
                     reject_key_attribute(&name, key_schema)?;
                     let delta = ctx
                         .operand_value(operand, Some(&work))?
+                        .map(Cow::into_owned)
                         .ok_or_else(|| undefined_operand(operand))?;
                     let current = get_path(&work, &resolved).cloned();
                     let updated = match current {
@@ -124,13 +126,14 @@ pub(crate) fn apply(
             }
             UpdateClause::Delete(pairs) => {
                 for (path, operand) in pairs {
-                    let resolved = ctx.resolve(path)?;
+                    let resolved = ctx.resolve(path)?.into_owned();
                     let name = root(&resolved)
                         .ok_or_else(|| invalid_path(&resolved))?
                         .to_string();
                     reject_key_attribute(&name, key_schema)?;
                     let delta = ctx
                         .operand_value(operand, Some(&work))?
+                        .map(Cow::into_owned)
                         .ok_or_else(|| undefined_operand(operand))?;
                     let Some(current) = get_path(&work, &resolved).cloned() else {
                         continue;
@@ -167,9 +170,10 @@ fn evaluate_set_value(value: &SetValue, item: &Item, ctx: &Ctx<'_>) -> Result<At
     match value {
         SetValue::Operand(operand) => ctx
             .operand_value(operand, Some(item))?
+            .map(Cow::into_owned)
             .ok_or_else(|| undefined_operand(operand)),
         SetValue::IfNotExists(path, fallback) => match ctx.path_value(path, Some(item))? {
-            Some(existing) => Ok(existing),
+            Some(existing) => Ok(existing.clone()),
             None => evaluate_set_value(fallback, item, ctx),
         },
         SetValue::ListAppend(first, second) => {
