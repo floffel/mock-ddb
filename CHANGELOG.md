@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- An `Internal` failure can now carry the lower-layer error that caused it.
+  `Error::internal_from(message, cause)` stores the cause as
+  `std::error::Error::source`, so a caller walks from the rendered message to the
+  real failure instead of parsing a flattened string; `Error::internal(message)`
+  still builds the variant without a cause and its chain ends there. `PartialEq`
+  is now hand-written (a boxed cause is neither `Clone`-comparable nor
+  `PartialEq`) and compares the rendered cause alongside the message, so
+  `Error` keeps the structural equality callers already relied on.
+
 ### Fixed
 
 - A `ConditionalCheckFailedException` now renders the table it was raised for:

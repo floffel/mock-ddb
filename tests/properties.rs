@@ -427,9 +427,7 @@ fn every_variant(payload: &str) -> Vec<Error> {
         Error::ItemCollectionSizeLimitExceeded {
             message: payload.to_string(),
         },
-        Error::Internal {
-            message: payload.to_string(),
-        },
+        Error::internal(payload.to_string()),
     ]
 }
 

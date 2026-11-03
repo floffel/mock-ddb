@@ -21,6 +21,8 @@
 //! # }
 //! ```
 
+use std::sync::Arc;
+
 use aws_sdk_dynamodb::types::AttributeValue;
 
 use crate::Item;
@@ -44,7 +46,13 @@ use crate::Item;
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A DynamoDB failure.
-#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+///
+/// Equality ignores nothing that a test can observe: two failures are equal
+/// when they are the same class, carry the same details and — for
+/// [`Error::Internal`] — name the same root cause. The cause is compared by its
+/// rendered text, because a boxed [`std::error::Error`] is not itself
+/// comparable.
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     /// The table (or index) named in the request does not exist.
@@ -111,11 +119,114 @@ pub enum Error {
 
     /// An invariant of the mock itself was violated. Reaching this is a bug in
     /// `mock-ddb`, not a property of the request.
+    ///
+    /// When a lower layer raised the failure — a number that does not parse, a
+    /// blob that is not UTF-8 — [`Error::internal_from`] keeps that error as the
+    /// [`source`](std::error::Error::source), so the chain ends at the real
+    /// cause instead of at a rendered string.
     #[error("{message}")]
     Internal {
         /// What went wrong inside the mock.
         message: String,
+        /// The lower-layer failure that made the invariant fail, or `None` when
+        /// the message is the whole story.
+        #[source]
+        source: Option<Arc<dyn std::error::Error + Send + Sync>>,
     },
+}
+
+impl PartialEq for Error {
+    /// Compare class, details and — for [`Error::Internal`] — the rendered root
+    /// cause.
+    ///
+    /// A boxed cause cannot be compared structurally, so it takes part in the
+    /// comparison through its own [`Display`](std::fmt::Display) text: two
+    /// internals are equal when they say the same thing and were caused by
+    /// failures that say the same thing.
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::ResourceNotFound {
+                    resource: left_resource,
+                    message: left_message,
+                },
+                Self::ResourceNotFound {
+                    resource: right_resource,
+                    message: right_message,
+                },
+            ) => left_resource == right_resource && left_message == right_message,
+            (
+                Self::ResourceInUse {
+                    message: left_message,
+                },
+                Self::ResourceInUse {
+                    message: right_message,
+                },
+            )
+            | (
+                Self::Validation {
+                    message: left_message,
+                },
+                Self::Validation {
+                    message: right_message,
+                },
+            )
+            | (
+                Self::ItemCollectionSizeLimitExceeded {
+                    message: left_message,
+                },
+                Self::ItemCollectionSizeLimitExceeded {
+                    message: right_message,
+                },
+            ) => left_message == right_message,
+            (
+                Self::ConditionalCheckFailed {
+                    table: left_table,
+                    message: left_message,
+                    item: left_item,
+                },
+                Self::ConditionalCheckFailed {
+                    table: right_table,
+                    message: right_message,
+                    item: right_item,
+                },
+            ) => {
+                left_table == right_table
+                    && left_message == right_message
+                    && left_item == right_item
+            }
+            (
+                Self::TransactionCanceled {
+                    message: left_message,
+                    reasons: left_reasons,
+                },
+                Self::TransactionCanceled {
+                    message: right_message,
+                    reasons: right_reasons,
+                },
+            ) => left_message == right_message && left_reasons == right_reasons,
+            (
+                Self::Internal {
+                    message: left_message,
+                    source: left_source,
+                },
+                Self::Internal {
+                    message: right_message,
+                    source: right_source,
+                },
+            ) => {
+                left_message == right_message
+                    && render_source(left_source.as_deref())
+                        == render_source(right_source.as_deref())
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The root cause as text, so that two sources can be compared at all.
+fn render_source(source: Option<&(dyn std::error::Error + Send + Sync)>) -> Option<String> {
+    source.map(ToString::to_string)
 }
 
 impl Error {
@@ -297,17 +408,52 @@ impl Error {
         }
     }
 
-    /// Build an `InternalServerError`.
-    #[must_use]
+    /// Build an `InternalServerError` whose message is the whole story.
     ///
     /// ```
     /// use mock_ddb::Error;
     ///
     /// assert_eq!(Error::internal("bug").code(), "InternalServerError");
     /// ```
+    #[must_use]
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal {
             message: message.into(),
+            source: None,
+        }
+    }
+
+    /// Build an `InternalServerError` caused by a lower-layer failure.
+    ///
+    /// The message is what the caller reads; the source is what it walks to
+    /// when it wants the root cause. Nothing of the source is repeated in the
+    /// message, and the cause stays reachable through
+    /// [`source`](std::error::Error::source).
+    ///
+    /// ```
+    /// use std::error::Error as _;
+    ///
+    /// use mock_ddb::Error;
+    ///
+    /// let cause = "7,5".parse::<u32>().unwrap_err();
+    /// let error = Error::internal_from("the stored count is not an integer", cause);
+    ///
+    /// assert_eq!(error.code(), "InternalServerError");
+    /// assert_eq!(error.to_string(), "the stored count is not an integer");
+    /// let source = error.source().expect("the cause is kept");
+    /// assert_eq!(source.to_string(), "invalid digit found in string");
+    ///
+    /// // Inside: no lower layer, so no chain. Outside: the cause is walked.
+    /// assert!(Error::internal("bug").source().is_none());
+    /// ```
+    #[must_use]
+    pub fn internal_from(
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::Internal {
+            message: message.into(),
+            source: Some(Arc::new(source)),
         }
     }
 
