@@ -264,13 +264,13 @@ async fn cancelled_transaction_leaves_no_partial_state() {
     match &result {
         Error::TransactionCanceled { reasons, .. } => {
             assert_eq!(reasons.len(), 2);
-            assert_eq!(reasons[0].code, mock_ddb::CancellationReasonCode::None);
+            assert_eq!(reasons[0].code(), mock_ddb::CancellationReasonCode::None);
             assert_eq!(
-                reasons[1].code,
+                reasons[1].code(),
                 mock_ddb::CancellationReasonCode::ConditionalCheckFailed
             );
-            assert!(reasons[1].message.contains("orders"));
-            assert!(reasons[1].item.is_none());
+            assert!(reasons[1].message().contains("orders"));
+            assert!(reasons[1].item().is_none());
         }
         other => panic!("expected a cancelled transaction, got {other:?}"),
     }
@@ -310,14 +310,14 @@ async fn cancellation_reason_carries_the_old_item_when_requested() {
 
     let reasons = error.cancellation_reasons();
     assert_eq!(reasons.len(), 2);
-    assert_eq!(reasons[0].code, mock_ddb::CancellationReasonCode::None);
+    assert_eq!(reasons[0].code(), mock_ddb::CancellationReasonCode::None);
     assert_eq!(
-        reasons[1].code,
+        reasons[1].code(),
         mock_ddb::CancellationReasonCode::ConditionalCheckFailed
     );
     assert_eq!(
-        reasons[1].item,
-        Some(order("c1", 1, "10")),
+        reasons[1].item(),
+        Some(&order("c1", 1, "10")),
         "the reason must carry the pre-transaction image"
     );
     assert_eq!(mock.count("orders"), 1);
