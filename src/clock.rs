@@ -3,6 +3,11 @@
 //! TTL expiry and stream timestamps are the only time-dependent behaviour, and
 //! both are decided by [`Clock`]. Tests inject a [`MockClock`] to move time
 //! forward without sleeping; everything else gets [`SystemClock`].
+//!
+//! This is hand-rolled because no maintained crate freezes [`SystemTime`]:
+//! `mock_instant` 0.6.1 mocks `std::time::Instant` only (TTL and stream
+//! timestamps are `SystemTime`), and `chronobreak` 0.1.0 is unmaintained since
+//! 2021. Only the two types above are needed, so the trait stays local.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
