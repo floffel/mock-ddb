@@ -37,6 +37,21 @@ pub(crate) struct Ctx<'a> {
     pub(crate) values: &'a ValueMap,
 }
 
+/// The service's rejection of an `#alias` that has no entry in the names map.
+fn undefined_name(alias: &str) -> Error {
+    Error::validation(format!(
+        "Invalid expression: An expression attribute name used in the document path is not defined; attribute name: #{alias}"
+    ))
+}
+
+/// The service's rejection of a `:placeholder` that has no entry in the values
+/// map.
+fn undefined_value(placeholder: &str) -> Error {
+    Error::validation(format!(
+        "Invalid expression: An expression attribute value used in expression is not defined; attribute value: :{placeholder}"
+    ))
+}
+
 impl Ctx<'_> {
     /// Replace `#alias` segments with the attribute names they stand for.
     ///
@@ -55,11 +70,8 @@ impl Ctx<'_> {
                 Segment::Name(name) => match name.strip_prefix('#') {
                     Some(alias) => {
                         // The map is keyed by the whole `#alias` segment.
-                        let replacement = self.names.get(name).ok_or_else(|| {
-                            Error::validation(format!(
-                                "Invalid expression: An expression attribute name used in the document path is not defined; attribute name: #{alias}"
-                            ))
-                        })?;
+                        let replacement =
+                            self.names.get(name).ok_or_else(|| undefined_name(alias))?;
                         resolved.push(Segment::Name(replacement.clone()));
                     }
                     None => resolved.push(Segment::Name(name.clone())),
@@ -68,6 +80,38 @@ impl Ctx<'_> {
             }
         }
         Ok(Cow::Owned(resolved))
+    }
+
+    /// Check that every `#alias` in `path` has an entry in the names map.
+    ///
+    /// This is the same test [`Ctx::resolve`] makes, without building the
+    /// resolved path: it exists so a whole condition can be checked before
+    /// evaluation reads anything.
+    pub(crate) fn check_path(&self, path: &Path) -> Result<()> {
+        for segment in path {
+            if let Segment::Name(name) = segment {
+                if let Some(alias) = name.strip_prefix('#') {
+                    if !self.names.contains_key(name) {
+                        return Err(undefined_name(alias));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Check that an operand's `#alias` and `:placeholder` references exist.
+    pub(crate) fn check_operand(&self, operand: &Operand) -> Result<()> {
+        match operand {
+            Operand::Path(path) | Operand::Size(path) => self.check_path(path),
+            Operand::Value(placeholder) => {
+                if self.values.contains_key(&format!(":{placeholder}")) {
+                    Ok(())
+                } else {
+                    Err(undefined_value(placeholder))
+                }
+            }
+        }
     }
 
     /// Read a path from an item, resolving aliases.
@@ -94,14 +138,10 @@ impl Ctx<'_> {
     ) -> Result<Option<Cow<'i, AttributeValue>>> {
         match operand {
             Operand::Path(path) => Ok(self.path_value(path, item)?.map(Cow::Borrowed)),
-            Operand::Value(placeholder) => {
-                match self.values.get(&format!(":{placeholder}")) {
-                    Some(value) => Ok(Some(Cow::Borrowed(value))),
-                    None => Err(Error::validation(format!(
-                        "Invalid expression: An expression attribute value used in expression is not defined; attribute value: :{placeholder}"
-                    ))),
-                }
-            }
+            Operand::Value(placeholder) => match self.values.get(&format!(":{placeholder}")) {
+                Some(value) => Ok(Some(Cow::Borrowed(value))),
+                None => Err(undefined_value(placeholder)),
+            },
             // `size()` of a missing attribute stays absent — the condition is
             // false, not an error — but of a value the function cannot measure
             // it is the service's `ValidationException`.
@@ -140,6 +180,53 @@ fn size_of(value: &AttributeValue) -> Result<u64> {
         // release adds must not acquire one: both are the service's rejection.
         _ => return Err(operand_type_error("size", value)),
     })
+}
+
+/// Check that every `#alias` and `:value` a condition names is defined, in
+/// source order.
+///
+/// The service validates the two maps against the expression before it
+/// evaluates anything, so an undefined placeholder is rejected on every call —
+/// including one where `AND`/`OR` short-circuiting would never reach the branch
+/// that names it. Evaluation resolves placeholders lazily, which is what keeps
+/// the common case allocation-free, so this pass runs first and the lazy
+/// errors stay as an internal invariant: a condition that reaches evaluation
+/// after passing this check can only be missing a placeholder if the check
+/// itself is wrong.
+///
+/// Recursion is as deep as the parser allows, which is bounded by the 64-level
+/// nesting limit.
+pub(crate) fn validate(condition: &Condition, ctx: &Ctx<'_>) -> Result<()> {
+    match condition {
+        Condition::AttributeExists(path) | Condition::AttributeNotExists(path) => {
+            ctx.check_path(path)
+        }
+        Condition::AttributeType(path, operand)
+        | Condition::BeginsWith(path, operand)
+        | Condition::Contains(path, operand) => {
+            ctx.check_path(path)?;
+            ctx.check_operand(operand)
+        }
+        Condition::Compare(left, _, right) => {
+            ctx.check_operand(left)?;
+            ctx.check_operand(right)
+        }
+        Condition::Between(value, low, high) => {
+            ctx.check_operand(value)?;
+            ctx.check_operand(low)?;
+            ctx.check_operand(high)
+        }
+        Condition::In(value, entries) => {
+            ctx.check_operand(value)?;
+            entries
+                .iter()
+                .try_for_each(|entry| ctx.check_operand(entry))
+        }
+        Condition::And(terms) | Condition::Or(terms) => {
+            terms.iter().try_for_each(|term| validate(term, ctx))
+        }
+        Condition::Not(inner) => validate(inner, ctx),
+    }
 }
 
 /// Evaluate a condition against an item.

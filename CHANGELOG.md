@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- An undefined `#alias` or `:value` placeholder is now reported even when
+  `AND`/`OR` short-circuiting never evaluates the branch that names it.
+  `ConditionExpression::evaluate` checks both maps against the whole expression
+  before it reads anything, the way the service validates a request statically:
+  `attribute_not_exists(pk) OR #typo = :v` used to succeed against the mock and
+  fail with a `ValidationException` for every call against DynamoDB. The lazy
+  resolution inside evaluation stays, so the common case still allocates
+  nothing.
 - A wrongly typed operand of `begins_with` or `contains` is now a
   `ValidationException` instead of a condition that evaluates to false.
   `begins_with(count, :s)`, `begins_with(blob, :s)`, `begins_with(tags, :s)` and

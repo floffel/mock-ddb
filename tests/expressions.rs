@@ -248,6 +248,85 @@ fn undefined_placeholders_and_incomparable_types_are_errors() {
         .is_err());
 }
 
+#[test]
+fn undefined_placeholders_fail_in_a_short_circuited_branch() {
+    let item = rich_item();
+    let empty_names = HashMap::new();
+    let empty_values = HashMap::new();
+
+    // `attribute_exists(pk)` holds, so `OR` never evaluates the right-hand
+    // term. The service checks both maps against the whole expression before it
+    // runs it, so the request is still refused.
+    let or_alias = ConditionExpression::parse("attribute_exists(pk) OR #typo = :v").unwrap();
+    let error = or_alias
+        .evaluate(Some(&item), &empty_names, &empty_values)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("#typo"),
+        "unexpected error: {error}"
+    );
+
+    // `attribute_not_exists(pk)` is false on this item, so `AND` stops before
+    // the term that names `:v`.
+    let and_value = ConditionExpression::parse("attribute_not_exists(pk) AND count = :v").unwrap();
+    let error = and_value
+        .evaluate(Some(&item), &empty_names, &empty_values)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains(":v"),
+        "unexpected error: {error}"
+    );
+
+    // The same holds inside a group under a `NOT`, and for a `BETWEEN` bound
+    // rather than a comparison operand: the pass walks the whole tree, in
+    // source order, so the first undefined placeholder it meets is reported.
+    let nested =
+        ConditionExpression::parse("attribute_exists(pk) OR NOT (count BETWEEN :low AND :high)")
+            .unwrap();
+    let error = nested
+        .evaluate(Some(&item), &empty_names, &empty_values)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains(":low"),
+        "unexpected error: {error}"
+    );
+
+    // The other side of the boundary: the very same expressions with both maps
+    // filled are ordinary conditions, so the check rejects only what is
+    // missing rather than any placeholder the evaluated path did not read.
+    let names = HashMap::from([("#typo".to_string(), "count".to_string())]);
+    let attribute_values = values([(":v", n("3")), (":low", n("1")), (":high", n("9"))]);
+    assert!(or_alias
+        .evaluate(Some(&item), &names, &attribute_values)
+        .unwrap());
+    assert!(!and_value
+        .evaluate(Some(&item), &names, &attribute_values)
+        .unwrap());
+    assert!(nested
+        .evaluate(Some(&item), &names, &attribute_values)
+        .unwrap());
+}
+
+#[tokio::test]
+async fn a_short_circuited_condition_does_not_write() {
+    let mock = users();
+    let request = PutItemRequest::new("users", item([("pk", s("u#1"))]))
+        .with_condition("attribute_not_exists(pk) OR #typo = :v");
+    let error = mock.put_item(request).await.unwrap_err();
+    assert!(
+        error.to_string().contains("#typo"),
+        "unexpected error: {error}"
+    );
+    // The rejection happens before the write, exactly as the service's
+    // validation does: nothing reached the table.
+    assert!(mock
+        .get_item(GetItemRequest::new("users", item([("pk", s("u#1"))])))
+        .await
+        .unwrap()
+        .item
+        .is_none());
+}
+
 #[tokio::test]
 async fn update_clauses_apply_in_one_expression() {
     let mock = users();
