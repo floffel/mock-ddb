@@ -2,10 +2,13 @@
 
 mod common;
 
+use std::collections::HashMap;
+
 use common::orders;
 use mock_ddb::{
-    item, n, s, values, CreateTableRequest, Item, KeySchema, KeyType, MockDdb, Projection,
-    QueryRequest, ScanRequest, SecondaryIndex, Select,
+    item, n, s, values, AttributeValue, CreateTableRequest, GetItemRequest, Item, KeySchema,
+    KeyType, MockDdb, Projection, PutItemRequest, QueryRequest, ScanRequest, SecondaryIndex,
+    Select,
 };
 
 async fn collect(mock: &MockDdb, mut request: QueryRequest) -> Vec<Item> {
@@ -605,4 +608,84 @@ async fn scan_of_an_index_applies_the_index_projection() {
         .await
         .is_err());
     assert!(mock.scan(ScanRequest::new("nope")).await.is_err());
+}
+
+#[tokio::test]
+async fn projection_selects_list_elements_through_every_read_path() {
+    // `rows[0]` projects the element, not the containing list. Verified through
+    // the mock's own transport surface (get, query, scan) so a test written
+    // against the mock sees the shape the service returns.
+    let mock = MockDdb::with_table("docs", KeySchema::hash("pk", KeyType::String)).unwrap();
+    let rows = AttributeValue::L(vec![
+        AttributeValue::M(HashMap::from([
+            ("v".to_string(), s("first")),
+            ("w".to_string(), s("1")),
+        ])),
+        AttributeValue::M(HashMap::from([("v".to_string(), s("second"))])),
+    ]);
+    let first = AttributeValue::L(vec![AttributeValue::M(HashMap::from([(
+        "v".to_string(),
+        s("first"),
+    )]))]);
+    let second = AttributeValue::L(vec![AttributeValue::M(HashMap::from([(
+        "v".to_string(),
+        s("second"),
+    )]))]);
+
+    mock.put_item(PutItemRequest::new(
+        "docs",
+        item([("pk", s("d#1")), ("rows", rows), ("secret", s("hidden"))]),
+    ))
+    .await
+    .unwrap();
+
+    let gotten = mock
+        .get_item(
+            GetItemRequest::new("docs", item([("pk", s("d#1"))])).with_projection("rows[0].v, pk"),
+        )
+        .await
+        .unwrap()
+        .item
+        .unwrap();
+    assert_eq!(gotten.get("rows"), Some(&first));
+    assert!(gotten.contains_key("pk"));
+    assert!(!gotten.contains_key("secret"));
+
+    let queried = mock
+        .query(
+            QueryRequest::new("docs", "pk = :pk")
+                .with_values(values([(":pk", s("d#1"))]))
+                .with_projection("rows[0].v"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(queried.items[0].get("rows"), Some(&first));
+
+    let scanned = mock
+        .scan(ScanRequest::new("docs").with_projection("rows[0].v"))
+        .await
+        .unwrap();
+    assert_eq!(scanned.items[0].get("rows"), Some(&first));
+
+    // Edge pair: index 1 is the last element (inside), index 2 is one past it.
+    let last = mock
+        .get_item(
+            GetItemRequest::new("docs", item([("pk", s("d#1"))])).with_projection("rows[1].v"),
+        )
+        .await
+        .unwrap()
+        .item
+        .unwrap();
+    assert_eq!(last.get("rows"), Some(&second));
+
+    let past = mock
+        .get_item(
+            GetItemRequest::new("docs", item([("pk", s("d#1"))])).with_projection("rows[2].v"),
+        )
+        .await
+        .unwrap()
+        .item
+        .unwrap();
+    assert!(!past.contains_key("rows"));
+    assert!(!past.contains_key("secret"));
 }
