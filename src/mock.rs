@@ -723,7 +723,7 @@ impl MockDdb {
             Some(existing) => existing.clone(),
             None => key_only_item(table.key_schema(), &request.key),
         };
-        let touched = update.apply_to_table(&mut item, &names, &values, table.key_schema())?;
+        let touched = update.apply(&mut item, table.key_schema(), &names, &values)?;
         table.validate_item(&item)?;
         table.store(key, item.clone(), previous.as_ref());
         table.on_update(previous_live.as_ref(), &item);
@@ -1919,7 +1919,7 @@ fn prepare_action(inner: &Inner, action: &TransactWriteItem, now: i64) -> Result
                 Some(existing) => existing.clone(),
                 None => key_only_item(table.key_schema(), &update.key),
             };
-            expression.apply_to_table(&mut item, &names, &values, table.key_schema())?;
+            expression.apply(&mut item, table.key_schema(), &names, &values)?;
             table.validate_item(&item)?;
             Ok(PreparedAction {
                 table_name: update.table_name.clone(),

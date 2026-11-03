@@ -9,7 +9,8 @@ use std::collections::HashMap;
 
 use libfuzzer_sys::fuzz_target;
 use mock_ddb::{
-    n, s, AttributeValue, ConditionExpression, Item, ProjectionExpression, UpdateExpression,
+    n, s, AttributeValue, ConditionExpression, Item, KeySchema, KeyType, ProjectionExpression,
+    UpdateExpression,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -50,10 +51,13 @@ fuzz_target!(|data: &[u8]| {
     }
     if let Ok(update) = UpdateExpression::parse(text) {
         let mut copy = item.clone();
-        let _ = update.apply(&mut copy, &names, &values);
+        // The schema protects `pk`; the interesting paths here are `a`, `b`,
+        // `l` and whatever the input names.
+        let schema = KeySchema::hash("pk", KeyType::String);
+        let _ = update.apply(&mut copy, &schema, &names, &values);
         // A second application checks that a partially applied update leaves a
         // value the evaluator can still read.
-        let _ = update.apply(&mut copy, &names, &values);
+        let _ = update.apply(&mut copy, &schema, &names, &values);
     }
     if let Ok(projection) = ProjectionExpression::parse(text) {
         let _ = projection.project(&item, &names);

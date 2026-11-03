@@ -173,7 +173,7 @@ impl ConditionExpression {
 ///
 /// ```
 /// use std::collections::HashMap;
-/// use mock_ddb::{n, s, Item, UpdateExpression};
+/// use mock_ddb::{n, s, Item, KeySchema, KeyType, UpdateExpression};
 ///
 /// let update = UpdateExpression::parse(
 ///     "SET #n = :name, hits = hits + :one REMOVE stale ADD tags :more",
@@ -190,7 +190,8 @@ impl ConditionExpression {
 ///     (":more".to_string(), mock_ddb::AttributeValue::Ss(vec!["a".into()])),
 /// ]);
 ///
-/// update.apply(&mut item, &names, &values).unwrap();
+/// let schema = KeySchema::hash("id", KeyType::String);
+/// update.apply(&mut item, &schema, &names, &values).unwrap();
 /// assert!(!item.contains_key("stale"));
 /// assert_eq!(item.get("hits"), Some(&n("2")));
 /// assert_eq!(item.get("name"), Some(&s("Bob")));
@@ -226,48 +227,57 @@ impl UpdateExpression {
     ///
     /// ```
     /// use std::collections::HashMap;
-    /// use mock_ddb::{n, Item, UpdateExpression};
+    /// use mock_ddb::{n, Item, KeySchema, KeyType, UpdateExpression};
     ///
     /// let update = UpdateExpression::parse("SET v = :v").unwrap();
     /// let mut item = Item::new();
+    /// let schema = KeySchema::hash("id", KeyType::String);
     /// let touched = update
-    ///     .apply(&mut item, &HashMap::new(), &HashMap::from([(":v".to_string(), n("1"))]))
+    ///     .apply(
+    ///         &mut item,
+    ///         &schema,
+    ///         &HashMap::new(),
+    ///         &HashMap::from([(":v".to_string(), n("1"))]),
+    ///     )
     ///     .unwrap();
     /// assert!(touched.contains("v"));
     /// assert_eq!(item.get("v"), Some(&n("1")));
+    ///
+    /// // The same expression against a table whose partition key is `v`.
+    /// let table_schema = KeySchema::hash("v", KeyType::Number);
+    /// assert!(update
+    ///     .apply(
+    ///         &mut Item::new(),
+    ///         &table_schema,
+    ///         &HashMap::new(),
+    ///         &HashMap::from([(":v".to_string(), n("1"))]),
+    ///     )
+    ///     .is_err());
     /// ```
     /// Apply to an item, returning the top-level attributes the expression
     /// touched.
     ///
-    /// This entry point does not know the table, so it will happily rewrite an
-    /// attribute that happens to be a key. The table operations in
-    /// [`MockDdb`](crate::MockDdb) pass the key schema through and reject that,
-    /// as the service does.
+    /// `key_schema` is the schema of the table the item belongs to, and it is
+    /// required because the service rejects an update that rewrites a key
+    /// attribute: without the real schema an expression that rewrites `pk`
+    /// would silently reach the item, which is exactly the failure a caller
+    /// validates against. Pass the table's own schema — the operations on
+    /// [`MockDdb`](crate::MockDdb) do.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`](crate::Error::Validation) when a
-    /// right-hand side refers to a missing attribute, a nested path's parent
-    /// does not exist, a list index is out of range, an operand has the wrong
-    /// type for the operator, or the target paths overlap once `#alias`
-    /// placeholders are resolved.
+    /// Returns [`Error::Validation`](crate::Error::Validation) when the
+    /// expression targets a key attribute of `key_schema`, a right-hand side
+    /// refers to a missing attribute, a nested path's parent does not exist, a
+    /// list index is out of range, an operand has the wrong type for the
+    /// operator, or the target paths overlap once `#alias` placeholders are
+    /// resolved.
     pub fn apply(
         &self,
         item: &mut Item,
-        names: &HashMap<String, String>,
-        values: &HashMap<String, AttributeValue>,
-    ) -> Result<BTreeSet<String>> {
-        let context = Ctx { names, values };
-        update::apply(&self.update, item, &context, &KeySchema::default())
-    }
-
-    /// Apply with key protection, as the table operations do.
-    pub(crate) fn apply_to_table(
-        &self,
-        item: &mut Item,
-        names: &HashMap<String, String>,
-        values: &HashMap<String, AttributeValue>,
         key_schema: &KeySchema,
+        names: &HashMap<String, String>,
+        values: &HashMap<String, AttributeValue>,
     ) -> Result<BTreeSet<String>> {
         let context = Ctx { names, values };
         update::apply(&self.update, item, &context, key_schema)
@@ -415,7 +425,14 @@ impl ProjectionExpression {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::KeyType;
     use crate::{n, s};
+
+    /// A table schema none of these expressions target, so the update engine
+    /// runs without key protection getting in the way.
+    fn schema() -> KeySchema {
+        KeySchema::hash("pk", KeyType::String)
+    }
 
     #[test]
     fn parses_every_clause_in_one_expression() {
@@ -429,7 +446,7 @@ mod tests {
             (":one".to_string(), n("1")),
             (":gone".to_string(), s("g")),
         ]);
-        update.apply(&mut item, &names, &values).unwrap();
+        update.apply(&mut item, &schema(), &names, &values).unwrap();
         assert_eq!(item.get("a"), Some(&s("x")));
         assert_eq!(item.get("c"), Some(&n("2")));
     }
@@ -533,7 +550,9 @@ mod tests {
                 let update =
                     UpdateExpression::parse(&format!("SET v = {}", vec![":v"; 600].join(" + ")))
                         .unwrap();
-                update.apply(&mut item, &HashMap::new(), &values).unwrap();
+                update
+                    .apply(&mut item, &schema(), &HashMap::new(), &values)
+                    .unwrap();
                 assert_eq!(item["v"].as_n().unwrap(), "600");
 
                 // 10^5 terms is not a crash: the 4096-byte limit rejects the
@@ -559,7 +578,9 @@ mod tests {
             (":three".to_string(), n("3")),
             (":two".to_string(), n("2")),
         ]);
-        update.apply(&mut item, &HashMap::new(), &values).unwrap();
+        update
+            .apply(&mut item, &schema(), &HashMap::new(), &values)
+            .unwrap();
         // Left to right: (10 - 3) - 2. A right fold would give 9.
         assert_eq!(item["v"].as_n().unwrap(), "5");
 
@@ -570,6 +591,7 @@ mod tests {
             .unwrap()
             .apply(
                 &mut item,
+                &schema(),
                 &HashMap::new(),
                 &HashMap::from([
                     (":ten".to_string(), n("10")),

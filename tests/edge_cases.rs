@@ -649,7 +649,12 @@ fn a_large_remove_list_within_the_limit_is_applied() {
         stored.insert(path.clone(), n("1"));
     }
     let touched = update
-        .apply(&mut stored, &HashMap::new(), &HashMap::new())
+        .apply(
+            &mut stored,
+            &KeySchema::hash("pk", KeyType::String),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
         .unwrap();
     assert_eq!(touched.len(), paths.len());
     assert!(paths.iter().all(|path| !stored.contains_key(path)));

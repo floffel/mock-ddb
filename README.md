@@ -149,7 +149,7 @@ production code path builds:
 
 ```rust
 use std::collections::HashMap;
-use mock_ddb::{n, s, ConditionExpression, Item, UpdateExpression};
+use mock_ddb::{n, s, ConditionExpression, Item, KeySchema, KeyType, UpdateExpression};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let condition =
@@ -164,7 +164,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let update = UpdateExpression::parse("SET hits = if_not_exists(hits, :zero) + :one")?;
     let values = HashMap::from([(":zero".to_string(), n("0")), (":one".to_string(), n("1"))]);
-    update.apply(&mut item, &names, &values)?;
+    let schema = KeySchema::hash("pk", KeyType::String);
+    update.apply(&mut item, &schema, &names, &values)?;
     assert_eq!(item.get("hits"), Some(&n("1")));
     Ok(())
 }
