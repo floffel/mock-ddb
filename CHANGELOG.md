@@ -45,6 +45,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   returns. Named indices are kept in ascending order and without duplicates; an
   index the list does not have contributes nothing.
 
+### Changed
+
+- Number values are backed by `bigdecimal::BigDecimal` instead of a local
+  hand-written decimal: ordering, equality, normalisation and `+`/`-` are the
+  maintained crate's, so `"1.0"` equals `"1"` and 38-significant-digit
+  comparisons are exact by construction rather than by inspection. The
+  DynamoDB-specific parts stay — the literal grammar (the crate accepts
+  `1_000`, the service does not), the 38-digit and `1E-130` … `9.99E+125`
+  limits, the alignment guard against absurd exponent gaps, and the padding
+  bound in `Number::to_plain_string`. Nothing observable changed: canonical
+  forms, key identity, TTL conversion and every error message are as before.
+
 ## [0.1.1] - 2026-10-25
 
 ### Fixed

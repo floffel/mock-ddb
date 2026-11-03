@@ -24,6 +24,7 @@ streams = []
 
 [dependencies]
 aws-sdk-dynamodb = { version = "1.51", default-features = false }
+bigdecimal = "0.4.11"
 parking_lot = "0.12"
 thiserror = "2"
 
