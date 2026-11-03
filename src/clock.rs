@@ -156,7 +156,6 @@ impl MockClock {
     }
 
     /// The current instant, in whole seconds since the Unix epoch.
-    #[must_use]
     ///
     /// ```
     /// use mock_ddb::MockClock;
@@ -164,6 +163,20 @@ impl MockClock {
     /// let clock = MockClock::at_epoch_seconds(42);
     /// assert_eq!(clock.epoch_seconds(), 42);
     /// ```
+    ///
+    /// Negative before the epoch, with the real second rather than a sentinel:
+    /// a clock set an hour early reports `-3_600`, so it can be told apart from
+    /// one set a second early.
+    ///
+    /// ```
+    /// use std::time::{Duration, UNIX_EPOCH};
+    /// use mock_ddb::MockClock;
+    ///
+    /// let early = MockClock::new(UNIX_EPOCH - Duration::from_secs(3_600));
+    /// assert_eq!(early.epoch_seconds(), -3_600);
+    /// assert_ne!(early.epoch_seconds(), -1);
+    /// ```
+    #[must_use]
     pub fn epoch_seconds(&self) -> i64 {
         epoch_seconds(self.now())
     }
@@ -213,16 +226,20 @@ fn max_instant() -> SystemTime {
 
 /// Seconds since the Unix epoch.
 ///
-/// Whole seconds, truncated towards the epoch: `0.9 s` after the epoch is `0`,
-/// not `1`. Every instant before the epoch maps to the sentinel `-1` (not `0`,
-/// which is a real second), so `time <= UNIX_EPOCH` is the only way to get a
-/// negative value. Instants further out than `i64::MAX` seconds saturate at
-/// `i64::MAX`; that arm is only reachable on platforms whose clock is wider
-/// than `i64` seconds (Windows), not on 64-bit Unix.
+/// Signed, whole seconds, with the magnitude truncated towards the epoch:
+/// `0.9 s` after the epoch is `0`, and `0.9 s` before it is `0` too, because it
+/// is the magnitude that is truncated. Every instant at least one whole second
+/// before the epoch reports its real negative second — `UNIX_EPOCH - 1 h` is
+/// `-3_600`, not a sentinel — so a clock set before the epoch can be told apart
+/// from a clock set one second before it. Both ends saturate at the
+/// representable extreme of `i64` instead of wrapping: an instant further out
+/// than `i64::MAX` seconds reports `i64::MAX`, one further back than
+/// `i64::MIN` reports `i64::MIN`. Those arms are only reachable on platforms
+/// whose clock is wider than `i64` seconds (Windows), not on 64-bit Unix.
 pub(crate) fn epoch_seconds(time: SystemTime) -> i64 {
     match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
-        Err(_) => -1,
+        Ok(after) => i64::try_from(after.as_secs()).unwrap_or(i64::MAX),
+        Err(before) => i64::try_from(before.duration().as_secs()).map_or(i64::MIN, |s| -s),
     }
 }
 
@@ -231,9 +248,6 @@ mod tests {
     use super::*;
 
     use proptest::prelude::*;
-
-    /// The sentinel `epoch_seconds` returns for every pre-epoch instant.
-    const BEFORE_EPOCH: i64 = -1;
 
     /// An instant `seconds` plus `nanos` away from the epoch, on either side.
     fn instant(seconds: i64, nanos: u32) -> SystemTime {
@@ -271,11 +285,24 @@ mod tests {
     }
 
     #[test]
-    fn one_second_before_the_epoch_is_the_sentinel_not_zero() {
+    fn one_second_before_the_epoch_is_minus_one() {
         // The just-inside/just-outside pair: 0 s is `0`, 1 s earlier is `-1`.
         assert_eq!(epoch_seconds(instant(0, 0)), 0);
-        assert_eq!(epoch_seconds(instant(-1, 0)), BEFORE_EPOCH);
-        assert_eq!(epoch_seconds(instant(-3_600, 0)), BEFORE_EPOCH);
+        assert_eq!(epoch_seconds(instant(-1, 0)), -1);
+    }
+
+    #[test]
+    fn a_real_instant_before_the_epoch_keeps_its_negative_second() {
+        // Everything before the epoch used to collapse onto `-1`, which is a
+        // legal timestamp (1969-12-31T23:59:59Z), so an hour early read like a
+        // second early and a TTL never expired.
+        assert_eq!(epoch_seconds(instant(-2, 0)), -2);
+        assert_eq!(epoch_seconds(instant(-3_600, 0)), -3_600);
+        assert_eq!(epoch_seconds(instant(-86_401, 0)), -86_401);
+        assert_ne!(
+            epoch_seconds(instant(-3_600, 0)),
+            epoch_seconds(instant(-1, 0))
+        );
     }
 
     #[test]
@@ -288,8 +315,14 @@ mod tests {
     fn sub_second_offsets_are_truncated_towards_the_epoch() {
         assert_eq!(epoch_seconds(instant(0, 999_999_999)), 0);
         assert_eq!(epoch_seconds(instant(1, 999_999_999)), 1);
-        // A hair before the epoch is still before the epoch.
-        assert_eq!(epoch_seconds(instant(-1, 1)), BEFORE_EPOCH);
+        // A hair before the epoch: one second and a nanosecond early is `-1`,
+        // and a pure fraction of a second early truncates to `0` like the
+        // fraction after the epoch does.
+        assert_eq!(epoch_seconds(instant(-1, 1)), -1);
+        let hair_before = UNIX_EPOCH
+            .checked_sub(Duration::from_nanos(1))
+            .expect("one nanosecond before the epoch is representable");
+        assert_eq!(epoch_seconds(hair_before), 0);
     }
 
     #[test]
@@ -301,11 +334,35 @@ mod tests {
     }
 
     #[test]
-    fn a_mock_clock_before_the_epoch_reports_the_sentinel() {
-        let clock = MockClock::new(instant(-1, 0));
-        assert_eq!(clock.epoch_seconds(), BEFORE_EPOCH);
-        clock.advance(Duration::from_secs(2));
+    fn i64_min_seconds_is_the_earliest_representable_second() {
+        let earliest = UNIX_EPOCH
+            .checked_sub(Duration::from_secs(i64::MAX.unsigned_abs() + 1))
+            .expect("i64::MIN seconds is representable on a 64-bit clock");
+        assert_eq!(epoch_seconds(earliest), i64::MIN);
+        // The second next to it is still exact, so the saturation covers the
+        // extreme only and introduces no off-by-one.
+        assert_eq!(
+            epoch_seconds(earliest + Duration::from_secs(1)),
+            i64::MIN + 1
+        );
+    }
+
+    #[test]
+    fn a_mock_clock_before_the_epoch_reports_its_real_second() {
+        let clock = MockClock::new(instant(-3_600, 0));
+        assert_eq!(clock.epoch_seconds(), -3_600);
+        clock.advance(Duration::from_secs(3_600));
+        assert_eq!(clock.epoch_seconds(), 0);
+        clock.advance(Duration::from_secs(1));
         assert_eq!(clock.epoch_seconds(), 1);
+    }
+
+    #[test]
+    fn an_hour_before_the_epoch_is_not_one_second_before_it() {
+        let early = MockClock::new(instant(-3_600, 0)).epoch_seconds();
+        let latest = MockClock::new(instant(-1, 0)).epoch_seconds();
+        assert_eq!((early, latest), (-3_600, -1));
+        assert_ne!(early, latest);
     }
 
     /// Whole seconds between the epoch and the last representable instant.
@@ -355,8 +412,8 @@ mod tests {
         }
 
         #[test]
-        fn every_pre_epoch_instant_is_the_sentinel((seconds, nanos) in offsets().prop_filter("negative", |(s, _)| *s < 0)) {
-            prop_assert_eq!(epoch_seconds(instant(seconds, nanos)), BEFORE_EPOCH);
+        fn every_pre_epoch_instant_round_trips((seconds, nanos) in offsets().prop_filter("negative", |(s, _)| *s < 0)) {
+            prop_assert_eq!(epoch_seconds(instant(seconds, nanos)), seconds);
         }
 
         #[test]
@@ -372,10 +429,24 @@ mod tests {
         }
 
         #[test]
-        fn negative_only_before_the_epoch((seconds, nanos) in offsets()) {
+        fn a_negative_second_starts_one_whole_second_before_the_epoch((seconds, nanos) in offsets()) {
             let time = instant(seconds, nanos);
             let negative = epoch_seconds(time) < 0;
-            prop_assert_eq!(negative, time < UNIX_EPOCH);
+            prop_assert_eq!(negative, time <= instant(-1, 0));
+        }
+
+        /// The magnitude is what is truncated, so a fraction of a second on
+        /// either side of the epoch reports the same second as the epoch.
+        #[test]
+        fn a_fraction_of_a_second_either_side_of_the_epoch_is_zero(nanos in 0..1_000_000_000_u32) {
+            let before = UNIX_EPOCH
+                .checked_sub(Duration::from_nanos(u64::from(nanos)))
+                .expect("sub-second offsets before the epoch are representable");
+            let after = UNIX_EPOCH
+                .checked_add(Duration::from_nanos(u64::from(nanos)))
+                .expect("sub-second offsets after the epoch are representable");
+            prop_assert_eq!(epoch_seconds(before), 0);
+            prop_assert_eq!(epoch_seconds(after), 0);
         }
 
         /// `advance` is total and agrees with `checked_add` wherever that

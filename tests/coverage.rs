@@ -228,7 +228,7 @@ fn clock_controls() {
     assert_eq!(clock.epoch_seconds(), 15);
 
     let pre_epoch = MockClock::new(UNIX_EPOCH - Duration::from_secs(10));
-    assert_eq!(pre_epoch.epoch_seconds(), -1);
+    assert_eq!(pre_epoch.epoch_seconds(), -10);
 
     assert!(SystemClock.now() > UNIX_EPOCH - Duration::from_secs(1));
 

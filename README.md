@@ -271,6 +271,11 @@ atomic and batch writes all-or-nothing. Reads take a shared lock, so many tasks
 can read concurrently while a write waits. There is no `unsafe`, no ambient
 state, and no lock is ever held across an `.await`.
 
+Seconds are signed: an instant before the Unix epoch reports its real negative
+second (`-3_600` an hour early), and a fraction of a second on either side of
+the epoch reports `0`, so a TTL deadline is never parked on a value that only
+looks like a timestamp.
+
 ## Testing this crate
 
 ```bash
@@ -283,7 +288,7 @@ cargo +nightly fuzz run parse_expression -- -max_total_time=60
 cargo +nightly fuzz run random_items -- -max_total_time=60
 ```
 
-- 271 tests (189 test functions plus 82 doctests): unit tests per module, an integration suite per area
+- 392 tests (295 test functions plus 97 doctests): unit tests per module, an integration suite per area
   (`surface`, `expressions`, `query_scan`, `batch_transact`, `ttl_streams`,
   `edge_cases`, `concurrency`, `coverage`), property tests with `proptest`, and
   a doctest on every public type, every operation and every error method.
