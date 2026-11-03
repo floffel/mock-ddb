@@ -26,6 +26,21 @@ use aws_sdk_dynamodb::types::AttributeValue;
 use crate::Item;
 
 /// The result type used throughout the crate.
+///
+/// The error parameter defaults to [`Error`], so a signature can write
+/// `Result<T>` and still name a different failure type when it needs to.
+///
+/// ```
+/// use mock_ddb::{Error, Result};
+///
+/// fn parse_count(text: &str) -> Result<u32> {
+///     text.parse::<u32>()
+///         .map_err(|_| Error::validation(format!("`{text}` is not a number")))
+/// }
+///
+/// assert_eq!(parse_count("7").unwrap(), 7);
+/// assert_eq!(parse_count("seven").unwrap_err().code(), "ValidationException");
+/// ```
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A DynamoDB failure.
@@ -130,27 +145,49 @@ impl Error {
     /// Whether the real service would expect the caller to retry.
     ///
     /// Every failure the mock produces is deterministic, so this is `false`
-    /// except for a transaction cancelled by a simulated
+    /// except for a transaction that was cancelled purely because its members
+    /// lost a race — that is, one whose reasons all name
     /// [`CancellationReasonCode::TransactionConflict`], which the real service
     /// does ask clients to retry.
+    ///
+    /// One terminal reason is enough to make the answer `false`: a retry would
+    /// meet the same rejected condition, or the same malformed member, again. A
+    /// cancelled transaction that reports no reason at all is not retryable
+    /// either, because nothing says the second attempt could succeed.
     #[must_use]
     ///
     /// ```
     /// use mock_ddb::{CancellationReason, CancellationReasonCode, Error};
     ///
-    /// let reason = CancellationReason::new(CancellationReasonCode::TransactionConflict, "conflict");
-    /// let cancelled = Error::TransactionCanceled {
-    ///     message: "cancelled".to_string(),
-    ///     reasons: vec![reason],
+    /// let conflict = || {
+    ///     CancellationReason::new(CancellationReasonCode::TransactionConflict, "conflict")
     /// };
-    /// assert!(cancelled.is_retryable());
+    /// let failed = || {
+    ///     CancellationReason::new(CancellationReasonCode::ConditionalCheckFailed, "no")
+    /// };
+    /// let cancelled = |reasons| Error::TransactionCanceled {
+    ///     message: "cancelled".to_string(),
+    ///     reasons,
+    /// };
+    ///
+    /// assert!(cancelled(vec![conflict()]).is_retryable());
+    /// assert!(cancelled(vec![conflict(), conflict()]).is_retryable());
+    /// // Inside: every member conflicted. Outside: one member was rejected for
+    /// // a terminal reason, so a retry cannot succeed.
+    /// assert!(!cancelled(vec![conflict(), failed()]).is_retryable());
+    /// assert!(!cancelled(vec![failed(), conflict()]).is_retryable());
+    /// // No reasons reported at all.
+    /// assert!(!cancelled(Vec::new()).is_retryable());
     /// assert!(!Error::validation("bad").is_retryable());
     /// ```
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::TransactionCanceled { reasons, .. } => reasons
-                .iter()
-                .any(|reason| reason.code() == CancellationReasonCode::TransactionConflict),
+            Self::TransactionCanceled { reasons, .. } => {
+                !reasons.is_empty()
+                    && reasons
+                        .iter()
+                        .all(|reason| reason.code() == CancellationReasonCode::TransactionConflict)
+            }
             _ => false,
         }
     }

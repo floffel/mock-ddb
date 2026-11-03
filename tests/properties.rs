@@ -3,9 +3,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use mock_ddb::{
-    item, n, s, values, AttributeValue, Blob, ConditionExpression, GetItemRequest, Item, KeySchema,
-    KeyType, MockDdb, PutItemRequest, QueryRequest, ReturnValues, UpdateExpression,
-    UpdateItemRequest,
+    item, n, s, values, AttributeValue, Blob, CancellationReason, CancellationReasonCode,
+    ConditionExpression, Error, GetItemRequest, Item, KeySchema, KeyType, MockDdb, PutItemRequest,
+    QueryRequest, ReturnValues, UpdateExpression, UpdateItemRequest,
 };
 use proptest::prelude::*;
 
@@ -391,6 +391,197 @@ proptest! {
             !expected_overlap,
             "expression `{}`",
             expression
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Error classification. `Error::code`, `Error::is_retryable` and
+// `Error::cancellation_reasons` are pure and total, so the properties they
+// promise are proven over a generated input space instead of one example.
+// ---------------------------------------------------------------------------
+
+/// One instance of every `Error` variant, with the payload handed in so a test
+/// can vary the payload without varying the variant.
+fn every_variant(payload: &str) -> Vec<Error> {
+    vec![
+        Error::ResourceNotFound {
+            resource: format!("table `{payload}`"),
+            message: payload.to_string(),
+        },
+        Error::ResourceInUse {
+            message: payload.to_string(),
+        },
+        Error::Validation {
+            message: payload.to_string(),
+        },
+        Error::ConditionalCheckFailed {
+            table: payload.to_string(),
+            message: payload.to_string(),
+            item: None,
+        },
+        Error::TransactionCanceled {
+            message: payload.to_string(),
+            reasons: Vec::new(),
+        },
+        Error::ItemCollectionSizeLimitExceeded {
+            message: payload.to_string(),
+        },
+        Error::Internal {
+            message: payload.to_string(),
+        },
+    ]
+}
+
+/// Every code a transaction member can be cancelled with.
+fn cancellation_codes() -> impl Strategy<Value = CancellationReasonCode> {
+    prop_oneof![
+        Just(CancellationReasonCode::ConditionalCheckFailed),
+        Just(CancellationReasonCode::TransactionConflict),
+        Just(CancellationReasonCode::ItemCollectionSizeLimitExceeded),
+        Just(CancellationReasonCode::ValidationError),
+        Just(CancellationReasonCode::ThrottlingError),
+        Just(CancellationReasonCode::None),
+    ]
+}
+
+/// A member list of arbitrary length, including the empty one.
+fn cancellation_reason_list() -> impl Strategy<Value = Vec<CancellationReason>> {
+    prop::collection::vec(
+        (cancellation_codes(), "[ -~]{0,12}")
+            .prop_map(|(code, message)| CancellationReason::new(code, message)),
+        0..8,
+    )
+}
+
+/// The rule the service applies to a cancelled transaction: retry only when
+/// every member lost a race, because a terminal reason would reject the retry
+/// for the same cause again.
+fn expected_retryable(reasons: &[CancellationReason]) -> bool {
+    !reasons.is_empty()
+        && reasons
+            .iter()
+            .all(|reason| reason.code() == CancellationReasonCode::TransactionConflict)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// A cancelled transaction is retryable exactly when it reported members
+    /// and all of them conflicted — no empty list, no mixed list.
+    #[test]
+    fn is_retryable_needs_a_non_empty_all_conflict_list(
+        reasons in cancellation_reason_list(),
+    ) {
+        let cancelled = Error::TransactionCanceled {
+            message: "cancelled".to_string(),
+            reasons: reasons.clone(),
+        };
+        let expected = expected_retryable(&reasons);
+        prop_assert_eq!(cancelled.is_retryable(), expected, "reasons: {:?}", reasons);
+
+        // A conflicting member followed by a terminal one must not make the
+        // whole transaction look retryable, in either order.
+        let mut mixed = vec![
+            CancellationReason::new(CancellationReasonCode::TransactionConflict, "conflict"),
+            CancellationReason::new(CancellationReasonCode::ConditionalCheckFailed, "no"),
+        ];
+        let mut cancelled = Error::TransactionCanceled {
+            message: "cancelled".to_string(),
+            reasons: mixed.clone(),
+        };
+        prop_assert!(!cancelled.is_retryable(), "reasons: {:?}", mixed);
+
+        mixed.reverse();
+        cancelled = Error::TransactionCanceled {
+            message: "cancelled".to_string(),
+            reasons: mixed.clone(),
+        };
+        prop_assert!(!cancelled.is_retryable(), "reasons: {:?}", mixed);
+    }
+
+    /// No failure outside a cancelled transaction is ever retryable, whatever
+    /// its payload says.
+    #[test]
+    fn only_a_cancelled_transaction_is_retryable(payload in "[ -~]{0,24}") {
+        for error in every_variant(&payload) {
+            prop_assert!(
+                !error.is_retryable(),
+                "{:?} must not be retryable",
+                error
+            );
+        }
+    }
+
+    /// The code a caller matches on depends on the variant and nothing else:
+    /// not on the message, not on a clone, not on how often it is asked.
+    #[test]
+    fn code_is_stable_and_payload_independent(
+        first in "[ -~]{0,16}",
+        second in "[ -~]{0,16}",
+    ) {
+        for (left, right) in every_variant(&first).iter().zip(every_variant(&second)) {
+            prop_assert_eq!(left.code(), right.code());
+            prop_assert_eq!(left.code(), left.clone().code());
+            prop_assert_eq!(left.code(), left.code());
+            prop_assert!(!left.code().is_empty());
+        }
+    }
+
+    /// The reasons handed back are the transaction members, in order, and
+    /// nothing for any other failure class.
+    #[test]
+    fn cancellation_reasons_are_the_members_and_nothing_else(
+        reasons in cancellation_reason_list(),
+        payload in "[ -~]{0,16}",
+    ) {
+        let cancelled = Error::TransactionCanceled {
+            message: payload.clone(),
+            reasons: reasons.clone(),
+        };
+        let reported = cancelled.cancellation_reasons();
+        prop_assert_eq!(reported.len(), reasons.len());
+        prop_assert!(reported.iter().zip(&reasons).all(|(left, right)| left == right));
+        // Empty exactly when nothing was reported: no members at all, or a
+        // failure class that never carries one.
+        prop_assert_eq!(reported.is_empty(), reasons.is_empty());
+        prop_assert_eq!(cancelled.is_retryable(), expected_retryable(reported));
+
+        for error in every_variant(&payload) {
+            if !matches!(error, Error::TransactionCanceled { .. }) {
+                prop_assert!(
+                    error.cancellation_reasons().is_empty(),
+                    "{:?} must not carry cancellation reasons",
+                    error
+                );
+            }
+        }
+    }
+}
+
+/// Each variant has its own code, so a caller matching on the string can never
+/// confuse two failure classes; the table is the service's, spelled out once.
+#[test]
+fn code_is_unique_and_names_the_service_class() {
+    let errors = every_variant("x");
+    let codes: Vec<&str> = errors.iter().map(Error::code).collect();
+    assert_eq!(
+        codes,
+        vec![
+            "ResourceNotFoundException",
+            "ResourceInUseException",
+            "ValidationException",
+            "ConditionalCheckFailedException",
+            "TransactionCanceledException",
+            "ItemCollectionSizeLimitExceededException",
+            "InternalServerError",
+        ]
+    );
+
+    for (index, code) in codes.iter().enumerate() {
+        assert!(
+            !codes[index + 1..].contains(code),
+            "`{code}` is used by more than one variant"
         );
     }
 }
