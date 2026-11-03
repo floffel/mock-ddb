@@ -107,7 +107,8 @@ impl Ctx<'_> {
 }
 
 /// The `size()` of a value: bytes for strings and binary, element count for
-/// sets, lists and maps. `BOOL` and `NULL` have size 0.
+/// sets, lists and maps. Scalars without a length — `N`, `BOOL` and `NULL` —
+/// have size 0, so the function is total over every [`AttributeValue`] shape.
 fn size_of(value: &AttributeValue) -> u64 {
     match value {
         AttributeValue::S(text) => u64::try_from(text.len()).unwrap_or(u64::MAX),
@@ -265,6 +266,7 @@ fn contains(value: &AttributeValue, needle: &AttributeValue) -> bool {
 mod tests {
     use super::*;
     use crate::{n, s};
+    use proptest::prelude::*;
 
     fn item() -> Item {
         let mut item = Item::new();
@@ -309,7 +311,10 @@ mod tests {
         assert!(evaluate_str("count > :two", &[("two", n("2"))]).unwrap());
         assert!(!evaluate_str("count > :nine", &[("nine", n("9"))]).unwrap());
         assert!(!evaluate_str("missing > :two", &[("two", n("2"))]).unwrap());
-        assert!(evaluate_str("missing <> :two", &[("two", n("2"))]).is_ok());
+        // A missing attribute satisfies no comparison at all — not even the
+        // negation of equality, which reads as "true" if the rule is flipped.
+        assert!(!evaluate_str("missing = :two", &[("two", n("2"))]).unwrap());
+        assert!(!evaluate_str("missing <> :two", &[("two", n("2"))]).unwrap());
         assert!(!evaluate_str("count = :nope", &[("nope", s("3"))]).unwrap());
     }
 
@@ -460,5 +465,292 @@ mod tests {
             .operand_value(&Operand::Path(absent), None)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn empty_needles_scalar_sizes_and_out_of_range_indices() {
+        // An empty needle is a substring of every string and a prefix of every
+        // string, but a set holds members, not substrings.
+        assert!(evaluate_str("contains(pk, :empty)", &[("empty", s(""))]).unwrap());
+        assert!(evaluate_str("begins_with(pk, :empty)", &[("empty", s(""))]).unwrap());
+        assert!(!evaluate_str("contains(tags, :empty)", &[("empty", s(""))]).unwrap());
+        assert!(!evaluate_str("begins_with(tags, :empty)", &[("empty", s(""))]).unwrap());
+
+        // A number has no length, so `size()` reports 0 for it instead of
+        // failing or inventing a count.
+        assert!(evaluate_str("size(count) = :zero", &[("zero", n("0"))]).unwrap());
+        assert!(!evaluate_str("size(count) = :one", &[("one", n("1"))]).unwrap());
+
+        let mut item = item();
+        item.insert("nums".into(), AttributeValue::Ns(vec!["1".into()]));
+        item.insert("list".into(), AttributeValue::L(vec![s("a"), n("7")]));
+
+        // Set membership is numeric for `NS`: the member `1` is also named by
+        // `1.0`, and by neither `1.1` nor `10`.
+        let condition = super::super::parse::parse_condition("contains(nums, :one)").unwrap();
+        for (needle, expected) in [("1.0", true), ("1.1", false), ("10", false)] {
+            let values = ValueMap::from([(":one".to_string(), n(needle))]);
+            let ctx = Ctx {
+                names: &NameMap::new(),
+                values: &values,
+            };
+            assert_eq!(
+                evaluate(&condition, Some(&item), &ctx).unwrap(),
+                expected,
+                "needle {needle}"
+            );
+        }
+
+        // A list index inside the list reads the element; one past the end
+        // reads as absent, so the comparison is false rather than an error.
+        let inside = super::super::parse::parse_condition("list[1] = :seven").unwrap();
+        let outside = super::super::parse::parse_condition("list[2] = :seven").unwrap();
+        let values = ValueMap::from([(":seven".to_string(), n("7"))]);
+        let ctx = Ctx {
+            names: &NameMap::new(),
+            values: &values,
+        };
+        assert!(evaluate(&inside, Some(&item), &ctx).unwrap());
+        assert!(!evaluate(&outside, Some(&item), &ctx).unwrap());
+    }
+
+    /// A value shape an item may hold: leaves first, then containers built from
+    /// them, so nested lists and maps are evaluated too.
+    fn attribute() -> impl Strategy<Value = AttributeValue> {
+        let leaf = prop_oneof![
+            "[a-zA-Z0-9 _#üöä-]{0,12}".prop_map(AttributeValue::S),
+            (-1_000_i64..1_000).prop_map(|value| AttributeValue::N(value.to_string())),
+            prop::collection::vec(any::<u8>(), 0..8)
+                .prop_map(|bytes| AttributeValue::B(crate::Blob::new(bytes))),
+            any::<bool>().prop_map(AttributeValue::Bool),
+            Just(AttributeValue::Null(true)),
+        ];
+        // A set is generated with at least one member: DynamoDB rejects an empty
+        // set on write, so the evaluator never has to look at one.
+        leaf.prop_recursive(2, 4, 4, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..3).prop_map(AttributeValue::L),
+                prop::collection::hash_map("[a-z]{1,5}", inner.clone(), 0..3)
+                    .prop_map(AttributeValue::M),
+                prop::collection::vec("[a-z]{1,4}", 1..3).prop_map(AttributeValue::Ss),
+                prop::collection::vec(1_i64..100, 1..3).prop_map(|members| {
+                    AttributeValue::Ns(members.iter().map(i64::to_string).collect())
+                }),
+                prop::collection::vec(prop::collection::vec(any::<u8>(), 0..4), 1..3).prop_map(
+                    |members| {
+                        AttributeValue::Bs(members.into_iter().map(crate::Blob::new).collect())
+                    }
+                ),
+            ]
+        })
+    }
+
+    /// A condition tree over the two placeholders and the fixture's attributes,
+    /// including a path that names nothing and an index past the list's end.
+    fn condition() -> impl Strategy<Value = Condition> {
+        let path = prop_oneof![
+            Just(vec![Segment::Name("pk".into())]),
+            Just(vec![Segment::Name("count".into())]),
+            Just(vec![Segment::Name("tags".into())]),
+            Just(vec![Segment::Name("blob".into())]),
+            Just(vec![
+                Segment::Name("profile".into()),
+                Segment::Name("city".into()),
+            ]),
+            Just(vec![Segment::Name("list".into()), Segment::Index(0)]),
+            Just(vec![Segment::Name("list".into()), Segment::Index(7)]),
+            Just(vec![Segment::Name("absent".into())]),
+        ];
+        let operand = prop_oneof![
+            path.clone().prop_map(Operand::Path),
+            Just(Operand::Value("a".to_string())),
+            Just(Operand::Value("b".to_string())),
+            path.clone().prop_map(Operand::Size),
+        ];
+        let operator = prop::sample::select(vec![
+            CmpOp::Eq,
+            CmpOp::Ne,
+            CmpOp::Lt,
+            CmpOp::Le,
+            CmpOp::Gt,
+            CmpOp::Ge,
+        ]);
+        let leaf = prop_oneof![
+            path.clone().prop_map(Condition::AttributeExists),
+            path.clone().prop_map(Condition::AttributeNotExists),
+            (path.clone(), operand.clone())
+                .prop_map(|(path, needle)| Condition::Contains(path, needle)),
+            (path.clone(), operand.clone())
+                .prop_map(|(path, prefix)| Condition::BeginsWith(path, prefix)),
+            (path, operand.clone())
+                .prop_map(|(path, expected)| Condition::AttributeType(path, expected)),
+            (operand.clone(), operator, operand.clone())
+                .prop_map(|(left, operator, right)| Condition::Compare(left, operator, right)),
+            (operand.clone(), operand.clone()).prop_map(|(value, bound)| Condition::Between(
+                value,
+                bound.clone(),
+                bound
+            )),
+            (
+                operand.clone(),
+                prop::collection::vec(operand.clone(), 1..4)
+            )
+                .prop_map(|(value, entries)| Condition::In(value, entries)),
+        ];
+        leaf.prop_recursive(2, 8, 4, |inner| {
+            prop_oneof![
+                inner
+                    .clone()
+                    .prop_map(|inner| Condition::Not(Box::new(inner))),
+                prop::collection::vec(inner.clone(), 1..4).prop_map(Condition::And),
+                prop::collection::vec(inner.clone(), 1..4).prop_map(Condition::Or),
+            ]
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(96))]
+
+        /// `NOT` is the exact negation of the condition it wraps, error
+        /// included: a condition that cannot be evaluated does not become
+        /// `true` by being negated.
+        #[test]
+        fn not_inverts_every_condition(
+            condition in condition(),
+            first in attribute(),
+            second in attribute(),
+        ) {
+            let values = ValueMap::from([
+                (":a".to_string(), first),
+                (":b".to_string(), second),
+            ]);
+            let ctx = Ctx {
+                names: &NameMap::new(),
+                values: &values,
+            };
+            let mut item = item();
+            item.insert(
+                "list".into(),
+                AttributeValue::L(vec![s("a"), n("7")]),
+            );
+            let negated = Condition::Not(Box::new(condition.clone()));
+            match (
+                evaluate(&condition, Some(&item), &ctx),
+                evaluate(&negated, Some(&item), &ctx),
+            ) {
+                (Ok(plain), Ok(flipped)) => prop_assert_eq!(flipped, !plain),
+                (Err(_), Err(_)) => {}
+                (plain, flipped) => {
+                    prop_assert!(false, "{:?} negated to {:?}", plain, flipped);
+                }
+            }
+        }
+
+        /// One ordering, seen from both sides: `left < right` holds exactly when
+        /// `right > left` does, and a pair that is not comparable at all is not
+        /// comparable in either direction.
+        #[test]
+        fn comparison_is_antisymmetric(left in attribute(), right in attribute()) {
+            match (
+                compare(&left, CmpOp::Lt, &right),
+                compare(&right, CmpOp::Gt, &left),
+            ) {
+                (Ok(forward), Ok(backward)) => prop_assert_eq!(forward, backward),
+                (Err(_), Err(_)) => {}
+                (forward, backward) => {
+                    prop_assert!(false, "one direction only: {:?} vs {:?}", forward, backward);
+                }
+            }
+        }
+
+        /// Equality and inequality are complements, and an equal pair is never
+        /// strictly less or greater than itself.
+        #[test]
+        fn equality_excludes_strict_order(left in attribute(), right in attribute()) {
+            let equal = matches!(compare(&left, CmpOp::Eq, &right), Ok(true));
+            prop_assert_eq!(
+                matches!(compare(&left, CmpOp::Ne, &right), Ok(true)),
+                !equal
+            );
+            if equal {
+                prop_assert!(!matches!(compare(&left, CmpOp::Lt, &right), Ok(true)));
+                prop_assert!(!matches!(compare(&left, CmpOp::Gt, &right), Ok(true)));
+            }
+        }
+
+        /// A container contains every member it holds, a string contains itself
+        /// and every string starts with itself.
+        #[test]
+        fn contains_accepts_every_member_it_holds(value in attribute()) {
+            match &value {
+                AttributeValue::S(text) => {
+                    prop_assert!(contains(&value, &AttributeValue::S(text.clone())));
+                    prop_assert!(begins_with(&value, &AttributeValue::S(text.clone())));
+                }
+                AttributeValue::Ss(members) => {
+                    for member in members {
+                        prop_assert!(contains(&value, &AttributeValue::S(member.clone())));
+                    }
+                }
+                AttributeValue::Ns(members) => {
+                    for member in members {
+                        prop_assert!(contains(&value, &AttributeValue::N(member.clone())));
+                    }
+                }
+                AttributeValue::Bs(members) => {
+                    for member in members {
+                        prop_assert!(contains(&value, &AttributeValue::B(member.clone())));
+                    }
+                }
+                AttributeValue::L(elements) => {
+                    for element in elements {
+                        prop_assert!(contains(&value, element));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        /// `size()` has a number for every value shape — bytes for strings and
+        /// binary, element count for collections, zero for the rest — and never
+        /// panics on one it was not written for.
+        #[test]
+        fn size_of_counts_bytes_or_elements(value in attribute()) {
+            let expected = match &value {
+                AttributeValue::S(text) => text.len(),
+                AttributeValue::B(blob) => blob.as_ref().len(),
+                AttributeValue::Ss(members) | AttributeValue::Ns(members) => members.len(),
+                AttributeValue::Bs(members) => members.len(),
+                AttributeValue::L(elements) => elements.len(),
+                AttributeValue::M(entries) => entries.len(),
+                _ => 0,
+            };
+            prop_assert_eq!(
+                size_of(&value),
+                u64::try_from(expected).ok().unwrap_or(u64::MAX)
+            );
+        }
+
+        /// The empty needle is a substring and a prefix of every string and a
+        /// prefix of every binary — including of an empty one.
+        #[test]
+        fn an_empty_needle_matches_every_string_and_binary(value in attribute()) {
+            let empty_string = AttributeValue::S(String::new());
+            let empty_blob = AttributeValue::B(crate::Blob::new(Vec::new()));
+            match &value {
+                AttributeValue::S(text) => {
+                    prop_assert!(contains(&value, &empty_string));
+                    prop_assert!(begins_with(&value, &empty_string));
+                    prop_assert!(text.is_empty() || !begins_with(&empty_string, &value));
+                }
+                AttributeValue::B(blob) => {
+                    prop_assert!(begins_with(&value, &empty_blob));
+                    prop_assert!(blob.as_ref().is_empty() || !begins_with(&empty_blob, &value));
+                }
+                _ => {
+                    prop_assert!(!begins_with(&value, &empty_blob));
+                }
+            }
+        }
     }
 }
