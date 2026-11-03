@@ -3,20 +3,34 @@
 //! DynamoDB numbers are 38-digit decimals carried as strings; the service
 //! compares them numerically (`"1.0"` equals `"1"`, `"10"` sorts after `"9"`).
 //! Parsing into `f64` would silently lose precision at the top of that range,
-//! so the mock normalises each number into `sign · digits · 10^exponent` and
-//! compares digit strings.
+//! so the value is held as a [`BigDecimal`]: ordering, equality, normalisation
+//! and addition are the maintained crate's, not a local implementation.
+//!
+//! What stays local is DynamoDB's *grammar*. It is narrower than the crate's —
+//! the service rejects `1_000` and `1.2.3`, while `BigDecimal` reads digit
+//! groups separated by underscores — so the literal is validated here before it
+//! reaches the parser, and the DynamoDB range limits
+//! (`1E-130` … `9.99…E+125`, 38 significant digits) are checked on the parsed
+//! value.
 
-use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
+use std::str::FromStr;
 
-/// A decimal number in normalised form: `(-1)^negative · digits · 10^exponent`.
+use bigdecimal::{BigDecimal, Zero};
+
+/// A DynamoDB number: an exact decimal value.
 ///
-/// `digits` never has a leading or trailing zero; the empty string is zero.
-#[derive(Clone, Debug)]
+/// The value is kept normalised (mantissa without leading or trailing zeros),
+/// so equality, ordering and hashing all agree on `"1"`, `"1.0"` and `"1e0"`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Number {
-    negative: bool,
-    digits: String,
-    exponent: i32,
+    /// The exact value; ordering and arithmetic are delegated to it.
+    value: BigDecimal,
+    /// `value == mantissa · 10^exponent` for the normalised mantissa.
+    ///
+    /// Cached because the padding guards below need it without a `BigInt`
+    /// round trip, and because normalisation determines it uniquely.
+    exponent: i64,
 }
 
 /// DynamoDB's documented maximum significant digits.
@@ -46,27 +60,34 @@ const MAX_PADDING: usize = 130;
 ///
 /// Aligning the operands means materialising the gap as zeros; DynamoDB's own
 /// exponent range keeps real values well inside this.
-const MAX_ALIGNMENT_SHIFT: i64 = 400;
+const MAX_ALIGNMENT_SHIFT: u64 = 400;
 
 impl Number {
     /// Parse a DynamoDB number string. `None` means the string is not a number.
+    ///
+    /// The grammar check is DynamoDB's, not the decimal crate's: see the
+    /// module documentation for why it cannot be delegated.
     pub(crate) fn parse(text: &str) -> Option<Self> {
         let text = text.trim();
         if text.is_empty() {
             return None;
         }
-        let (negative, rest) = match text.strip_prefix('-') {
-            Some(rest) => (true, rest),
-            None => (false, text.strip_prefix('+').unwrap_or(text)),
+        let unsigned = match text.strip_prefix('-') {
+            Some(rest) => rest,
+            None => text.strip_prefix('+').unwrap_or(text),
         };
-        let (mantissa, exponent_text) = match rest.find(['e', 'E']) {
-            Some(index) => (&rest[..index], Some(&rest[index + 1..])),
-            None => (rest, None),
+        let (mantissa, exponent_text) = match unsigned.find(['e', 'E']) {
+            Some(index) => (&unsigned[..index], Some(&unsigned[index + 1..])),
+            None => (unsigned, None),
         };
-        let mut exponent: i64 = match exponent_text {
-            Some(raw) => raw.parse().ok()?,
-            None => 0,
-        };
+        if let Some(raw) = exponent_text {
+            // `BigDecimal` takes an `i128` exponent; the service's own limit is
+            // far smaller, and an exponent that does not fit an `i64` is not
+            // storable whichever way it is read.
+            if raw.parse::<i64>().is_err() {
+                return None;
+            }
+        }
         let (integer_part, fraction_part) = match mantissa.find('.') {
             Some(index) => (&mantissa[..index], &mantissa[index + 1..]),
             None => (mantissa, ""),
@@ -79,38 +100,47 @@ impl Number {
         {
             return None;
         }
-        exponent -= i64::try_from(fraction_part.len()).ok()?;
+        // A leading `+` is grammar, and `BigDecimal` only accepts it on the
+        // exponent — pass the literal without it.
+        let literal = text.strip_prefix('+').unwrap_or(text);
+        Self::from_decimal(&BigDecimal::from_str(literal).ok()?)
+    }
 
-        let mut digits = format!("{integer_part}{fraction_part}");
-        let first_significant = digits.find(|c: char| c != '0');
-        let Some(first_significant) = first_significant else {
-            return Some(Self {
-                negative: false,
-                digits: String::new(),
-                exponent: 0,
-            });
-        };
-        digits.drain(..first_significant);
-        let significant_len = digits.trim_end_matches('0').len();
-        let stripped = digits.len() - significant_len;
-        digits.truncate(significant_len);
-        exponent += i64::try_from(stripped).ok()?;
-
-        Some(Self {
-            negative,
-            digits,
-            exponent: i32::try_from(exponent).ok()?,
-        })
+    /// Wrap an exact value, normalising it and caching its exponent.
+    ///
+    /// `None` when the value's scale has no negatable `i64` exponent
+    /// (`i64::MIN`). No DynamoDB value comes near it, and such a number could
+    /// not be rendered, compared or stored, so it is refused rather than
+    /// carried around.
+    fn from_decimal(value: &BigDecimal) -> Option<Self> {
+        let value = value.normalized();
+        let (_, scale) = value.as_bigint_and_exponent();
+        let exponent = scale.checked_neg()?;
+        Some(Self { value, exponent })
     }
 
     /// Whether the value is zero.
     pub(crate) fn is_zero(&self) -> bool {
-        self.digits.is_empty()
+        self.value.is_zero()
     }
 
-    /// Number of significant digits.
+    /// The normalised mantissa as `(negative, digits)`, or `None` for zero,
+    /// which has no significant digits.
+    fn mantissa(&self) -> Option<(bool, String)> {
+        if self.is_zero() {
+            return None;
+        }
+        let (mantissa, _) = self.value.as_bigint_and_exponent();
+        let text = mantissa.to_str_radix(10);
+        match text.strip_prefix('-') {
+            Some(digits) => Some((true, digits.to_string())),
+            None => Some((false, text)),
+        }
+    }
+
+    /// Number of significant digits. Zero has none.
     pub(crate) fn significant_digits(&self) -> usize {
-        self.digits.len()
+        self.mantissa().map_or(0, |(_, digits)| digits.len())
     }
 
     /// The value's order of magnitude: `digits.len() + exponent`, i.e. the
@@ -118,7 +148,8 @@ impl Number {
     ///
     /// Zero has no order of magnitude; callers check [`Self::is_zero`] first.
     fn order(&self) -> i64 {
-        i64::try_from(self.digits.len()).unwrap_or(i64::MAX) + i64::from(self.exponent)
+        let width = i64::try_from(self.significant_digits()).unwrap_or(i64::MAX);
+        width.saturating_add(self.exponent)
     }
 
     /// Whether the value fits DynamoDB's documented exponent range
@@ -132,108 +163,64 @@ impl Number {
     /// Two numbers are equal exactly when their canonical forms match, which is
     /// what key maps use for identity.
     pub(crate) fn canonical(&self) -> String {
-        if self.is_zero() {
-            return "0".to_string();
-        }
-        let sign = if self.negative { "-" } else { "" };
-        format!("{sign}{}E{}", self.digits, self.exponent)
+        self.mantissa().map_or_else(
+            || "0".to_string(),
+            |(negative, digits)| {
+                let sign = if negative { "-" } else { "" };
+                format!("{sign}{digits}E{}", self.exponent)
+            },
+        )
     }
 
     /// The number as an `i64`, if it is integral and fits.
     pub(crate) fn as_i64(&self) -> Option<i64> {
-        let magnitude = i64::from(self.exponent);
-        if magnitude < 0 || self.digits.len() > 19 {
+        if self.is_zero() {
+            return Some(0);
+        }
+        let (negative, digits) = self.mantissa()?;
+        if self.exponent < 0 || digits.len() > 19 {
             return None;
         }
         let mut value: i64 = 0;
-        for digit in self.digits.bytes() {
+        for digit in digits.bytes() {
             value = value.checked_mul(10)?;
             value = value.checked_add(i64::from(digit - b'0'))?;
         }
-        for _ in 0..magnitude {
+        for _ in 0..self.exponent {
             value = value.checked_mul(10)?;
         }
-        Some(if self.negative { -value } else { value })
+        Some(if negative { -value } else { value })
+    }
+
+    /// Whether aligning the two exponents would materialise an absurd run of
+    /// zeros. Two exponents within [`MAX_ALIGNMENT_SHIFT`] of each other are
+    /// aligned; anything further apart is refused.
+    fn alignment_fits(&self, other: &Self) -> bool {
+        self.exponent.saturating_sub(other.exponent).unsigned_abs() <= MAX_ALIGNMENT_SHIFT
     }
 
     /// Add two numbers exactly.
     ///
     /// `None` when the exponents are so far apart that aligning them would
-    /// allocate an absurd string — DynamoDB's own range makes that unreachable
-    /// for stored values, and returning `None` keeps a hostile expression from
-    /// exhausting memory.
+    /// materialise an absurd run of digits — DynamoDB's own range makes that
+    /// unreachable for stored values, and returning `None` keeps a hostile
+    /// expression from exhausting memory. The addition itself is
+    /// `BigDecimal`'s.
     pub(crate) fn add(&self, other: &Self) -> Option<Self> {
-        // Difference in `i64`: two accepted `i32` exponents can be further
-        // apart than `i32` itself can express (`i32::MAX - i32::MIN`), and the
-        // subtraction used to overflow before the shift guard below ran.
-        let base = i64::from(self.exponent).min(i64::from(other.exponent));
-        let left_shift = i64::from(self.exponent) - base;
-        let right_shift = i64::from(other.exponent) - base;
-        if left_shift > MAX_ALIGNMENT_SHIFT || right_shift > MAX_ALIGNMENT_SHIFT {
+        if !self.alignment_fits(other) {
             return None;
         }
-        let left_shift = usize::try_from(left_shift).ok()?;
-        let right_shift = usize::try_from(right_shift).ok()?;
-        // The smaller of two `i32`s is one of them, so it always fits.
-        let exponent = self.exponent.min(other.exponent);
-        let left = format!("{}{}", self.digits, "0".repeat(left_shift));
-        let right = format!("{}{}", other.digits, "0".repeat(right_shift));
-        let left = if left.is_empty() {
-            "0".to_string()
-        } else {
-            left
-        };
-        let right = if right.is_empty() {
-            "0".to_string()
-        } else {
-            right
-        };
-
-        let (negative, digits) = if self.negative == other.negative {
-            (self.negative, unsigned_add(&left, &right))
-        } else {
-            match unsigned_cmp(&left, &right) {
-                Ordering::Equal => return Some(Self::zero()),
-                Ordering::Greater => (self.negative, unsigned_sub(&left, &right)),
-                Ordering::Less => (other.negative, unsigned_sub(&right, &left)),
-            }
-        };
-        Some(Self::from_parts(negative, &digits, exponent))
+        let sum = &self.value + &other.value;
+        Self::from_decimal(&sum)
     }
 
     /// Subtract `other` from `self`.
     pub(crate) fn sub(&self, other: &Self) -> Option<Self> {
-        let negated = Self {
-            negative: !other.negative && !other.is_zero(),
-            digits: other.digits.clone(),
-            exponent: other.exponent,
-        };
-        self.add(&negated)
-    }
-
-    /// Zero.
-    fn zero() -> Self {
-        Self {
-            negative: false,
-            digits: String::new(),
-            exponent: 0,
+        if !self.alignment_fits(other) {
+            return None;
         }
-    }
-
-    /// Build from an unnormalised `digits · 10^exponent`.
-    fn from_parts(negative: bool, digits: &str, exponent: i32) -> Self {
-        let trimmed = digits.trim_start_matches('0');
-        if trimmed.is_empty() {
-            return Self::zero();
-        }
-        let significant = trimmed.trim_end_matches('0');
-        let stripped = trimmed.len() - significant.len();
-        let exponent = exponent.saturating_add(i32::try_from(stripped).unwrap_or(i32::MAX));
-        Self {
-            negative,
-            digits: significant.to_string(),
-            exponent,
-        }
+        let difference = &self.value - &other.value;
+        Self::from_decimal(&difference)
     }
 
     /// Format the number the way DynamoDB stores it (no exponent notation).
@@ -243,103 +230,38 @@ impl Number {
     /// nothing useful to render. Returning `None` keeps a 5-byte input like
     /// `1e2147483647` from asking for gigabytes of zero padding.
     pub(crate) fn to_plain_string(&self) -> Option<String> {
-        if self.is_zero() {
+        let Some((negative, digits)) = self.mantissa() else {
             return Some("0".to_string());
-        }
-        let sign = if self.negative { "-" } else { "" };
+        };
+        let sign = if negative { "-" } else { "" };
         if self.exponent >= 0 {
             let zeros = usize::try_from(self.exponent).ok()?;
             if zeros > MAX_PADDING {
                 return None;
             }
-            Some(format!("{sign}{}{}", self.digits, "0".repeat(zeros)))
+            Some(format!("{sign}{digits}{}", "0".repeat(zeros)))
         } else {
-            // `unsigned_abs` keeps `i32::MIN` from overflowing.
+            // `unsigned_abs` keeps `i64::MIN` from overflowing.
             let scale = usize::try_from(self.exponent.unsigned_abs()).ok()?;
             if scale > MAX_PADDING {
                 return None;
             }
-            if scale < self.digits.len() {
-                let split = self.digits.len() - scale;
-                Some(format!(
-                    "{sign}{}.{}",
-                    &self.digits[..split],
-                    &self.digits[split..]
-                ))
+            if scale < digits.len() {
+                let split = digits.len() - scale;
+                Some(format!("{sign}{}.{}", &digits[..split], &digits[split..]))
             } else {
                 Some(format!(
-                    "{sign}0.{}{}",
-                    "0".repeat(scale - self.digits.len()),
-                    self.digits
+                    "{sign}0.{}{digits}",
+                    "0".repeat(scale - digits.len())
                 ))
             }
         }
     }
-
-    /// Compare the magnitudes (absolute values) of two numbers.
-    fn magnitude_cmp(&self, other: &Self) -> Ordering {
-        self.order().cmp(&other.order()).then_with(|| {
-            let width = self.digits.len().max(other.digits.len());
-            let mut left = self.digits.bytes();
-            let mut right = other.digits.bytes();
-            for _ in 0..width {
-                let a = left.next().unwrap_or(b'0');
-                let b = right.next().unwrap_or(b'0');
-                match a.cmp(&b) {
-                    Ordering::Equal => {}
-                    ordering => return ordering,
-                }
-            }
-            Ordering::Equal
-        })
-    }
 }
-
-impl PartialEq for Number {
-    fn eq(&self, other: &Self) -> bool {
-        self.canonical() == other.canonical()
-    }
-}
-
-impl Eq for Number {}
 
 impl Hash for Number {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.canonical().hash(state);
-    }
-}
-
-impl PartialOrd for Number {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Number {
-    fn cmp(&self, other: &Self) -> Ordering {
-        match (self.is_zero(), other.is_zero()) {
-            (true, true) => Ordering::Equal,
-            (true, false) => {
-                if other.negative {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                }
-            }
-            (false, true) => {
-                if self.negative {
-                    Ordering::Less
-                } else {
-                    Ordering::Greater
-                }
-            }
-            (false, false) => match (self.negative, other.negative) {
-                (false, true) => Ordering::Greater,
-                (true, false) => Ordering::Less,
-                (false, false) => self.magnitude_cmp(other),
-                (true, true) => self.magnitude_cmp(other).reverse(),
-            },
-        }
     }
 }
 
@@ -370,64 +292,10 @@ pub(crate) fn validate(text: &str) -> crate::Result<()> {
     Ok(())
 }
 
-/// Add two non-negative decimal strings.
-fn unsigned_add(left: &str, right: &str) -> String {
-    let mut digits: Vec<u8> = Vec::with_capacity(left.len().max(right.len()) + 1);
-    let mut carry = 0_u8;
-    let mut left = left.bytes().rev();
-    let mut right = right.bytes().rev();
-    loop {
-        let a = left.next().map(|byte| byte - b'0');
-        let b = right.next().map(|byte| byte - b'0');
-        if a.is_none() && b.is_none() {
-            break;
-        }
-        let sum = a.unwrap_or(0) + b.unwrap_or(0) + carry;
-        digits.push(b'0' + sum % 10);
-        carry = sum / 10;
-    }
-    if carry > 0 {
-        digits.push(b'0' + carry);
-    }
-    digits.reverse();
-    String::from_utf8(digits).unwrap_or_else(|_| "0".to_string())
-}
-
-/// Compare two non-negative decimal strings of any length.
-fn unsigned_cmp(left: &str, right: &str) -> Ordering {
-    let left = left.trim_start_matches('0');
-    let right = right.trim_start_matches('0');
-    left.len().cmp(&right.len()).then_with(|| left.cmp(right))
-}
-
-/// Subtract `right` from `left`, where `left >= right` and both are
-/// non-negative decimal strings.
-fn unsigned_sub(left: &str, right: &str) -> String {
-    let mut digits: Vec<u8> = Vec::with_capacity(left.len());
-    let mut borrow = 0_i16;
-    let mut left = left.bytes().rev();
-    let mut right = right.bytes().rev();
-    loop {
-        let a = left.next().map(|byte| i16::from(byte - b'0'));
-        let b = right.next().map_or(0, |byte| i16::from(byte - b'0'));
-        if a.is_none() {
-            break;
-        }
-        let mut difference = a.unwrap_or(0) - b - borrow;
-        if difference < 0 {
-            difference += 10;
-            borrow = 1;
-        } else {
-            borrow = 0;
-        }
-        digits.push(b'0' + u8::try_from(difference).unwrap_or(0));
-    }
-    digits.reverse();
-    String::from_utf8(digits).unwrap_or_else(|_| "0".to_string())
-}
-
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+
     use super::*;
 
     #[test]
@@ -440,6 +308,26 @@ mod tests {
         for text in ["", "-", ".", "1.2.3", "abc", "1e", "e5", "--1", "1 2"] {
             assert!(Number::parse(text).is_none(), "{text}");
         }
+    }
+
+    #[test]
+    fn grammar_is_dynamodb_not_bigdecimals() {
+        // `BigDecimal` reads these as numbers; the service does not, so the
+        // mock must not either. This is the reason the grammar check stays
+        // local instead of being handed to the crate.
+        for text in ["1_000", "1_._2", "271576662.__E4", "123_", "1.2_3"] {
+            assert!(BigDecimal::from_str(text).is_ok(), "{text} parses");
+            assert_eq!(Number::parse(text), None, "{text} must be rejected");
+        }
+        // ... and the forms both accept keep working, sign and all.
+        assert_eq!(
+            Number::parse("+7").map(|number| number.canonical()),
+            Some("7E0".to_string())
+        );
+        assert_eq!(
+            Number::parse("007").map(|number| number.canonical()),
+            Some("7E0".to_string())
+        );
     }
 
     #[test]
@@ -459,6 +347,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn canonical_forms_carry_the_normalised_mantissa() {
+        for (text, canonical) in [
+            ("0", "0"),
+            ("-0.00", "0"),
+            ("1.5", "15E-1"),
+            ("-1.5", "-15E-1"),
+            ("100", "1E2"),
+            ("0.001", "1E-3"),
+            ("1e125", "1E125"),
+            ("-1e-130", "-1E-130"),
+        ] {
+            assert_eq!(
+                Number::parse(text).unwrap().canonical(),
+                canonical,
+                "{text}"
+            );
+        }
+        // 38 significant digits survive intact - the reason `f64` and the
+        // fixed-width decimal crates are not an option here.
+        let wide = "12345678901234567890123456789012345678";
+        assert_eq!(
+            Number::parse(wide).unwrap().canonical(),
+            format!("{wide}E0")
+        );
+        assert_eq!(Number::parse(wide).unwrap().significant_digits(), 38);
     }
 
     #[test]
@@ -491,8 +407,15 @@ mod tests {
             Some(1_700_000_000)
         );
         assert_eq!(Number::parse("-3").unwrap().as_i64(), Some(-3));
+        assert_eq!(Number::parse("0").unwrap().as_i64(), Some(0));
         assert_eq!(Number::parse("1.5").unwrap().as_i64(), None);
         assert_eq!(Number::parse("1e30").unwrap().as_i64(), None);
+        // Just inside and just outside `i64::MAX`.
+        assert_eq!(
+            Number::parse("9223372036854775807").unwrap().as_i64(),
+            Some(i64::MAX)
+        );
+        assert_eq!(Number::parse("9223372036854775808").unwrap().as_i64(), None);
     }
 
     #[test]
@@ -524,6 +447,32 @@ mod tests {
     }
 
     #[test]
+    fn exponent_boundary_is_i64_min() {
+        // An exponent of `i64::MAX` (or `i64::MIN + 1`) has a negatable
+        // counterpart; `i64::MIN` as a scale does not, and such a value
+        // cannot be rendered or ordered, so it is not a number.
+        let at_limit = Number::from_decimal(&BigDecimal::new(1.into(), -i64::MAX));
+        assert!(at_limit.is_some());
+        let past_limit = Number::from_decimal(&BigDecimal::new(1.into(), i64::MIN));
+        assert!(past_limit.is_none());
+
+        // Through the parser the same boundary sits where the exponent stops
+        // fitting an `i64`, on both ends.
+        assert!(Number::parse("1e9223372036854775807").is_some());
+        assert!(Number::parse("1e9223372036854775808").is_none());
+        assert!(Number::parse("1e-9223372036854775807").is_some());
+        assert!(Number::parse("1e-9223372036854775808").is_none());
+
+        // Neither extreme renders, and ordering still holds without touching
+        // the padding path.
+        let largest = Number::parse("1e9223372036854775807").unwrap();
+        let smallest = Number::parse("1e-9223372036854775807").unwrap();
+        assert_eq!(largest.to_plain_string(), None);
+        assert_eq!(smallest.to_plain_string(), None);
+        assert!(largest > smallest);
+    }
+
+    #[test]
     fn plain_string_refuses_absurd_padding() {
         // Hostile exponents are refused instead of allocated.
         let huge = Number::parse("1e2147483647").unwrap();
@@ -532,35 +481,19 @@ mod tests {
         assert_eq!(tiny.to_plain_string(), None);
 
         // Boundary pair on the padding limit: 130 zeros render, 131 do not.
-        let at_limit = Number {
-            negative: false,
-            digits: "1".to_string(),
-            exponent: 130,
-        };
+        let at_limit = Number::parse("1e130").unwrap();
         assert_eq!(at_limit.to_plain_string().unwrap().len(), 131);
-        let past_limit = Number {
-            negative: false,
-            digits: "1".to_string(),
-            exponent: 131,
-        };
+        let past_limit = Number::parse("1e131").unwrap();
         assert_eq!(past_limit.to_plain_string(), None);
 
         // Same on the fractional side: a scale of 130 pads 129 zeros, 131 is
         // refused.
-        let fraction_limit = Number {
-            negative: false,
-            digits: "1".to_string(),
-            exponent: -130,
-        };
+        let fraction_limit = Number::parse("1e-130").unwrap();
         assert_eq!(
             fraction_limit.to_plain_string().unwrap(),
             format!("0.{}1", "0".repeat(129))
         );
-        let fraction_past = Number {
-            negative: false,
-            digits: "1".to_string(),
-            exponent: -131,
-        };
+        let fraction_past = Number::parse("1e-131").unwrap();
         assert_eq!(fraction_past.to_plain_string(), None);
 
         // Everything DynamoDB accepts still renders.
@@ -578,8 +511,8 @@ mod tests {
     fn arithmetic_survives_extreme_exponents() {
         // `i32::MAX - i32::MIN` does not fit in `i32`: the subtraction used to
         // panic in debug builds before the shift guard could reject the pair.
-        let max = Number::parse("1e2147483647").expect("exponent i32::MAX is accepted");
-        let min = Number::parse("1e-2147483648").expect("exponent i32::MIN is accepted");
+        let max = Number::parse("1e2147483647").expect("a huge exponent is a number");
+        let min = Number::parse("1e-2147483648").expect("a tiny exponent is a number");
         assert!(max.add(&min).is_none());
         assert!(min.add(&max).is_none());
         assert!(max.sub(&min).is_none());
@@ -669,6 +602,67 @@ mod tests {
         for text in ["0", "1", "-1", "1.5", "-0.25", "1000000", "0.001"] {
             let number = Number::parse(text).unwrap();
             assert_eq!(number.to_plain_string().as_deref(), Some(text));
+        }
+    }
+
+    use proptest::prelude::*;
+
+    /// A literal the service accepts: sign, nine digits with the decimal point
+    /// somewhere inside them, and an exponent.
+    fn decimal_literal() -> impl Strategy<Value = String> {
+        (any::<bool>(), 1_u32..1_000_000_000, 0_u32..9, -30_i32..30).prop_map(
+            |(negative, mantissa, scale, exponent)| {
+                let sign = if negative { "-" } else { "" };
+                let digits = format!("{mantissa:09}");
+                let split = digits.len() - scale as usize;
+                let (integer, fraction) = digits.split_at(split);
+                if fraction.is_empty() {
+                    format!("{sign}{integer}e{exponent}")
+                } else {
+                    format!("{sign}{integer}.{fraction}e{exponent}")
+                }
+            },
+        )
+    }
+
+    proptest! {
+        /// Equality is equality *of value*: any spelling of a number is the
+        /// same number, and the canonical form re-parses to it.
+        #[test]
+        fn canonical_form_identifies_the_value(literal in decimal_literal()) {
+            let number = Number::parse(&literal).expect("generated literals are valid");
+            let canonical = number.canonical();
+            let again = Number::parse(&canonical).expect("the canonical form is a literal");
+            prop_assert_eq!(&again, &number, "{} -> {}", literal.as_str(), canonical.as_str());
+            prop_assert_eq!(again.significant_digits(), number.significant_digits());
+            prop_assert_eq!(again.to_plain_string(), number.to_plain_string());
+        }
+
+        /// Trailing zeros in the fraction, and a matching step of the exponent,
+        /// must not change the value.
+        #[test]
+        fn respelling_keeps_the_value(mantissa in 1_u64..1_000_000, scale in 1_u32..10) {
+            let plain = format!("{mantissa}");
+            let fraction = format!("{mantissa}.{}", "0".repeat(scale as usize));
+            let scaled = format!("{mantissa}{}e-{}", "0".repeat(scale as usize), scale);
+            let plain = Number::parse(&plain).expect("plain literal");
+            let with_zeros = Number::parse(&fraction).expect("padded literal");
+            let with_exponent = Number::parse(&scaled).expect("scaled literal");
+            prop_assert_eq!(&with_zeros, &plain);
+            prop_assert_eq!(&with_exponent, &plain);
+        }
+
+        /// The ordering of integers is the ordering of their values - `f64` is
+        /// exact for `i32`, so the float comparison is an independent oracle.
+        #[test]
+        fn integer_ordering_matches_the_value(left in 0_i32..i32::MAX, right in 0_i32..i32::MAX) {
+            let ordering = Number::parse(&left.to_string())
+                .expect("left parses")
+                .cmp(&Number::parse(&right.to_string()).expect("right parses"));
+            let expected = f64::from(left)
+                .partial_cmp(&f64::from(right))
+                .expect("both are finite");
+            prop_assert_eq!(ordering, expected);
         }
     }
 }
