@@ -667,12 +667,15 @@ fn a_large_remove_list_within_the_limit_is_applied() {
 }
 
 /// The retry decision turns on the last terminal reason: an empty list is not
-/// retryable, one conflict is, and a single terminal member on either side of
-/// the conflict ends that.
+/// retryable, one retryable reason is, and a single terminal member on either
+/// side of it ends that.
 #[test]
 fn retryability_edges_around_the_terminal_reason() {
     fn conflict() -> CancellationReason {
         CancellationReason::new(CancellationReasonCode::TransactionConflict, "conflict")
+    }
+    fn throttled() -> CancellationReason {
+        CancellationReason::new(CancellationReasonCode::ThrottlingError, "throttled")
     }
     fn terminal() -> CancellationReason {
         CancellationReason::new(CancellationReasonCode::ConditionalCheckFailed, "no")
@@ -687,15 +690,32 @@ fn retryability_edges_around_the_terminal_reason() {
     // Just inside the boundary: empty is not retryable, one conflict is.
     assert!(!cancelled(Vec::new()).is_retryable());
     assert!(cancelled(vec![conflict()]).is_retryable());
-    // Two conflicts stay retryable — length is not the limit, conflict is.
+    // Two conflicts stay retryable — length is not the limit, the reason is —
+    // and a throttle is as fixable as a lost race.
     assert!(cancelled(vec![conflict(), conflict()]).is_retryable());
-    // Just outside: a terminal member before or after the conflict.
+    assert!(cancelled(vec![throttled()]).is_retryable());
+    assert!(cancelled(vec![conflict(), throttled()]).is_retryable());
+    // Just outside: a terminal member before or after a retryable one.
     assert!(!cancelled(vec![terminal(), conflict()]).is_retryable());
     assert!(!cancelled(vec![conflict(), terminal()]).is_retryable());
+    assert!(!cancelled(vec![throttled(), terminal()]).is_retryable());
     assert!(!cancelled(vec![terminal()]).is_retryable());
-    // Only a cancelled transaction is retryable at all.
+    // A member whose item collection is exhausted is terminal too: the data is
+    // too large, and the second attempt meets the same limit.
+    assert!(!cancelled(vec![CancellationReason::new(
+        CancellationReasonCode::ItemCollectionSizeLimitExceeded,
+        "too big"
+    )])
+    .is_retryable());
+    // Outside a cancellation only the 5xx is retryable.
+    assert!(Error::internal("bug").is_retryable());
+    assert!(Error::internal_from("bug", "not a number".parse::<u32>().unwrap_err()).is_retryable());
     assert!(!Error::validation("bad").is_retryable());
     assert!(!Error::table_not_found("users").is_retryable());
+    assert!(!Error::ResourceInUse {
+        message: "exists".to_string()
+    }
+    .is_retryable());
 }
 
 /// `cancellation_reasons` is the member list for a cancelled transaction and

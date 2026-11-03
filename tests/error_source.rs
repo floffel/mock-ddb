@@ -53,7 +53,9 @@ fn internal_without_a_cause_ends_the_chain() {
     assert_eq!(error.code(), "InternalServerError");
     assert_eq!(error.to_string(), "bug");
     assert!(error.source().is_none());
-    assert!(!error.is_retryable());
+    // A 5xx carries no decision about the request, so it is the one failure a
+    // retry layer should attempt again.
+    assert!(error.is_retryable());
 }
 
 #[test]

@@ -453,22 +453,20 @@ fn cancellation_reason_list() -> impl Strategy<Value = Vec<CancellationReason>> 
 }
 
 /// The rule the service applies to a cancelled transaction: retry only when
-/// every member lost a race, because a terminal reason would reject the retry
-/// for the same cause again.
+/// every member was rejected for a reason a retry can fix — a lost race or a
+/// throttle — because a terminal reason would reject the retry for the same
+/// cause again.
 fn expected_retryable(reasons: &[CancellationReason]) -> bool {
-    !reasons.is_empty()
-        && reasons
-            .iter()
-            .all(|reason| reason.code() == CancellationReasonCode::TransactionConflict)
+    !reasons.is_empty() && reasons.iter().all(|reason| reason.code().is_retryable())
 }
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
 
     /// A cancelled transaction is retryable exactly when it reported members
-    /// and all of them conflicted — no empty list, no mixed list.
+    /// and all of them name a retryable reason — no empty list, no mixed list.
     #[test]
-    fn is_retryable_needs_a_non_empty_all_conflict_list(
+    fn is_retryable_needs_a_non_empty_all_retryable_list(
         reasons in cancellation_reason_list(),
     ) {
         let cancelled = Error::TransactionCanceled {
@@ -478,10 +476,10 @@ proptest! {
         let expected = expected_retryable(&reasons);
         prop_assert_eq!(cancelled.is_retryable(), expected, "reasons: {:?}", reasons);
 
-        // A conflicting member followed by a terminal one must not make the
+        // A retryable member followed by a terminal one must not make the
         // whole transaction look retryable, in either order.
         let mut mixed = vec![
-            CancellationReason::new(CancellationReasonCode::TransactionConflict, "conflict"),
+            CancellationReason::new(CancellationReasonCode::ThrottlingError, "throttled"),
             CancellationReason::new(CancellationReasonCode::ConditionalCheckFailed, "no"),
         ];
         let mut cancelled = Error::TransactionCanceled {
@@ -498,17 +496,53 @@ proptest! {
         prop_assert!(!cancelled.is_retryable(), "reasons: {:?}", mixed);
     }
 
-    /// No failure outside a cancelled transaction is ever retryable, whatever
-    /// its payload says.
+    /// The only failure outside a cancelled transaction that is retryable is the
+    /// 5xx, whatever its payload says: a caller that retries every
+    /// `is_retryable` failure retries internal failures and nothing else.
     #[test]
-    fn only_a_cancelled_transaction_is_retryable(payload in "[ -~]{0,24}") {
+    fn internal_is_the_only_retryable_failure_outside_a_cancellation(
+        payload in "[ -~]{0,24}",
+    ) {
         for error in every_variant(&payload) {
-            prop_assert!(
-                !error.is_retryable(),
-                "{:?} must not be retryable",
-                error
+            let expected = error.code() == "InternalServerError";
+            prop_assert_eq!(
+                error.is_retryable(),
+                expected,
+                "{:?} is classified `{}`",
+                error,
+                error.code()
             );
         }
+    }
+
+    /// Every reason code answers `is_retryable` from its own class, and the
+    /// answer a whole transaction gives is the conjunction of its members'.
+    #[test]
+    fn a_reasons_retryability_follows_its_code(
+        code in cancellation_codes(),
+        other in cancellation_codes(),
+    ) {
+        let expected = matches!(
+            code,
+            CancellationReasonCode::TransactionConflict | CancellationReasonCode::ThrottlingError
+        );
+        prop_assert_eq!(code.is_retryable(), expected, "code: {}", code);
+
+        let pair = vec![
+            CancellationReason::new(code, "first"),
+            CancellationReason::new(other, "second"),
+        ];
+        let cancelled = Error::TransactionCanceled {
+            message: "cancelled".to_string(),
+            reasons: pair,
+        };
+        prop_assert_eq!(
+            cancelled.is_retryable(),
+            code.is_retryable() && other.is_retryable(),
+            "codes: {}, {}",
+            code,
+            other
+        );
     }
 
     /// The code a caller matches on depends on the variant and nothing else:

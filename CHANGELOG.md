@@ -19,6 +19,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `Error::is_retryable` now follows the error code the failure reports instead
+  of a blanket `false`. An `Internal` failure — `InternalServerError`, the 5xx
+  class a retry layer and the AWS SDK retry by default — answered "terminal", so
+  a test could assert both "we do not retry 5xx blindly" and "5xx is retried"
+  against the same mock. `CancellationReasonCode::ThrottlingError`, documented
+  as "the request exceeded the table's throughput", was non-retryable for the
+  same reason and now is, both on its own through the new
+  `CancellationReasonCode::is_retryable` and inside a cancelled transaction that
+  reports nothing but throttled members. A cancelled transaction still needs
+  every member to be retryable: one rejected condition, malformed member or
+  exhausted item collection keeps the whole answer terminal, and an empty reason
+  list stays terminal too. `code` and `is_retryable` now read one classification
+  table, so a code that names a retryable class and a verdict that calls it
+  terminal can no longer be written side by side.
 - A `ConditionalCheckFailedException` now renders the table it was raised for:
   every variant formatted as its bare `message`, so a logged rejection read
   "condition `attribute_not_exists(pk)` evaluated to false" with no hint which
