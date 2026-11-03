@@ -4,7 +4,12 @@
 //! `missing < :v`, `contains(missing, :v)` and `size(missing) > :n` are all
 //! false. `attribute_not_exists` is the way to test for absence, which is why
 //! the write path passes `None` for a missing item.
+//!
+//! Reads borrow: a condition only compares, so the value an operand names stays
+//! in the item (or in the value map) and no attribute value is copied. Paths
+//! without an `#alias` are used as they are, without being rebuilt either.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -28,13 +33,23 @@ pub(crate) struct Ctx<'a> {
 
 impl Ctx<'_> {
     /// Replace `#alias` segments with the attribute names they stand for.
-    pub(crate) fn resolve(&self, path: &Path) -> Result<Path> {
+    ///
+    /// A path that names no alias is handed back borrowed, so the common case
+    /// allocates nothing; only a path with an alias is rebuilt.
+    pub(crate) fn resolve<'p>(&self, path: &'p Path) -> Result<Cow<'p, Path>> {
+        let aliased = path
+            .iter()
+            .any(|segment| matches!(segment, Segment::Name(name) if name.starts_with('#')));
+        if !aliased {
+            return Ok(Cow::Borrowed(path));
+        }
         let mut resolved = Path::with_capacity(path.len());
         for segment in path {
             match segment {
                 Segment::Name(name) => match name.strip_prefix('#') {
                     Some(alias) => {
-                        let replacement = self.names.get(&format!("#{alias}")).ok_or_else(|| {
+                        // The map is keyed by the whole `#alias` segment.
+                        let replacement = self.names.get(name).ok_or_else(|| {
                             Error::validation(format!(
                                 "Invalid expression: An expression attribute name used in the document path is not defined; attribute name: #{alias}"
                             ))
@@ -46,41 +61,46 @@ impl Ctx<'_> {
                 Segment::Index(index) => resolved.push(Segment::Index(*index)),
             }
         }
-        Ok(resolved)
+        Ok(Cow::Owned(resolved))
     }
 
     /// Read a path from an item, resolving aliases.
-    pub(crate) fn path_value(
-        &self,
+    ///
+    /// The value is borrowed from the item, not copied: a membership, prefix or
+    /// comparison test only reads it, and an attribute may hold a large payload.
+    pub(crate) fn path_value<'i>(
+        &'i self,
         path: &Path,
-        item: Option<&Item>,
-    ) -> Result<Option<AttributeValue>> {
+        item: Option<&'i Item>,
+    ) -> Result<Option<&'i AttributeValue>> {
         let resolved = self.resolve(path)?;
-        Ok(item.and_then(|item| get_path(item, &resolved)).cloned())
+        Ok(item.and_then(|item| get_path(item, &resolved)))
     }
 
     /// Read an operand: a path, a placeholder or `size(path)`.
-    pub(crate) fn operand_value(
-        &self,
+    ///
+    /// A path and a placeholder borrow the stored value; `size()` is the only
+    /// operand that builds a new one, because it reports a derived number.
+    pub(crate) fn operand_value<'i>(
+        &'i self,
         operand: &Operand,
-        item: Option<&Item>,
-    ) -> Result<Option<AttributeValue>> {
+        item: Option<&'i Item>,
+    ) -> Result<Option<Cow<'i, AttributeValue>>> {
         match operand {
-            Operand::Path(path) => self.path_value(path, item),
+            Operand::Path(path) => Ok(self.path_value(path, item)?.map(Cow::Borrowed)),
             Operand::Value(placeholder) => {
-                self.values
-                    .get(&format!(":{placeholder}"))
-                    .cloned()
-                    .map(Some)
-                    .ok_or_else(|| {
-                        Error::validation(format!(
-                            "Invalid expression: An expression attribute value used in expression is not defined; attribute value: :{placeholder}"
-                        ))
-                    })
+                match self.values.get(&format!(":{placeholder}")) {
+                    Some(value) => Ok(Some(Cow::Borrowed(value))),
+                    None => Err(Error::validation(format!(
+                        "Invalid expression: An expression attribute value used in expression is not defined; attribute value: :{placeholder}"
+                    ))),
+                }
             }
             Operand::Size(path) => {
                 let value = self.path_value(path, item)?;
-                Ok(value.map(|value| AttributeValue::N(size_of(&value).to_string())))
+                Ok(value.map(|value| {
+                    Cow::Owned(AttributeValue::N(size_of(value).to_string()))
+                }))
             }
         }
     }
@@ -111,27 +131,27 @@ pub(crate) fn evaluate(condition: &Condition, item: Option<&Item>, ctx: &Ctx<'_>
             let expected = ctx.operand_value(expected, item)?.ok_or_else(|| {
                 Error::validation("Invalid expression: attribute_type requires a type placeholder")
             })?;
-            let AttributeValue::S(expected) = expected else {
+            let AttributeValue::S(expected) = expected.as_ref() else {
                 return Err(Error::validation(
                     "Invalid ConditionExpression: The attribute type in attribute_type must be a string",
                 ));
             };
             Ok(ctx
                 .path_value(path, item)?
-                .is_some_and(|value| type_name(&value) == expected))
+                .is_some_and(|value| type_name(value) == expected.as_str()))
         }
         Condition::BeginsWith(path, prefix) => match (
             ctx.path_value(path, item)?,
             ctx.operand_value(prefix, item)?,
         ) {
-            (Some(value), Some(prefix)) => Ok(begins_with(&value, &prefix)),
+            (Some(value), Some(prefix)) => Ok(begins_with(value, &prefix)),
             _ => Ok(false),
         },
         Condition::Contains(path, needle) => match (
             ctx.path_value(path, item)?,
             ctx.operand_value(needle, item)?,
         ) {
-            (Some(value), Some(needle)) => Ok(contains(&value, &needle)),
+            (Some(value), Some(needle)) => Ok(contains(value, &needle)),
             _ => Ok(false),
         },
         Condition::Compare(left, operator, right) => {
@@ -363,5 +383,82 @@ mod tests {
             &[("one", n("1")), ("three", n("3"))]
         )
         .unwrap());
+    }
+
+    #[test]
+    fn path_resolution_borrows_until_an_alias_forces_a_copy() {
+        let plain: Path = vec![
+            Segment::Name("profile".into()),
+            Segment::Name("city".into()),
+        ];
+        let ctx = Ctx {
+            names: &NameMap::new(),
+            values: &ValueMap::new(),
+        };
+        // No alias: the parsed path is used as it is, without an allocation.
+        let resolved = ctx.resolve(&plain).unwrap();
+        assert!(matches!(&resolved, Cow::Borrowed(_)));
+        assert!(std::ptr::eq(resolved.as_ref(), &raw const plain));
+
+        // One alias anywhere in the path switches to a rewritten, owned path.
+        let names = NameMap::from([("#p".to_string(), "profile".to_string())]);
+        let ctx = Ctx {
+            names: &names,
+            values: &ValueMap::new(),
+        };
+        let aliased: Path = vec![Segment::Name("#p".into()), Segment::Name("city".into())];
+        let expected: Path = vec![
+            Segment::Name("profile".into()),
+            Segment::Name("city".into()),
+        ];
+        let resolved = ctx.resolve(&aliased).unwrap();
+        assert!(matches!(&resolved, Cow::Owned(_)));
+        assert_eq!(resolved.as_ref(), &expected);
+
+        // The last segment counts as much as the first.
+        let nested: Path = vec![Segment::Name("a".into()), Segment::Name("#p".into())];
+        let expected: Path = vec![Segment::Name("a".into()), Segment::Name("profile".into())];
+        assert_eq!(ctx.resolve(&nested).unwrap().as_ref(), &expected);
+
+        // An undefined alias stays an error instead of being read literally.
+        let undefined: Path = vec![Segment::Name("#gone".into())];
+        assert!(ctx.resolve(&undefined).is_err());
+    }
+
+    #[test]
+    fn operands_borrow_the_stored_value_instead_of_copying_it() {
+        // 400 KB is the attribute size limit: a membership or prefix test on
+        // such a value must see the item's own allocation, not a copy of it.
+        let payload = "x".repeat(400 * 1024);
+        let mut item = Item::new();
+        item.insert("payload".into(), s(&payload));
+        let ctx = Ctx {
+            names: &NameMap::new(),
+            values: &ValueMap::new(),
+        };
+        let stored = item.get("payload").unwrap();
+
+        let path: Path = vec![Segment::Name("payload".into())];
+        let read = ctx.path_value(&path, Some(&item)).unwrap().unwrap();
+        assert!(std::ptr::eq(read, stored));
+
+        let operand = Operand::Path(path.clone());
+        let read = ctx.operand_value(&operand, Some(&item)).unwrap().unwrap();
+        assert!(matches!(&read, Cow::Borrowed(_)));
+        assert!(std::ptr::eq(read.as_ref(), stored));
+
+        // `size()` is the one operand that has to build a number.
+        let operand = Operand::Size(path);
+        let read = ctx.operand_value(&operand, Some(&item)).unwrap().unwrap();
+        assert!(matches!(&read, Cow::Owned(_)));
+        assert_eq!(read.as_ref(), &AttributeValue::N((400 * 1024).to_string()));
+
+        // A path that names nothing reads as absent, still without a copy.
+        let absent: Path = vec![Segment::Name("missing".into())];
+        assert!(ctx.path_value(&absent, Some(&item)).unwrap().is_none());
+        assert!(ctx
+            .operand_value(&Operand::Path(absent), None)
+            .unwrap()
+            .is_none());
     }
 }

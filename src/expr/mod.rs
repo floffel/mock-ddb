@@ -57,6 +57,7 @@ mod parse;
 mod path;
 mod update;
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -147,6 +148,11 @@ impl ConditionExpression {
     /// ```
     /// Evaluate against an item. `None` means "the item does not exist", which
     /// is what makes `attribute_not_exists(pk)` true on a create.
+    ///
+    /// Reads borrow: a path reads its value out of `item`, a `:placeholder`
+    /// reads its value out of `values`, and neither is copied — a 400 KB
+    /// attribute stays where it is. Only `size()` builds a number, and only
+    /// an `#alias` path is rebuilt with the alias replaced.
     ///
     /// # Errors
     ///
@@ -442,7 +448,7 @@ impl ProjectionExpression {
         };
         self.paths
             .iter()
-            .map(|path| context.resolve(path))
+            .map(|path| context.resolve(path).map(Cow::into_owned))
             .collect()
     }
 }
