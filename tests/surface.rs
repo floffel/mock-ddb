@@ -732,3 +732,51 @@ async fn error_codes_and_retry_classification() {
         "ItemCollectionSizeLimitExceeded"
     );
 }
+
+#[tokio::test]
+async fn error_text_and_accessors_name_the_table_or_resource() {
+    let mock = users();
+    mock.put_item(PutItemRequest::new("users", user("u#1", "a@example.com")))
+        .await
+        .unwrap();
+
+    // The rendered error used to be the bare reason, so the table the write
+    // was rejected for appeared nowhere in the text a log would show.
+    let rejected = mock
+        .put_item(
+            PutItemRequest::new("users", user("u#1", "b@example.com"))
+                .with_condition("attribute_not_exists(pk)"),
+        )
+        .await
+        .unwrap_err();
+    let rendered = rejected.to_string();
+    assert!(rendered.contains("table users"), "rendered: {rendered}");
+    assert!(
+        rendered.contains("attribute_not_exists(pk)"),
+        "rendered: {rendered}"
+    );
+    assert_eq!(rejected.table(), Some("users"));
+    assert_eq!(
+        rejected.resource(),
+        None,
+        "a rejected write names a table, not a resource"
+    );
+
+    // One table away from the existing one, the miss carries the looked-up
+    // resource as a value as well as in the text.
+    let missing = mock
+        .get_item(GetItemRequest::new("userz", user_key("u#1")))
+        .await
+        .unwrap_err();
+    assert_eq!(missing.resource(), Some("table `userz`"));
+    assert!(missing.to_string().contains("userz"));
+    assert_eq!(
+        missing.table(),
+        None,
+        "a missing table is not a rejected condition"
+    );
+
+    // A failure that carries neither identifier answers `None` from both.
+    assert_eq!(Error::validation("bad").resource(), None);
+    assert_eq!(Error::validation("bad").table(), None);
+}

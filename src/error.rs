@@ -35,6 +35,10 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[non_exhaustive]
 pub enum Error {
     /// The table (or index) named in the request does not exist.
+    ///
+    /// The rendered message already names the table or stream, the way the
+    /// service words it; [`Error::resource`] hands the same identifier back as
+    /// a value, so a test can assert on it without parsing the text.
     #[error("{message}")]
     ResourceNotFound {
         /// The resource that was looked up, for example the `users` table.
@@ -60,7 +64,7 @@ pub enum Error {
 
     /// A `ConditionExpression` (including every condition in a transaction)
     /// evaluated to false, so the write was rejected.
-    #[error("{message}")]
+    #[error("The conditional request failed for table {table}: {message}")]
     ConditionalCheckFailed {
         /// The table the rejected write targeted.
         table: String,
@@ -188,6 +192,47 @@ impl Error {
         }
     }
 
+    /// The resource a [`Error::ResourceNotFound`] was raised for, for example
+    /// ``table `users` `` or ``stream `arn:aws:dynamodb:...` ``, or `None` for
+    /// every other failure.
+    #[must_use]
+    ///
+    /// ```
+    /// use mock_ddb::Error;
+    ///
+    /// let error = Error::table_not_found("users");
+    /// assert_eq!(error.resource(), Some("table `users`"));
+    /// assert_eq!(Error::validation("bad").resource(), None);
+    /// ```
+    pub fn resource(&self) -> Option<&str> {
+        match self {
+            Self::ResourceNotFound { resource, .. } => Some(resource),
+            _ => None,
+        }
+    }
+
+    /// The table a [`Error::ConditionalCheckFailed`] was raised for, or `None`
+    /// for every other failure.
+    #[must_use]
+    ///
+    /// ```
+    /// use mock_ddb::Error;
+    ///
+    /// let error = Error::ConditionalCheckFailed {
+    ///     table: "users".to_string(),
+    ///     message: "condition `v = :two` evaluated to false".to_string(),
+    ///     item: None,
+    /// };
+    /// assert_eq!(error.table(), Some("users"));
+    /// assert_eq!(Error::table_not_found("users").table(), None);
+    /// ```
+    pub fn table(&self) -> Option<&str> {
+        match self {
+            Self::ConditionalCheckFailed { table, .. } => Some(table),
+            _ => None,
+        }
+    }
+
     /// Build a `ValidationException`.
     ///
     /// ```
@@ -235,7 +280,7 @@ impl Error {
     pub(crate) fn conditional_failed(table: &str, expression: &str, item: Option<Item>) -> Self {
         Self::ConditionalCheckFailed {
             table: table.to_string(),
-            message: format!("The conditional request failed (condition: `{expression}`)"),
+            message: format!("condition `{expression}` evaluated to false"),
             item,
         }
     }
