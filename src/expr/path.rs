@@ -271,29 +271,121 @@ fn invalid_nested_path(path: &[Segment]) -> Error {
     ))
 }
 
+/// The most bytes [`render`] emits before it cuts the path short.
+///
+/// Attribute names are caller supplied and a path may name an attribute whose
+/// name the caller chose to make long, so the text a rejected request carries
+/// back must be bounded: the rest of the message is fixed, only the path could
+/// grow without limit.
+const MAX_RENDERED_PATH_BYTES: usize = 256;
+
+/// Marks a rendered path the cap cut short.
+const TRUNCATION_MARK: char = '…';
+
 /// Render a path for an error message.
+///
+/// The text identifies exactly one path. A `.` separates segments by their
+/// position in the path rather than by whether something has been rendered
+/// already, so a leading name that is empty keeps its separator and does not
+/// collapse into its neighbour; a name that is empty or carries `.`, `[`, `]`,
+/// a quote, a backslash or a control character is quoted and escaped
+/// (`"a.b"`), so it cannot be read as nesting. The rendering stops after
+/// [`MAX_RENDERED_PATH_BYTES`] bytes and ends with [`TRUNCATION_MARK`], which
+/// is what a caller sees when the name itself was too long to report.
 pub(crate) fn render(path: &[Segment]) -> String {
-    let mut rendered = String::new();
-    for segment in path {
+    let mut rendered = Rendered::default();
+    for (position, segment) in path.iter().enumerate() {
         match segment {
             Segment::Name(name) => {
-                if !rendered.is_empty() {
+                if position > 0 {
                     rendered.push('.');
                 }
-                rendered.push_str(name);
+                rendered.push_name(name);
             }
             Segment::Index(index) => {
                 rendered.push('[');
-                rendered.push_str(&index.to_string());
+                for digit in index.to_string().chars() {
+                    rendered.push(digit);
+                }
                 rendered.push(']');
             }
         }
+        if rendered.cut {
+            break;
+        }
     }
-    rendered
+    rendered.finish()
+}
+
+/// Whether a name has to be quoted to be read back unambiguously.
+///
+/// A name needs quoting when it is empty, when it carries one of the
+/// separators [`render`] uses itself, or when it carries a character that
+/// would end the quoting or break the message across lines.
+fn needs_quoting(name: &str) -> bool {
+    name.is_empty()
+        || name.chars().any(|character| {
+            matches!(character, '.' | '[' | ']' | '"' | '\\') || character.is_control()
+        })
+}
+
+/// A bounded buffer for [`render`]: once it is full it takes no more text and
+/// records that the path was cut short.
+#[derive(Default)]
+struct Rendered {
+    /// The text rendered so far.
+    text: String,
+    /// Whether text was left out; [`Rendered::finish`] appends the mark.
+    cut: bool,
+}
+
+impl Rendered {
+    /// Append one character unless the cap is reached.
+    ///
+    /// Room for the mark is kept free from the start, so the rendering is at
+    /// most [`MAX_RENDERED_PATH_BYTES`] bytes whether or not it was cut.
+    fn push(&mut self, character: char) {
+        if self.cut {
+            return;
+        }
+        let room = MAX_RENDERED_PATH_BYTES - TRUNCATION_MARK.len_utf8();
+        if self.text.len() + character.len_utf8() > room {
+            self.cut = true;
+            return;
+        }
+        self.text.push(character);
+    }
+
+    /// Append a name, quoted and escaped when it would otherwise be ambiguous.
+    fn push_name(&mut self, name: &str) {
+        if !needs_quoting(name) {
+            for character in name.chars() {
+                self.push(character);
+            }
+            return;
+        }
+        self.push('"');
+        for character in name.chars() {
+            for escaped in character.escape_default() {
+                self.push(escaped);
+            }
+        }
+        self.push('"');
+    }
+
+    /// The rendering, with the mark appended when text was left out.
+    fn finish(mut self) -> String {
+        if self.cut {
+            self.text.push(TRUNCATION_MARK);
+        }
+        self.text
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
     use crate::{n, s};
 
@@ -759,14 +851,130 @@ mod tests {
 
     #[test]
     fn renders_paths_for_errors() {
+        assert_eq!(render(&[name("a"), name("b"), index(2)]), "a.b[2]");
+        // The separator follows the segment position, after a list index too.
+        assert_eq!(render(&[name("a"), index(0), name("b")]), "a[0].b");
+        assert_eq!(render(&[index(3)]), "[3]");
+        assert_eq!(render(&[]), "");
+    }
+
+    #[test]
+    fn rendering_keeps_a_leading_empty_name_apart_from_its_neighbour() {
+        // An empty first name is quoted, so the path does not collapse into
+        // the top-level attribute `b` — the old rendering produced exactly
+        // that same text for both.
+        assert_eq!(render(&[name(""), name("b")]), "\"\".b");
+        assert_eq!(render(&[name("b")]), "b");
+        assert_ne!(render(&[name(""), name("b")]), render(&[name("b")]));
+        // Only a path with no segments renders as nothing at all.
+        assert_eq!(render(&[name("")]), "\"\"");
+    }
+
+    #[test]
+    fn rendering_quotes_names_that_would_read_as_nesting() {
+        // One attribute called `a.b` against the nested path a → b.
+        assert_eq!(render(&[name("a.b")]), "\"a.b\"");
+        assert_eq!(render(&[name("a"), name("b")]), "a.b");
+        // The same for the brackets a list index uses.
+        assert_eq!(render(&[name("a[0]")]), "\"a[0]\"");
+        assert_eq!(render(&[name("a"), index(0)]), "a[0]");
+        // The quoting characters themselves are escaped, so quoting cannot be
+        // closed early from inside a name.
+        assert_eq!(render(&[name("say \"hi\"")]), "\"say \\\"hi\\\"\"");
+        assert_eq!(render(&[name("back\\slash")]), "\"back\\\\slash\"");
+    }
+
+    #[test]
+    fn rendering_escapes_control_characters() {
+        assert_eq!(render(&[name("line\nbreak")]), "\"line\\nbreak\"");
+        assert_eq!(render(&[name("null\0byte")]), "\"null\\u{0}byte\"");
+        assert!(!render(&[name("line\nbreak")]).contains('\n'));
+        // Printable non-ASCII names stay readable rather than being escaped.
+        assert_eq!(render(&[name("Grüße")]), "Grüße");
+    }
+
+    #[test]
+    fn rendering_stops_at_the_length_cap() {
+        let room = MAX_RENDERED_PATH_BYTES - TRUNCATION_MARK.len_utf8();
+
+        // Just inside: a name that fills the usable room is rendered whole.
+        let inside = "a".repeat(room);
+        assert_eq!(render(&[name(&inside)]), inside);
+
+        // Just outside: one more byte and the rendering is cut and marked, and
+        // it never grows past the cap.
+        let outside = "a".repeat(room + 1);
+        let rendered = render(&[name(&outside)]);
+        assert_eq!(rendered.len(), MAX_RENDERED_PATH_BYTES);
         assert_eq!(
-            render(&[
-                Segment::Name("a".into()),
-                Segment::Name("b".into()),
-                Segment::Index(2)
-            ]),
-            "a.b[2]"
+            rendered.strip_suffix(TRUNCATION_MARK),
+            Some(inside.as_str())
         );
+
+        // A name far past the cap costs a bounded rendering.
+        assert_eq!(
+            render(&[name(&"x".repeat(10_000))]).len(),
+            MAX_RENDERED_PATH_BYTES
+        );
+        // A multi-byte character that no longer fits is dropped whole rather
+        // than split, and the rendering still ends exactly at the cap.
+        let unicode = format!("{}é", "a".repeat(room));
+        let rendered = render(&[name(&unicode)]);
+        assert_eq!(rendered, format!("{}{TRUNCATION_MARK}", "a".repeat(room)));
+        assert_eq!(rendered.len(), MAX_RENDERED_PATH_BYTES);
+    }
+
+    #[test]
+    fn rendering_a_long_path_stays_within_the_cap() {
+        let deep: Vec<Segment> = (0..200)
+            .map(|position| name(&format!("n{position}")))
+            .collect();
+        let rendered = render(&deep);
+        assert!(rendered.len() <= MAX_RENDERED_PATH_BYTES);
+        assert!(rendered.ends_with(TRUNCATION_MARK));
+        // A path that fits is never marked.
+        assert!(!render(&[name("a"), index(1)]).ends_with(TRUNCATION_MARK));
+    }
+
+    /// Names that mix the separators, the quoting characters and control
+    /// characters with plain text, short enough that the cap never applies.
+    fn short_segment() -> impl Strategy<Value = Segment> {
+        let character = prop_oneof![
+            Just('a'),
+            Just('b'),
+            Just('.'),
+            Just('['),
+            Just(']'),
+            Just('"'),
+            Just('\\'),
+            Just('\n'),
+            Just(' '),
+            Just('0'),
+        ];
+        prop_oneof![
+            prop::collection::vec(character, 0..4)
+                .prop_map(|text| Segment::Name(text.into_iter().collect())),
+            (0_usize..1000).prop_map(Segment::Index),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(96))]
+
+        /// Distinct short paths render to distinct text: the path in a message
+        /// identifies one document path and cannot be mistaken for another.
+        #[test]
+        fn distinct_paths_render_distinctly(
+            left in prop::collection::vec(short_segment(), 0..5),
+            right in prop::collection::vec(short_segment(), 0..5),
+        ) {
+            prop_assume!(left != right);
+            let rendered_left = render(&left);
+            let rendered_right = render(&right);
+            prop_assume!(!rendered_left.ends_with(TRUNCATION_MARK));
+            prop_assume!(!rendered_right.ends_with(TRUNCATION_MARK));
+            prop_assert_ne!(rendered_left, rendered_right);
+        }
     }
 
     #[test]

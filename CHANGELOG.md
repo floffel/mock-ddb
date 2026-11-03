@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The document path in an update error message is now unambiguous and bounded.
+  `render` separated segments only while the rendered text was non-empty, so a
+  path whose first name was empty swallowed the separator and read exactly like
+  the top-level attribute `b`; an attribute actually named `a.b` read exactly
+  like the nested path `a` → `b`, and a caller-supplied name travelled into the
+  message verbatim with no length limit and no escaping. Segments are now
+  separated by position, a name that is empty or carries `.`, `[`, `]`, a quote,
+  a backslash or a control character is quoted and escaped (`"a.b"`), and the
+  rendering stops after 256 bytes with an ellipsis.
 - An undefined `#alias` or `:value` placeholder is now reported even when
   `AND`/`OR` short-circuiting never evaluates the branch that names it.
   `ConditionExpression::evaluate` checks both maps against the whole expression
