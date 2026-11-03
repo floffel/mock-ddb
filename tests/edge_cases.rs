@@ -3,10 +3,10 @@
 mod common;
 
 use mock_ddb::{
-    item, n, s, values, AttributeValue, Blob, CancellationReason, CancellationReasonCode,
+    item, n, s, values, AttributeValue, Blob, CancellationReason, CancellationReasonCode, Clock,
     ConditionExpression, CreateTableRequest, DeleteItemRequest, Error, GetItemRequest, KeySchema,
-    KeyType, ListTablesRequest, MockDdb, PutItemRequest, QueryRequest, ReturnValues, ScanRequest,
-    Select, UpdateItemRequest,
+    KeyType, ListTablesRequest, MockClock, MockDdb, PutItemRequest, QueryRequest, ReturnValues,
+    ScanRequest, Select, UpdateItemRequest,
 };
 
 fn numbers() -> MockDdb {
@@ -742,4 +742,22 @@ fn cancellation_reason_edges_between_variants() {
     }
     .cancellation_reasons()
     .is_empty());
+}
+
+/// The clock surface is total over its input range: an instant past the last
+/// representable one clamps instead of aborting the test binary with an
+/// arithmetic-overflow panic.
+#[test]
+fn clocks_clamp_instead_of_panicking_at_the_top_of_the_range() {
+    let clock = MockClock::at_epoch_seconds(u64::MAX);
+    let last = clock.now();
+    clock.advance(std::time::Duration::MAX);
+    assert_eq!(clock.now(), last);
+
+    let from_epoch = MockClock::new(std::time::UNIX_EPOCH);
+    from_epoch.advance(std::time::Duration::MAX);
+    assert!(from_epoch.epoch_seconds() > 0);
+
+    clock.set(std::time::UNIX_EPOCH);
+    assert_eq!(clock.epoch_seconds(), 0);
 }
