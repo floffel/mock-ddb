@@ -102,21 +102,31 @@ impl Ctx<'_> {
                     ))),
                 }
             }
-            Operand::Size(path) => {
-                let value = self.path_value(path, item)?;
-                Ok(value.map(|value| {
-                    Cow::Owned(AttributeValue::N(size_of(value).to_string()))
-                }))
-            }
+            // `size()` of a missing attribute stays absent — the condition is
+            // false, not an error — but of a value the function cannot measure
+            // it is the service's `ValidationException`.
+            Operand::Size(path) => match self.path_value(path, item)? {
+                None => Ok(None),
+                Some(value) => Ok(Some(Cow::Owned(AttributeValue::N(
+                    size_of(value)?.to_string(),
+                )))),
+            },
         }
     }
 }
 
 /// The `size()` of a value: bytes for strings and binary, element count for
-/// sets, lists and maps. Scalars without a length — `N`, `BOOL` and `NULL` —
-/// have size 0, so the function is total over every [`AttributeValue`] shape.
-fn size_of(value: &AttributeValue) -> u64 {
-    match value {
+/// sets, lists and maps.
+///
+/// The two scalars without a length — `BOOL` and `NULL` — have size 0. A number
+/// does not: the service has no `size()` for `N` and rejects the expression, so
+/// a `size()` that answered 0 for it would let a condition guarding a write
+/// pass for an operand type the service refuses to measure. Any other variant
+/// is rejected the same way rather than measured as 0, which is what keeps the
+/// function closed over [`AttributeValue`]: the enum is `#[non_exhaustive]`, so
+/// a shape a future SDK release adds must not silently acquire a length.
+fn size_of(value: &AttributeValue) -> Result<u64> {
+    Ok(match value {
         AttributeValue::S(text) => u64::try_from(text.len()).unwrap_or(u64::MAX),
         AttributeValue::B(blob) => u64::try_from(blob.as_ref().len()).unwrap_or(u64::MAX),
         AttributeValue::Ss(members) | AttributeValue::Ns(members) => {
@@ -125,8 +135,11 @@ fn size_of(value: &AttributeValue) -> u64 {
         AttributeValue::Bs(members) => u64::try_from(members.len()).unwrap_or(u64::MAX),
         AttributeValue::L(elements) => u64::try_from(elements.len()).unwrap_or(u64::MAX),
         AttributeValue::M(entries) => u64::try_from(entries.len()).unwrap_or(u64::MAX),
-        _ => 0,
-    }
+        AttributeValue::Bool(_) | AttributeValue::Null(_) => 0,
+        // `N` is the known variant without a length, and a variant a future SDK
+        // release adds must not acquire one: both are the service's rejection.
+        _ => return Err(operand_type_error("size", value)),
+    })
 }
 
 /// Evaluate a condition against an item.
@@ -381,6 +394,70 @@ mod tests {
         assert!(!evaluate_str("attribute_type(count, :t)", &[("t", s("S"))]).unwrap());
     }
 
+    /// `size()` of a number is the service's `ValidationException`, not 0.
+    ///
+    /// Answering a number with the same size as an empty value is a fail-open
+    /// default: `size(count) = :zero`, `size(count) < :five` and the documented
+    /// `size(missing) > :n` inverse all become true for an attribute the service
+    /// refuses to measure, so a condition guarding a write passes where the
+    /// service would reject the expression.
+    #[test]
+    fn size_of_a_number_is_a_validation_error() {
+        // just inside: the measurable shapes around a number — a one-byte
+        // string, a two-member set, a one-element binary set, the two scalars
+        // that do have size 0, and an absent path that stays absent.
+        assert!(evaluate_str("size(pk) = :one", &[("one", n("1"))]).unwrap());
+        assert!(evaluate_str("size(tags) = :two", &[("two", n("2"))]).unwrap());
+        assert!(evaluate_str("size(blobs) = :one", &[("one", n("1"))]).unwrap());
+        assert!(evaluate_str("size(flag) = :zero", &[("zero", n("0"))]).unwrap());
+        assert!(!evaluate_str("size(absent) > :zero", &[("zero", n("0"))]).unwrap());
+
+        // just outside: `count` holds 3, and every comparison against it — on
+        // either side of the operator, and on neither side of the truth table —
+        // is rejected rather than answered.
+        for expression in [
+            "size(count) = :zero",
+            "size(count) <> :zero",
+            "size(count) < :five",
+            "size(count) > :two",
+            ":two < size(count)",
+            "size(count) BETWEEN :zero AND :five",
+            "size(count) IN (:zero, :five)",
+            "size(count) = size(count)",
+        ] {
+            let values = [
+                ("zero", n("0")),
+                ("one", n("1")),
+                ("two", n("2")),
+                ("five", n("5")),
+            ];
+            let error =
+                evaluate_str(expression, &values).expect_err("size() of a number is rejected");
+            assert_eq!(error.code(), "ValidationException", "{expression}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Incorrect operand type for operator or function"),
+                "{expression}: {error}"
+            );
+            assert!(error.to_string().contains("size"), "{expression}: {error}");
+        }
+
+        // A number nested in a list is the list's element, not its size: only
+        // the shape at the path is measured, so `list` still has a size.
+        let mut item = item();
+        item.insert("list".into(), AttributeValue::L(vec![s("a"), n("7")]));
+        let condition = super::super::parse::parse_condition("size(list) = :two").unwrap();
+        let values = ValueMap::from([(":two".to_string(), n("2"))]);
+        let ctx = Ctx {
+            names: &NameMap::new(),
+            values: &values,
+        };
+        assert!(evaluate(&condition, Some(&item), &ctx).unwrap());
+        let condition = super::super::parse::parse_condition("size(list[1]) = :one").unwrap();
+        assert!(evaluate(&condition, Some(&item), &ctx).is_err());
+    }
+
     #[test]
     fn size_and_type_functions_cover_binary_and_missing_operands() {
         assert!(evaluate_str("size(blob) = :two", &[("two", n("2"))]).unwrap());
@@ -586,10 +663,11 @@ mod tests {
         assert!(!evaluate_str("contains(tags, :empty)", &[("empty", s(""))]).unwrap());
         assert!(evaluate_str("begins_with(tags, :empty)", &[("empty", s(""))]).is_err());
 
-        // A number has no length, so `size()` reports 0 for it instead of
-        // failing or inventing a count.
-        assert!(evaluate_str("size(count) = :zero", &[("zero", n("0"))]).unwrap());
-        assert!(!evaluate_str("size(count) = :one", &[("one", n("1"))]).unwrap());
+        // `count` holds a number: the service has no `size()` for `N`, so this
+        // is the `ValidationException` in `size_of_a_number_is_a_validation_error`
+        // rather than a 0 that would satisfy `size(count) = :zero`.
+        assert!(evaluate_str("size(count) = :zero", &[("zero", n("0"))]).is_err());
+        assert!(evaluate_str("size(count) = :one", &[("one", n("1"))]).is_err());
 
         let mut item = item();
         item.insert("nums".into(), AttributeValue::Ns(vec!["1".into()]));
@@ -821,24 +899,29 @@ mod tests {
             }
         }
 
-        /// `size()` has a number for every value shape — bytes for strings and
-        /// binary, element count for collections, zero for the rest — and never
-        /// panics on one it was not written for.
+        /// `size()` has a number for every measurable value shape — bytes for
+        /// strings and binary, element count for collections, zero for `BOOL`
+        /// and `NULL` — and rejects a number rather than measuring it as 0.
         #[test]
         fn size_of_counts_bytes_or_elements(value in attribute()) {
             let expected = match &value {
-                AttributeValue::S(text) => text.len(),
-                AttributeValue::B(blob) => blob.as_ref().len(),
-                AttributeValue::Ss(members) | AttributeValue::Ns(members) => members.len(),
-                AttributeValue::Bs(members) => members.len(),
-                AttributeValue::L(elements) => elements.len(),
-                AttributeValue::M(entries) => entries.len(),
-                _ => 0,
+                AttributeValue::S(text) => Some(text.len()),
+                AttributeValue::B(blob) => Some(blob.as_ref().len()),
+                AttributeValue::Ss(members) | AttributeValue::Ns(members) => Some(members.len()),
+                AttributeValue::Bs(members) => Some(members.len()),
+                AttributeValue::L(elements) => Some(elements.len()),
+                AttributeValue::M(entries) => Some(entries.len()),
+                AttributeValue::Bool(_) | AttributeValue::Null(_) => Some(0),
+                // `N` — and any shape this build does not know — has no size.
+                _ => None,
             };
-            prop_assert_eq!(
-                size_of(&value),
-                u64::try_from(expected).ok().unwrap_or(u64::MAX)
-            );
+            match expected {
+                Some(expected) => {
+                    let expected = u64::try_from(expected).ok().unwrap_or(u64::MAX);
+                    prop_assert_eq!(size_of(&value)?, expected);
+                }
+                None => prop_assert!(size_of(&value).is_err()),
+            }
         }
 
         /// The empty needle is a substring and a prefix of every string and a

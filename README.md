@@ -191,10 +191,10 @@ that changes what a caller must do is called out.
 5. **`Query` without a key condition is allowed.** The service requires one.
    The mock returns every item in key order, which is what tests that want to
    inspect a whole table actually mean.
-6. **A wrongly typed operand of `begins_with`/`contains` is rejected.** A
+6. **A wrongly typed operand of `begins_with`/`contains`/`size` is rejected.** A
    number where a string prefix belongs, a string prefix on a binary, a set
-   needle of a type the set cannot hold: the service raises
-   `ValidationException`
+   needle of a type the set cannot hold, `size()` of a number: the service
+   raises `ValidationException`
    ("Incorrect operand type for operator or function") and so does the mock.
    Cross-type comparisons that the service answers with false — `count = :s`,
    `size(NULL) > :n`, an expression on a missing attribute — still evaluate to
