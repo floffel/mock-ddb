@@ -154,12 +154,32 @@ impl ConditionExpression {
     /// attribute stays where it is. Only `size()` builds a number, and only
     /// an `#alias` path is rebuilt with the alias replaced.
     ///
+    /// Both maps are checked against the whole expression before anything is
+    /// read, so a placeholder that is undefined anywhere is rejected even where
+    /// `AND`/`OR` short-circuiting means the branch naming it is never
+    /// evaluated. The service validates the maps the same way, statically, on
+    /// every call.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Validation`](crate::Error::Validation) for an
-    /// undefined `#name` or `:value` placeholder, for an ordered comparison
-    /// between values of different types, and for `size()` of an operand with
-    /// no length — a number, which the service refuses to measure.
+    /// undefined `#name` or `:value` placeholder — in any branch, evaluated or
+    /// not — for an ordered comparison between values of different types, and
+    /// for `size()` of an operand with no length — a number, which the service
+    /// refuses to measure.
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use mock_ddb::{ConditionExpression, Item};
+    ///
+    /// // `attribute_not_exists(pk)` is true, so `OR` never reads the right
+    /// // branch — the undefined `:v` is still an error, as it is upstream.
+    /// let condition = ConditionExpression::parse("attribute_not_exists(pk) OR a = :v").unwrap();
+    /// let error = condition
+    ///     .evaluate(Some(&Item::new()), &HashMap::new(), &HashMap::new())
+    ///     .unwrap_err();
+    /// assert!(error.to_string().contains(":v"));
+    /// ```
     pub fn evaluate(
         &self,
         item: Option<&Item>,
@@ -167,6 +187,7 @@ impl ConditionExpression {
         values: &HashMap<String, AttributeValue>,
     ) -> Result<bool> {
         let context = Ctx { names, values };
+        eval::validate(&self.condition, &context)?;
         eval::evaluate(&self.condition, item, &context)
     }
 
