@@ -6,9 +6,10 @@ use common::{order, order_key, orders, user, user_key, users};
 #[cfg(feature = "streams")]
 use mock_ddb::StreamViewType;
 use mock_ddb::{
-    item, n, s, AttributeDefinition, BillingMode, CreateTableRequest, DeleteItemRequest, Error,
-    GetItemRequest, Item, KeySchema, KeyType, KeysAndAttributes, ListTablesRequest, MockDdb,
-    Projection, PutItemRequest, ReturnValues, SecondaryIndex, Select, UpdateItemRequest,
+    item, n, s, AttributeDefinition, BillingMode, CancellationReason, CancellationReasonCode,
+    CreateTableRequest, DeleteItemRequest, Error, GetItemRequest, Item, KeySchema, KeyType,
+    KeysAndAttributes, ListTablesRequest, MockDdb, Projection, PutItemRequest, ReturnValues,
+    SecondaryIndex, Select, UpdateItemRequest,
 };
 
 #[tokio::test]
@@ -702,10 +703,10 @@ async fn error_codes_and_retry_classification() {
         mock_ddb::CancellationReasonCode::TransactionConflict,
         "conflict",
     );
-    assert_eq!(reason.code.as_str(), "TransactionConflict");
-    assert_eq!(reason.code.to_string(), "TransactionConflict");
+    assert_eq!(reason.code().as_str(), "TransactionConflict");
+    assert_eq!(reason.code().to_string(), "TransactionConflict");
     reason = reason.with_item(None);
-    assert!(reason.item.is_none());
+    assert!(reason.item().is_none());
 
     let cancelled = Error::TransactionCanceled {
         message: "cancelled".to_string(),
@@ -731,6 +732,45 @@ async fn error_codes_and_retry_classification() {
         mock_ddb::CancellationReasonCode::ItemCollectionSizeLimitExceeded.as_str(),
         "ItemCollectionSizeLimitExceeded"
     );
+}
+
+#[test]
+fn cancellation_reason_cannot_hold_a_state_the_service_never_reports() {
+    // A `None` code is the "nothing reported here" placeholder: any message or
+    // image handed to the constructors is dropped, so the reason cannot claim a
+    // failure the service would not have sent.
+    let none = CancellationReason::new(CancellationReasonCode::None, "not reported");
+    assert_eq!(none.code(), CancellationReasonCode::None);
+    assert_eq!(none.message(), "");
+    assert!(none.item().is_none());
+
+    let image = item([("pk", s("u#1")), ("total", n("10"))]);
+    let none_with_image = CancellationReason::new(CancellationReasonCode::None, "still nothing")
+        .with_item(Some(image.clone()));
+    assert_eq!(none_with_image.message(), "");
+    assert!(none_with_image.item().is_none());
+
+    // Just outside: a real code keeps both the message and the image.
+    let failed = CancellationReason::new(
+        CancellationReasonCode::ConditionalCheckFailed,
+        "condition failed",
+    )
+    .with_item(Some(image.clone()));
+    assert_eq!(
+        failed.code(),
+        CancellationReasonCode::ConditionalCheckFailed
+    );
+    assert_eq!(failed.message(), "condition failed");
+    assert_eq!(failed.item(), Some(&image));
+
+    // Dropping the image again leaves code and message untouched.
+    let cleared = failed.with_item(None);
+    assert!(cleared.item().is_none());
+    assert_eq!(
+        cleared.code(),
+        CancellationReasonCode::ConditionalCheckFailed
+    );
+    assert_eq!(cleared.message(), "condition failed");
 }
 
 #[tokio::test]

@@ -21,8 +21,6 @@
 //! # }
 //! ```
 
-use std::collections::HashMap;
-
 use aws_sdk_dynamodb::types::AttributeValue;
 
 use crate::Item;
@@ -152,7 +150,7 @@ impl Error {
         match self {
             Self::TransactionCanceled { reasons, .. } => reasons
                 .iter()
-                .any(|reason| reason.code == CancellationReasonCode::TransactionConflict),
+                .any(|reason| reason.code() == CancellationReasonCode::TransactionConflict),
             _ => false,
         }
     }
@@ -287,46 +285,111 @@ impl Error {
 }
 
 /// The reason one member of a cancelled transaction was rejected.
+///
+/// The code, the message and the optional item image belong together, so they
+/// are private and a reason is built through [`CancellationReason::new`] and
+/// [`CancellationReason::with_item`]. [`CancellationReasonCode::None`] is the
+/// "nothing was reported for this position" placeholder: such a reason never
+/// carries a message or an image, and the constructors enforce that.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct CancellationReason {
-    /// The class of failure, as the service reports it.
-    pub code: CancellationReasonCode,
-    /// A human-readable explanation.
-    pub message: String,
-    /// The member's item as it was before the transaction, when the member
-    /// asked for `ReturnValuesOnConditionCheckFailure`.
-    pub item: Option<HashMap<String, AttributeValue>>,
+    code: CancellationReasonCode,
+    message: String,
+    item: Option<Item>,
 }
 
 impl CancellationReason {
     /// Build a reason with no item image.
     ///
+    /// [`CancellationReasonCode::None`] means the service reported no reason at
+    /// all for this position, so `message` is dropped for that code.
+    ///
     /// ```
     /// use mock_ddb::{CancellationReason, CancellationReasonCode};
     /// let reason = CancellationReason::new(CancellationReasonCode::TransactionConflict, "conflict");
-    /// assert_eq!(reason.code.as_str(), "TransactionConflict");
+    /// assert_eq!(reason.code().as_str(), "TransactionConflict");
+    /// assert_eq!(reason.message(), "conflict");
+    /// assert!(reason.item().is_none());
     /// ```
     #[must_use]
     pub fn new(code: CancellationReasonCode, message: impl Into<String>) -> Self {
+        let message = match code {
+            CancellationReasonCode::None => String::new(),
+            _ => message.into(),
+        };
         Self {
             code,
-            message: message.into(),
+            message,
             item: None,
         }
     }
 
-    /// Attach the item image reported with the reason.
+    /// The class of failure the service reported.
+    ///
+    /// ```
+    /// use mock_ddb::{CancellationReason, CancellationReasonCode};
+    ///
+    /// let reason = CancellationReason::new(
+    ///     CancellationReasonCode::ConditionalCheckFailed,
+    ///     "condition evaluated to false",
+    /// );
+    /// assert_eq!(reason.code(), CancellationReasonCode::ConditionalCheckFailed);
+    /// ```
     #[must_use]
+    pub fn code(&self) -> CancellationReasonCode {
+        self.code
+    }
+
+    /// The human-readable explanation, empty for
+    /// [`CancellationReasonCode::None`].
+    ///
+    /// ```
+    /// use mock_ddb::{CancellationReason, CancellationReasonCode};
+    ///
+    /// let reason = CancellationReason::new(CancellationReasonCode::ValidationError, "bad action");
+    /// assert_eq!(reason.message(), "bad action");
+    /// assert_eq!(CancellationReason::new(CancellationReasonCode::None, "ignored").message(), "");
+    /// ```
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// The member's item image, or `None` when it was not reported.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, CancellationReason, CancellationReasonCode};
+    ///
+    /// let reason = CancellationReason::new(CancellationReasonCode::ConditionalCheckFailed, "")
+    ///     .with_item(Some(item([("pk", s("u#1"))])));
+    /// assert_eq!(reason.item().and_then(|image| image.get("pk")), Some(&s("u#1")));
+    /// assert!(CancellationReason::new(CancellationReasonCode::TransactionConflict, "")
+    ///     .item()
+    ///     .is_none());
+    /// ```
+    #[must_use]
+    pub fn item(&self) -> Option<&Item> {
+        self.item.as_ref()
+    }
+
+    /// Attach the item image reported with the reason.
+    ///
+    /// A [`CancellationReasonCode::None`] reason carries no image, so `item` is
+    /// dropped for that code.
     ///
     /// ```
     /// use mock_ddb::{item, s, CancellationReason, CancellationReasonCode};
     ///
     /// let reason = CancellationReason::new(CancellationReasonCode::None, "")
     ///     .with_item(Some(item([("pk", s("u#1"))])));
-    /// assert!(reason.item.is_some());
+    /// assert!(reason.item().is_none());
     /// ```
+    #[must_use]
     pub fn with_item(mut self, item: Option<Item>) -> Self {
-        self.item = item;
+        if self.code != CancellationReasonCode::None {
+            self.item = item;
+        }
         self
     }
 }
