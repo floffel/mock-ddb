@@ -632,6 +632,8 @@ async fn query_key_conditions_using_functions_and_in() {
     .await
     .unwrap();
 
+    // A numeric sort key cannot begin with a string: the service rejects the
+    // type mismatch instead of answering "no items", and so does the mock.
     let begins = mock
         .query(
             QueryRequest::new("events", "pk = :pk AND begins_with(#sk, :prefix)")
@@ -639,11 +641,13 @@ async fn query_key_conditions_using_functions_and_in() {
                 .with_values(values([(":pk", s("e1")), (":prefix", s("1"))])),
         )
         .await
-        .unwrap();
-    // A numeric sort key can never begin with a string, so the condition holds
-    // for no item. (The service rejects the type mismatch outright; the mock
-    // treats an unsatisfiable comparison as false.)
-    assert_eq!(begins.count, 0);
+        .unwrap_err();
+    assert!(
+        begins
+            .to_string()
+            .contains("Incorrect operand type for operator or function"),
+        "unexpected error: {begins}"
+    );
 
     let in_condition = mock
         .query(

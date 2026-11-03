@@ -114,7 +114,45 @@ fn existence_type_and_functions() {
         &[(":p", AttributeValue::B(mock_ddb::Blob::new(vec![1_u8, 2])))]
     ));
     assert!(!check("contains(absent, :p)", &[(":p", s("x"))]));
-    assert!(!check("contains(count, :p)", &[(":p", s("3"))]));
+}
+
+#[test]
+fn a_wrongly_typed_function_operand_is_a_validation_error() {
+    let item = rich_item();
+    let evaluate = |expression: &str, value: AttributeValue| {
+        let attribute_values = HashMap::from([(":p".to_string(), value)]);
+        ConditionExpression::parse(expression)
+            .unwrap()
+            .evaluate(Some(&item), &HashMap::new(), &attribute_values)
+            .unwrap_err()
+    };
+
+    // Begins-with takes a string prefix on a string and a binary prefix on a
+    // binary; a number or a set is the service's ValidationException.
+    let count = evaluate("begins_with(count, :p)", s("3"));
+    assert_eq!(count.code(), "ValidationException");
+    assert!(
+        count
+            .to_string()
+            .contains("operator or function: begins_with, operand type: N"),
+        "unexpected error: {count}"
+    );
+    let number_prefix = evaluate("begins_with(name, :p)", n("1"));
+    assert!(
+        number_prefix
+            .to_string()
+            .contains("operator or function: begins_with, operand type: N"),
+        "unexpected error: {number_prefix}"
+    );
+
+    // A string set holds strings, so a numeric needle is a type error too.
+    let set_needle = evaluate("contains(tags, :p)", n("1"));
+    assert!(
+        set_needle
+            .to_string()
+            .contains("operator or function: contains, operand type: N"),
+        "unexpected error: {set_needle}"
+    );
 }
 
 #[test]
