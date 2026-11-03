@@ -3,9 +3,10 @@
 mod common;
 
 use mock_ddb::{
-    item, n, s, values, AttributeValue, Blob, ConditionExpression, CreateTableRequest,
-    DeleteItemRequest, GetItemRequest, KeySchema, KeyType, ListTablesRequest, MockDdb,
-    PutItemRequest, QueryRequest, ReturnValues, ScanRequest, Select, UpdateItemRequest,
+    item, n, s, values, AttributeValue, Blob, CancellationReason, CancellationReasonCode,
+    ConditionExpression, CreateTableRequest, DeleteItemRequest, Error, GetItemRequest, KeySchema,
+    KeyType, ListTablesRequest, MockDdb, PutItemRequest, QueryRequest, ReturnValues, ScanRequest,
+    Select, UpdateItemRequest,
 };
 
 fn numbers() -> MockDdb {
@@ -663,4 +664,62 @@ fn a_large_remove_list_within_the_limit_is_applied() {
     let duplicated = format!("{expression},a0");
     assert!(duplicated.len() < 4096);
     assert!(mock_ddb::UpdateExpression::parse(&duplicated).is_err());
+}
+
+/// The retry decision turns on the last terminal reason: an empty list is not
+/// retryable, one conflict is, and a single terminal member on either side of
+/// the conflict ends that.
+#[test]
+fn retryability_edges_around_the_terminal_reason() {
+    fn conflict() -> CancellationReason {
+        CancellationReason::new(CancellationReasonCode::TransactionConflict, "conflict")
+    }
+    fn terminal() -> CancellationReason {
+        CancellationReason::new(CancellationReasonCode::ConditionalCheckFailed, "no")
+    }
+    fn cancelled(reasons: Vec<CancellationReason>) -> Error {
+        Error::TransactionCanceled {
+            message: "cancelled".to_string(),
+            reasons,
+        }
+    }
+
+    // Just inside the boundary: empty is not retryable, one conflict is.
+    assert!(!cancelled(Vec::new()).is_retryable());
+    assert!(cancelled(vec![conflict()]).is_retryable());
+    // Two conflicts stay retryable — length is not the limit, conflict is.
+    assert!(cancelled(vec![conflict(), conflict()]).is_retryable());
+    // Just outside: a terminal member before or after the conflict.
+    assert!(!cancelled(vec![terminal(), conflict()]).is_retryable());
+    assert!(!cancelled(vec![conflict(), terminal()]).is_retryable());
+    assert!(!cancelled(vec![terminal()]).is_retryable());
+    // Only a cancelled transaction is retryable at all.
+    assert!(!Error::validation("bad").is_retryable());
+    assert!(!Error::table_not_found("users").is_retryable());
+}
+
+/// `cancellation_reasons` is the member list for a cancelled transaction and
+/// empty for every other failure, including one with no members.
+#[test]
+fn cancellation_reason_edges_between_variants() {
+    let reason = CancellationReason::new(CancellationReasonCode::ValidationError, "bad action");
+    let cancelled = Error::TransactionCanceled {
+        message: "cancelled".to_string(),
+        reasons: vec![reason.clone()],
+    };
+    assert_eq!(cancelled.cancellation_reasons(), [reason]);
+    assert!(Error::TransactionCanceled {
+        message: "cancelled".to_string(),
+        reasons: Vec::new(),
+    }
+    .cancellation_reasons()
+    .is_empty());
+    assert!(Error::validation("bad").cancellation_reasons().is_empty());
+    assert!(Error::ConditionalCheckFailed {
+        table: "users".to_string(),
+        message: "condition failed".to_string(),
+        item: None,
+    }
+    .cancellation_reasons()
+    .is_empty());
 }
