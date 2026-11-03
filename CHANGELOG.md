@@ -19,6 +19,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `MockClock::epoch_seconds` reports the real negative second before the Unix
+  epoch instead of the fixed sentinel `-1`, so a clock set an hour early no
+  longer claims to be one second early. `-1` is itself a legal timestamp
+  (1969-12-31T23:59:59Z), which made the two indistinguishable, and because
+  TTL expiry compares a stored deadline against that value, items with a TTL
+  never expired while the clock ran before the epoch: the second stuck at `-1`
+  however far `advance` moved the instant, so no deadline was ever crossed. The
+  value is now derived from `duration_since` on both sides of the epoch,
+  truncated in magnitude (a fraction of a second on either side reports `0`)
+  and saturating at `i64::MIN` / `i64::MAX` at the far ends of the clock.
 - `Error::is_retryable` now follows the error code the failure reports instead
   of a blanket `false`. An `Internal` failure — `InternalServerError`, the 5xx
   class a retry layer and the AWS SDK retry by default — answered "terminal", so

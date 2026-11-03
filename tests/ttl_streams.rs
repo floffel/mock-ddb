@@ -135,6 +135,44 @@ async fn expired_items_are_invisible_everywhere() {
         .is_none());
 }
 
+/// A clock set before the epoch still expires items: `now_seconds` reports the
+/// real negative second, so the deadline arithmetic keeps moving instead of
+/// parking on a sentinel that never crosses a deadline.
+#[tokio::test]
+async fn ttl_expires_on_a_clock_before_the_epoch() {
+    let clock = Arc::new(MockClock::new(
+        std::time::UNIX_EPOCH - Duration::from_secs(3_600),
+    ));
+    let mock = MockDdb::with_clock(clock.clone());
+    mock.create_table(CreateTableRequest::new(
+        "sessions",
+        KeySchema::hash("pk", KeyType::String),
+    ))
+    .await
+    .unwrap();
+    mock.update_time_to_live(UpdateTimeToLiveRequest::new("sessions", "expires_at", true))
+        .await
+        .unwrap();
+    assert_eq!(mock.now_seconds(), -3_600);
+
+    // Written at -3_600, expiring 60 s later, at -3_540.
+    mock.seed(
+        "sessions",
+        vec![item([("pk", s("short")), ("expires_at", n("-3540"))])],
+    )
+    .unwrap();
+    let key = || GetItemRequest::new("sessions", item([("pk", s("short"))]));
+    assert!(mock.get_item(key()).await.unwrap().item.is_some());
+
+    clock.advance(Duration::from_secs(59));
+    assert_eq!(mock.now_seconds(), -3_541);
+    assert!(mock.get_item(key()).await.unwrap().item.is_some());
+
+    clock.advance(Duration::from_secs(1));
+    assert_eq!(mock.now_seconds(), -3_540);
+    assert!(mock.get_item(key()).await.unwrap().item.is_none());
+}
+
 #[tokio::test]
 async fn purge_removes_expired_rows() {
     let (mock, _clock) = ttl_table().await;
