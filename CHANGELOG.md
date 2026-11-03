@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A `ConditionalCheckFailedException` now renders the table it was raised for:
+  every variant formatted as its bare `message`, so a logged rejection read
+  "condition `attribute_not_exists(pk)` evaluated to false" with no hint which
+  table refused the write. `Display` is now "The conditional request failed for
+  table users: condition `attribute_not_exists(pk)` evaluated to false".
+- `Error::resource` and `Error::table` expose the identifiers the variants
+  already carried. `ResourceNotFound.resource` was written by the crate and read
+  by nothing — not by `Display`, not by an accessor — so it was a write-only
+  field a test could not assert against; the new accessors return `None` for
+  every variant that carries no such identifier.
+
 - The document path in an update error message is now unambiguous and bounded.
   `render` separated segments only while the rendered text was non-empty, so a
   path whose first name was empty swallowed the separator and read exactly like
