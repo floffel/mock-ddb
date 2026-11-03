@@ -120,6 +120,11 @@ pub enum Error {
     /// An invariant of the mock itself was violated. Reaching this is a bug in
     /// `mock-ddb`, not a property of the request.
     ///
+    /// It reports the code `InternalServerError`, the 5xx class a caller — and
+    /// the AWS SDK, by default — retries, so [`Error::is_retryable`] answers
+    /// `true` for it: nothing about the request was decided, and a second
+    /// attempt is not a duplicate of a write that landed.
+    ///
     /// When a lower layer raised the failure — a number that does not parse, a
     /// blob that is not UTF-8 — [`Error::internal_from`] keeps that error as the
     /// [`source`](std::error::Error::source), so the chain ends at the real
@@ -229,7 +234,67 @@ fn render_source(source: Option<&(dyn std::error::Error + Send + Sync)>) -> Opti
     source.map(ToString::to_string)
 }
 
+/// Whether the service expects the caller to retry a failure class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retry {
+    /// A retry meets the same rejected condition or the same malformed request.
+    Terminal,
+    /// The failure says "try again": nothing was decided, as with a 5xx.
+    Always,
+    /// Only when every transaction member was rejected for a retryable reason.
+    WhenEveryMemberIsRetryable,
+}
+
+/// One row of the classification table: the code string and the retry verdict.
+///
+/// Both live in the same row, so [`Error::code`] and [`Error::is_retryable`]
+/// answer from one place and cannot contradict each other.
+struct Class {
+    code: &'static str,
+    retry: Retry,
+}
+
 impl Error {
+    /// The one row of the classification table this failure belongs to.
+    ///
+    /// [`Error::code`] and [`Error::is_retryable`] both read their answer from
+    /// here, so a code that names a retryable class and a verdict that calls it
+    /// terminal can no longer be written side by side.
+    fn class(&self) -> Class {
+        match self {
+            Self::ResourceNotFound { .. } => Class {
+                code: "ResourceNotFoundException",
+                retry: Retry::Terminal,
+            },
+            Self::ResourceInUse { .. } => Class {
+                code: "ResourceInUseException",
+                retry: Retry::Terminal,
+            },
+            Self::Validation { .. } => Class {
+                code: "ValidationException",
+                retry: Retry::Terminal,
+            },
+            Self::ConditionalCheckFailed { .. } => Class {
+                code: "ConditionalCheckFailedException",
+                retry: Retry::Terminal,
+            },
+            Self::TransactionCanceled { .. } => Class {
+                code: "TransactionCanceledException",
+                retry: Retry::WhenEveryMemberIsRetryable,
+            },
+            Self::ItemCollectionSizeLimitExceeded { .. } => Class {
+                code: "ItemCollectionSizeLimitExceededException",
+                retry: Retry::Terminal,
+            },
+            // A 5xx: the request was never decided, which is exactly the class a
+            // caller (and the AWS SDK, by default) retries.
+            Self::Internal { .. } => Class {
+                code: "InternalServerError",
+                retry: Retry::Always,
+            },
+        }
+    }
+
     /// The DynamoDB error code for this failure.
     #[must_use]
     ///
@@ -240,31 +305,27 @@ impl Error {
     /// assert_eq!(Error::table_not_found("users").code(), "ResourceNotFoundException");
     /// ```
     pub fn code(&self) -> &'static str {
-        match self {
-            Self::ResourceNotFound { .. } => "ResourceNotFoundException",
-            Self::ResourceInUse { .. } => "ResourceInUseException",
-            Self::Validation { .. } => "ValidationException",
-            Self::ConditionalCheckFailed { .. } => "ConditionalCheckFailedException",
-            Self::TransactionCanceled { .. } => "TransactionCanceledException",
-            Self::ItemCollectionSizeLimitExceeded { .. } => {
-                "ItemCollectionSizeLimitExceededException"
-            }
-            Self::Internal { .. } => "InternalServerError",
-        }
+        self.class().code
     }
 
     /// Whether the real service would expect the caller to retry.
     ///
-    /// Every failure the mock produces is deterministic, so this is `false`
-    /// except for a transaction that was cancelled purely because its members
-    /// lost a race — that is, one whose reasons all name
-    /// [`CancellationReasonCode::TransactionConflict`], which the real service
-    /// does ask clients to retry.
+    /// The verdict follows the code the failure reports, because that is what a
+    /// caller — and a retry layer — actually matches on:
     ///
-    /// One terminal reason is enough to make the answer `false`: a retry would
-    /// meet the same rejected condition, or the same malformed member, again. A
-    /// cancelled transaction that reports no reason at all is not retryable
-    /// either, because nothing says the second attempt could succeed.
+    /// * a 5xx ([`Error::Internal`], `InternalServerError`) is retryable: no
+    ///   decision was reached, so a second attempt is not a duplicate;
+    /// * a cancelled transaction is retryable only when every member was
+    ///   rejected for a retryable reason
+    ///   ([`CancellationReasonCode::is_retryable`]) — one terminal reason is
+    ///   enough to make the answer `false`, because the retry would meet the
+    ///   same rejected condition or the same malformed member again, and a
+    ///   transaction that reports no reason at all is not retryable either,
+    ///   because nothing says the second attempt could succeed;
+    /// * everything else — a missing resource, a malformed request, a rejected
+    ///   condition, a table that is already there, an exhausted item
+    ///   collection — is terminal, since the mock reaches that verdict from the
+    ///   request and the stored state, both of which a retry presents unchanged.
     #[must_use]
     ///
     /// ```
@@ -272,6 +333,9 @@ impl Error {
     ///
     /// let conflict = || {
     ///     CancellationReason::new(CancellationReasonCode::TransactionConflict, "conflict")
+    /// };
+    /// let throttled = || {
+    ///     CancellationReason::new(CancellationReasonCode::ThrottlingError, "throughput exceeded")
     /// };
     /// let failed = || {
     ///     CancellationReason::new(CancellationReasonCode::ConditionalCheckFailed, "no")
@@ -283,23 +347,29 @@ impl Error {
     ///
     /// assert!(cancelled(vec![conflict()]).is_retryable());
     /// assert!(cancelled(vec![conflict(), conflict()]).is_retryable());
-    /// // Inside: every member conflicted. Outside: one member was rejected for
-    /// // a terminal reason, so a retry cannot succeed.
+    /// assert!(cancelled(vec![throttled()]).is_retryable());
+    /// // Inside: every member is worth another attempt. Outside: one member was
+    /// // rejected for a terminal reason, so a retry cannot succeed.
     /// assert!(!cancelled(vec![conflict(), failed()]).is_retryable());
-    /// assert!(!cancelled(vec![failed(), conflict()]).is_retryable());
+    /// assert!(!cancelled(vec![failed(), throttled()]).is_retryable());
     /// // No reasons reported at all.
     /// assert!(!cancelled(Vec::new()).is_retryable());
+    /// // A 5xx is the class a retry layer expects; a rejected condition is not.
+    /// assert!(Error::internal("bug").is_retryable());
     /// assert!(!Error::validation("bad").is_retryable());
     /// ```
     pub fn is_retryable(&self) -> bool {
-        match self {
-            Self::TransactionCanceled { reasons, .. } => {
-                !reasons.is_empty()
-                    && reasons
-                        .iter()
-                        .all(|reason| reason.code() == CancellationReasonCode::TransactionConflict)
-            }
-            _ => false,
+        match self.class().retry {
+            Retry::Terminal => false,
+            Retry::Always => true,
+            Retry::WhenEveryMemberIsRetryable => match self {
+                Self::TransactionCanceled { reasons, .. } => {
+                    !reasons.is_empty() && reasons.iter().all(|reason| reason.code().is_retryable())
+                }
+                // `class` never assigns this rule to another variant, so this arm
+                // is unreachable; it answers "terminal" rather than guessing.
+                _ => false,
+            },
         }
     }
 
@@ -596,6 +666,37 @@ pub enum CancellationReasonCode {
 }
 
 impl CancellationReasonCode {
+    /// Whether a retry of the whole transaction can still succeed after this
+    /// reason.
+    ///
+    /// A member that lost a race ([`Self::TransactionConflict`]) or hit the
+    /// table's throughput ([`Self::ThrottlingError`]) is worth another attempt:
+    /// neither says anything about the request itself. A rejected condition, an
+    /// exhausted item collection, a malformed member and "nothing reported"
+    /// are terminal — the second attempt meets the same refusal.
+    ///
+    /// ```
+    /// use mock_ddb::CancellationReasonCode;
+    ///
+    /// assert!(CancellationReasonCode::TransactionConflict.is_retryable());
+    /// assert!(CancellationReasonCode::ThrottlingError.is_retryable());
+    /// // Inside: the two reasons a retry can fix. Outside: every other one.
+    /// assert!(!CancellationReasonCode::ConditionalCheckFailed.is_retryable());
+    /// assert!(!CancellationReasonCode::ItemCollectionSizeLimitExceeded.is_retryable());
+    /// assert!(!CancellationReasonCode::ValidationError.is_retryable());
+    /// assert!(!CancellationReasonCode::None.is_retryable());
+    /// ```
+    #[must_use]
+    pub fn is_retryable(self) -> bool {
+        match self {
+            Self::TransactionConflict | Self::ThrottlingError => true,
+            Self::ConditionalCheckFailed
+            | Self::ItemCollectionSizeLimitExceeded
+            | Self::ValidationError
+            | Self::None => false,
+        }
+    }
+
     /// The code string the service uses.
     #[must_use]
     ///

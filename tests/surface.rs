@@ -698,6 +698,10 @@ async fn error_codes_and_retry_classification() {
 
     let internal = Error::internal("bug");
     assert_eq!(internal.code(), "InternalServerError");
+    // The code says 5xx, so the verdict says retryable — the two cannot drift.
+    assert!(internal.is_retryable());
+    assert!(!too_large.is_retryable());
+    assert!(!not_found.is_retryable());
 
     let mut reason = mock_ddb::CancellationReason::new(
         mock_ddb::CancellationReasonCode::TransactionConflict,
@@ -728,6 +732,19 @@ async fn error_codes_and_retry_classification() {
         mock_ddb::CancellationReasonCode::ThrottlingError.as_str(),
         "ThrottlingError"
     );
+    // A throttled member is retryable, a malformed one is not: the reason table
+    // is the same one `Error::is_retryable` reads.
+    assert!(mock_ddb::CancellationReasonCode::ThrottlingError.is_retryable());
+    assert!(!mock_ddb::CancellationReasonCode::ValidationError.is_retryable());
+    let throttled = mock_ddb::CancellationReason::new(
+        mock_ddb::CancellationReasonCode::ThrottlingError,
+        "throughput exceeded",
+    );
+    assert!(Error::TransactionCanceled {
+        message: "cancelled".to_string(),
+        reasons: vec![throttled],
+    }
+    .is_retryable());
     assert_eq!(
         mock_ddb::CancellationReasonCode::ItemCollectionSizeLimitExceeded.as_str(),
         "ItemCollectionSizeLimitExceeded"
