@@ -6,6 +6,12 @@
 //! order; overlapping paths were rejected before the first write — by the
 //! parser where the spellings already collide, and by the alias-resolved check
 //! here for the rest — so the order cannot change the result.
+//!
+//! The writes land on a scratch copy that replaces the caller's item only once
+//! all of them have succeeded: a write can still fail on its own — a nested
+//! path whose parent does not exist, a list index past the end — and the
+//! service writes nothing at all when it rejects an update. A caller that gets
+//! an error therefore keeps exactly the item it passed in.
 
 use std::collections::BTreeSet;
 
@@ -47,6 +53,9 @@ fn reject_overlapping_targets(update: &Update, ctx: &Ctx<'_>) -> Result<()> {
 /// `key_schema` is consulted so an expression cannot rewrite a key attribute:
 /// the service rejects that, and silently allowing it would leave an item
 /// indexed under a key it no longer carries.
+///
+/// The writes are staged on a copy of `item`, which is replaced only when every
+/// one of them succeeded; on `Err` the caller's item is untouched.
 pub(crate) fn apply(
     update: &Update,
     item: &mut Item,
@@ -54,7 +63,7 @@ pub(crate) fn apply(
     key_schema: &KeySchema,
 ) -> Result<BTreeSet<String>> {
     reject_overlapping_targets(update, ctx)?;
-    let snapshot = item.clone();
+    let mut work = item.clone();
     let mut mutations: Vec<Mutation> = Vec::new();
     let mut touched: BTreeSet<String> = BTreeSet::new();
 
@@ -67,7 +76,7 @@ pub(crate) fn apply(
                         .ok_or_else(|| invalid_path(&resolved))?
                         .to_string();
                     reject_key_attribute(&name, key_schema)?;
-                    let value = evaluate_set_value(value, &snapshot, ctx)?;
+                    let value = evaluate_set_value(value, &work, ctx)?;
                     touched.insert(name);
                     mutations.push(Mutation::Set(resolved, value));
                 }
@@ -91,9 +100,9 @@ pub(crate) fn apply(
                         .to_string();
                     reject_key_attribute(&name, key_schema)?;
                     let delta = ctx
-                        .operand_value(operand, Some(&snapshot))?
+                        .operand_value(operand, Some(&work))?
                         .ok_or_else(|| undefined_operand(operand))?;
-                    let current = get_path(&snapshot, &resolved).cloned();
+                    let current = get_path(&work, &resolved).cloned();
                     let updated = match current {
                         None => {
                             if !matches!(
@@ -121,9 +130,9 @@ pub(crate) fn apply(
                         .to_string();
                     reject_key_attribute(&name, key_schema)?;
                     let delta = ctx
-                        .operand_value(operand, Some(&snapshot))?
+                        .operand_value(operand, Some(&work))?
                         .ok_or_else(|| undefined_operand(operand))?;
-                    let Some(current) = get_path(&snapshot, &resolved).cloned() else {
+                    let Some(current) = get_path(&work, &resolved).cloned() else {
                         continue;
                     };
                     let remaining = set_difference(&current, &delta).ok_or_else(|| {
@@ -145,10 +154,11 @@ pub(crate) fn apply(
 
     for mutation in mutations {
         match mutation {
-            Mutation::Set(path, value) => set_path(item, &path, value)?,
-            Mutation::Remove(path) => remove_path(item, &path),
+            Mutation::Set(path, value) => set_path(&mut work, &path, value)?,
+            Mutation::Remove(path) => remove_path(&mut work, &path),
         }
     }
+    *item = work;
     Ok(touched)
 }
 
@@ -467,6 +477,56 @@ mod tests {
         let values = ValueMap::new();
         let error = apply("SET v = size(absent)", &mut target, &values).unwrap_err();
         assert!(error.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn a_rejected_write_leaves_the_item_unchanged() {
+        // The first clause writes, the second names a nested path whose parent
+        // is not there, so the failure lands after a write was staged.
+        let mut target = item([("pk", s("a")), ("v", s("old"))]);
+        let original = target.clone();
+        let values = crate::values([(":v", s("new"))]);
+        let error = apply("SET v = :v, gone.nested = :v", &mut target, &values).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid for update"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(target, original);
+
+        // Just inside: with the parent present the same two clauses land.
+        target.insert("gone".into(), AttributeValue::M(HashMap::new()));
+        let original = target.clone();
+        apply("SET v = :v, gone.nested = :v", &mut target, &values).unwrap();
+        assert_eq!(target.get("v"), Some(&s("new")));
+        assert_eq!(
+            get_path(
+                &target,
+                &[Segment::Name("gone".into()), Segment::Name("nested".into())]
+            ),
+            Some(&s("new"))
+        );
+        // The clone above is only a guard: the successful run did change it.
+        assert_ne!(target, original);
+    }
+
+    #[test]
+    fn an_out_of_range_index_leaves_the_item_unchanged() {
+        // `rows` holds one element, so index 0 is just inside and 1 is past the
+        // end; the write before the failing one must not stick either.
+        let mut target = item([("pk", s("a")), ("rows", AttributeValue::L(vec![s("x")]))]);
+        let values = crate::values([(":v", s("y"))]);
+
+        let original = target.clone();
+        let error = apply("SET v = :v, rows[1] = :v", &mut target, &values).unwrap_err();
+        assert!(
+            error.to_string().contains("list index is out of range"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(target, original);
+
+        apply("SET v = :v, rows[0] = :v", &mut target, &values).unwrap();
+        assert_eq!(target.get("v"), Some(&s("y")));
+        assert_eq!(target.get("rows"), Some(&AttributeValue::L(vec![s("y")])));
     }
 
     #[test]

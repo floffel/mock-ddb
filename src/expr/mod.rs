@@ -272,6 +272,31 @@ impl UpdateExpression {
     /// list index is out of range, an operand has the wrong type for the
     /// operator, or the target paths overlap once `#alias` placeholders are
     /// resolved.
+    ///
+    /// An error leaves `item` exactly as the caller passed it: the writes are
+    /// staged on a copy and committed only once every clause has succeeded, so
+    /// an item kept after an error is never half-updated.
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use mock_ddb::{s, Item, KeySchema, KeyType, UpdateExpression};
+    ///
+    /// let update = UpdateExpression::parse("SET a = :v, gone.nested = :v").unwrap();
+    /// let mut item = Item::new();
+    /// item.insert("a".into(), s("kept"));
+    /// let error = update
+    ///     .apply(
+    ///         &mut item,
+    ///         &KeySchema::hash("id", KeyType::String),
+    ///         &HashMap::new(),
+    ///         &HashMap::from([(":v".to_string(), s("new"))]),
+    ///     )
+    ///     .unwrap_err();
+    /// assert!(error.to_string().contains("invalid for update"));
+    /// // `a` was the first clause and is still the old value: nothing landed.
+    /// assert_eq!(item.get("a"), Some(&s("kept")));
+    /// assert!(!item.contains_key("gone"));
+    /// ```
     pub fn apply(
         &self,
         item: &mut Item,
