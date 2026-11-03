@@ -157,8 +157,9 @@ impl ConditionExpression {
     /// # Errors
     ///
     /// Returns [`Error::Validation`](crate::Error::Validation) for an
-    /// undefined `#name` or `:value` placeholder, or for an ordered comparison
-    /// between values of different types.
+    /// undefined `#name` or `:value` placeholder, for an ordered comparison
+    /// between values of different types, and for `size()` of an operand with
+    /// no length — a number, which the service refuses to measure.
     pub fn evaluate(
         &self,
         item: Option<&Item>,
