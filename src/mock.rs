@@ -31,7 +31,13 @@ use crate::value::Scalar;
 use crate::Item;
 
 #[cfg(feature = "streams")]
-use crate::stream::StreamRecord;
+use crate::stream::{
+    wire_record, DescribeStreamOutput, DescribeStreamRequest, GetRecordsOutput, GetRecordsRequest,
+    GetShardIteratorOutput, GetShardIteratorRequest, ListStreamsOutput, ListStreamsRequest, Shard,
+    StreamDescription, StreamRecord, StreamState, StreamSummary, StreamsApi, StreamsRecord,
+    MAX_RECORDS_PER_GET, MAX_SHARDS_PER_DESCRIBE, MAX_STREAMS_PER_LIST,
+    STREAM_CREATION_EPOCH_SECONDS,
+};
 
 /// The mutable state behind the client.
 struct Inner {
@@ -1521,6 +1527,459 @@ impl MockDdb {
             message: format!("Requested resource not found: Stream: {stream_arn} not found"),
         })
     }
+
+    /// The DynamoDB Streams API over this mock: `ListStreams`,
+    /// `DescribeStream`, `GetShardIterator` and `GetRecords` in the wire shapes
+    /// the service (and the DynamoDB Streams Kinesis Adapter) uses.
+    ///
+    /// [`MockDdb::list_streams`] and [`MockDdb::get_records`] stay the short
+    /// in-process readers; this handle is for code that is written against the
+    /// Streams client, shard iterators and paging included.
+    #[cfg(feature = "streams")]
+    #[must_use]
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, CreateTableRequest, KeySchema, KeyType, ListStreamsRequest, MockDdb, PutItemRequest, StreamViewType};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mock = MockDdb::new();
+    /// mock.create_table(
+    ///     CreateTableRequest::new("users", KeySchema::hash("pk", KeyType::String))
+    ///         .with_stream(StreamViewType::NewImage),
+    /// )
+    /// .await
+    /// .unwrap();
+    /// mock.put_item(PutItemRequest::new("users", item([("pk", s("u#1"))])))
+    ///     .await
+    ///     .unwrap();
+    ///
+    /// let streams = mock.streams();
+    /// let listed = streams.list_streams(ListStreamsRequest::new()).await.unwrap();
+    /// assert_eq!(listed.streams.len(), 1);
+    /// # }
+    /// ```
+    pub fn streams(&self) -> StreamsApi<'_> {
+        StreamsApi { mock: self }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The DynamoDB Streams API
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "streams")]
+#[allow(unknown_lints, clippy::unused_async, clippy::unused_async_trait_impl)]
+impl StreamsApi<'_> {
+    /// `ListStreams`: every stream this mock holds, one page at a time,
+    /// sorted by ARN.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Validation`] when `limit` is outside `1..=100` or when
+    /// `exclusive_start_stream_arn` names a stream that does not exist.
+    ///
+    /// ```
+    /// use mock_ddb::{CreateTableRequest, KeySchema, KeyType, ListStreamsRequest, MockDdb, StreamViewType};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mock = MockDdb::new();
+    /// for name in ["orders", "users"] {
+    ///     mock.create_table(
+    ///         CreateTableRequest::new(name, KeySchema::hash("pk", KeyType::String))
+    ///             .with_stream(StreamViewType::KeysOnly),
+    ///     )
+    ///     .await
+    ///     .unwrap();
+    /// }
+    ///
+    /// let page = mock.streams().list_streams(ListStreamsRequest::new()).await.unwrap();
+    /// assert_eq!(page.streams.len(), 2);
+    /// assert_eq!(page.streams[0].table_name, "orders");
+    /// # }
+    /// ```
+    pub async fn list_streams(&self, request: ListStreamsRequest) -> Result<ListStreamsOutput> {
+        let limit = checked_page_limit(request.limit, MAX_STREAMS_PER_LIST)?;
+        let inner = self.mock.inner.read();
+        let mut streams: Vec<StreamSummary> = inner
+            .tables
+            .values()
+            .filter_map(|table| {
+                table.stream.as_ref().map(|stream| StreamSummary {
+                    stream_arn: stream.arn.clone(),
+                    stream_label: stream.label().to_string(),
+                    table_name: table.definition.table_name.clone(),
+                    stream_status: "ENABLED".to_string(),
+                })
+            })
+            .collect();
+        streams.sort_by(|left, right| left.stream_arn.cmp(&right.stream_arn));
+
+        let start = match &request.exclusive_start_stream_arn {
+            Some(arn) => streams
+                .iter()
+                .position(|stream| &stream.stream_arn == arn)
+                .map_or_else(
+                    || {
+                        Err(Error::validation(format!(
+                            "Invalid ExclusiveStartStreamArn: stream {arn} not found"
+                        )))
+                    },
+                    |position| Ok(position + 1),
+                )?,
+            None => 0,
+        };
+        let page: Vec<StreamSummary> = streams.into_iter().skip(start).take(limit).collect();
+        let last_evaluated_stream_arn = page.last().and_then(|stream| {
+            let index = start + page.len();
+            (index < inner_stream_count(&inner)).then(|| stream.stream_arn.clone())
+        });
+        Ok(ListStreamsOutput {
+            streams: page,
+            last_evaluated_stream_arn,
+        })
+    }
+
+    /// `DescribeStream`: the stream's label, view type, table and its single
+    /// shard.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ResourceNotFound`] for an unknown stream ARN,
+    /// [`Error::Validation`] for a `limit` outside `1..=100` or an
+    /// `exclusive_start_shard_id` that names no shard.
+    ///
+    /// ```
+    /// use mock_ddb::{CreateTableRequest, DescribeStreamRequest, KeySchema, KeyType, MockDdb, StreamViewType};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mock = MockDdb::new();
+    /// let table = mock
+    ///     .create_table(
+    ///         CreateTableRequest::new("users", KeySchema::hash("pk", KeyType::String))
+    ///             .with_stream(StreamViewType::NewAndOldImages),
+    ///     )
+    ///     .await
+    ///     .unwrap();
+    /// let arn = table.latest_stream_arn.unwrap();
+    ///
+    /// let described = mock
+    ///     .streams()
+    ///     .describe_stream(DescribeStreamRequest::new(&arn))
+    ///     .await
+    ///     .unwrap();
+    /// assert_eq!(described.stream_description.shards.len(), 1);
+    /// # }
+    /// ```
+    pub async fn describe_stream(
+        &self,
+        request: DescribeStreamRequest,
+    ) -> Result<DescribeStreamOutput> {
+        let limit = checked_page_limit(request.limit, MAX_SHARDS_PER_DESCRIBE)?;
+        let inner = self.mock.inner.read();
+        let (table_name, stream) = stream_for(&inner, &request.stream_arn)?;
+        let start = match &request.exclusive_start_shard_id {
+            Some(shard_id) if shard_id == StreamState::SHARD_ID => 1,
+            Some(shard_id) => {
+                return Err(Error::validation(format!(
+                    "Invalid ShardId: {shard_id} is not a shard of {}",
+                    request.stream_arn
+                )))
+            }
+            None => 0,
+        };
+        let shards = if start == 0 && limit > 0 {
+            vec![Shard {
+                shard_id: StreamState::SHARD_ID.to_string(),
+                parent_shard_id: None,
+                sequence_number_range: crate::stream::SequenceNumberRange {
+                    starting_sequence_number: starting_sequence_number(stream),
+                    ending_sequence_number: None,
+                },
+            }]
+        } else {
+            Vec::new()
+        };
+        Ok(DescribeStreamOutput {
+            stream_description: StreamDescription {
+                stream_arn: stream.arn.clone(),
+                stream_label: stream.label().to_string(),
+                stream_status: "ENABLED".to_string(),
+                stream_view_type: stream.view_type(),
+                creation_request_date_time: STREAM_CREATION_EPOCH_SECONDS,
+                table_name,
+                shards,
+                last_evaluated_shard_id: None,
+            },
+        })
+    }
+
+    /// `GetShardIterator`: a token that [`StreamsApi::get_records`] reads from.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ResourceNotFound`] for an unknown stream ARN,
+    /// [`Error::Validation`] for an unknown shard, for a sequence number that
+    /// is missing where the type needs one (or given where it must not be),
+    /// and for a sequence number the stream never issued.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, CreateTableRequest, GetShardIteratorRequest, KeySchema, KeyType, MockDdb, PutItemRequest, ShardIteratorType, StreamViewType};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mock = MockDdb::new();
+    /// let table = mock
+    ///     .create_table(
+    ///         CreateTableRequest::new("users", KeySchema::hash("pk", KeyType::String))
+    ///             .with_stream(StreamViewType::KeysOnly),
+    ///     )
+    ///     .await
+    ///     .unwrap();
+    /// mock.put_item(PutItemRequest::new("users", item([("pk", s("u#1"))])))
+    ///     .await
+    ///     .unwrap();
+    ///
+    /// let arn = table.latest_stream_arn.unwrap();
+    /// let described = mock.streams().describe_stream(
+    ///     mock_ddb::DescribeStreamRequest::new(&arn),
+    /// ).await.unwrap();
+    /// let shard_id = described.stream_description.shards[0].shard_id.clone();
+    ///
+    /// let iterator = mock
+    ///     .streams()
+    ///     .get_shard_iterator(GetShardIteratorRequest::new(&arn, shard_id, ShardIteratorType::TrimHorizon))
+    ///     .await
+    ///     .unwrap();
+    /// let page = mock
+    ///     .streams()
+    ///     .get_records(mock_ddb::GetRecordsRequest::new(iterator.shard_iterator))
+    ///     .await
+    ///     .unwrap();
+    /// assert_eq!(page.records.len(), 1);
+    /// # }
+    /// ```
+    pub async fn get_shard_iterator(
+        &self,
+        request: GetShardIteratorRequest,
+    ) -> Result<GetShardIteratorOutput> {
+        let inner = self.mock.inner.read();
+        let (_, stream) = stream_for(&inner, &request.stream_arn)?;
+        if request.shard_id != StreamState::SHARD_ID {
+            return Err(Error::validation(format!(
+                "Invalid ShardId: {} is not a shard of {}",
+                request.shard_id, request.stream_arn
+            )));
+        }
+        let kind = request.shard_iterator_type;
+        let position = match (kind.requires_sequence_number(), &request.sequence_number) {
+            (true, Some(sequence)) => {
+                let found = stream.position_of(sequence).ok_or_else(|| {
+                    Error::validation(format!(
+                        "The sequence number {sequence} does not exist in shard {}",
+                        StreamState::SHARD_ID
+                    ))
+                })?;
+                if kind == crate::stream::ShardIteratorType::AfterSequenceNumber {
+                    found.saturating_add(1)
+                } else {
+                    found
+                }
+            }
+            (true, None) => {
+                return Err(Error::validation(
+                    "1 validation error detected: Value null at 'sequenceNumber' failed to satisfy constraint: Member must not be null for AT_SEQUENCE_NUMBER and AFTER_SEQUENCE_NUMBER",
+                ))
+            }
+            (false, Some(_)) => {
+                return Err(Error::validation(
+                    "1 validation error detected: 'sequenceNumber' is only valid with AT_SEQUENCE_NUMBER and AFTER_SEQUENCE_NUMBER",
+                ))
+            }
+            (false, None) => match kind {
+                crate::stream::ShardIteratorType::Latest => stream.records.len(),
+                _ => 0,
+            },
+        };
+        Ok(GetShardIteratorOutput {
+            shard_iterator: encode_iterator(&stream.arn, position),
+        })
+    }
+
+    /// `GetRecords`: the next page of a shard, in write order, plus the token
+    /// for the call after it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ResourceNotFound`] when the iterator's stream no longer exists,
+    /// [`Error::Validation`] for an iterator this mock did not issue and for a
+    /// `limit` outside `1..=1000`.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, CreateTableRequest, DescribeStreamRequest, GetRecordsRequest, GetShardIteratorRequest, KeySchema, KeyType, MockDdb, PutItemRequest, ShardIteratorType, StreamViewType};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mock = MockDdb::new();
+    /// let table = mock
+    ///     .create_table(
+    ///         CreateTableRequest::new("users", KeySchema::hash("pk", KeyType::String))
+    ///             .with_stream(StreamViewType::NewImage),
+    ///     )
+    ///     .await
+    ///     .unwrap();
+    /// for id in ["u#1", "u#2"] {
+    ///     mock.put_item(PutItemRequest::new("users", item([("pk", s(id))])))
+    ///         .await
+    ///         .unwrap();
+    /// }
+    /// let arn = table.latest_stream_arn.unwrap();
+    /// let described = mock
+    ///     .streams()
+    ///     .describe_stream(DescribeStreamRequest::new(&arn))
+    ///     .await
+    ///     .unwrap();
+    /// let shard_id = described.stream_description.shards[0].shard_id.clone();
+    ///
+    /// let iterator = mock
+    ///     .streams()
+    ///     .get_shard_iterator(GetShardIteratorRequest::new(
+    ///         &arn,
+    ///         shard_id,
+    ///         ShardIteratorType::TrimHorizon,
+    ///     ))
+    ///     .await
+    ///     .unwrap();
+    /// let first = mock
+    ///     .streams()
+    ///     .get_records(GetRecordsRequest::new(iterator.shard_iterator).with_limit(1))
+    ///     .await
+    ///     .unwrap();
+    /// assert_eq!(first.records.len(), 1);
+    /// assert_eq!(first.records[0].event_name.as_str(), "INSERT");
+    ///
+    /// // The next page continues after the record just read.
+    /// let second = mock
+    ///     .streams()
+    ///     .get_records(GetRecordsRequest::new(first.next_shard_iterator.unwrap()))
+    ///     .await
+    ///     .unwrap();
+    /// assert_eq!(second.records.len(), 1);
+    /// # }
+    /// ```
+    pub async fn get_records(&self, request: GetRecordsRequest) -> Result<GetRecordsOutput> {
+        let limit = checked_page_limit(request.limit, MAX_RECORDS_PER_GET)?;
+        let (stream_arn, position) = decode_iterator(&request.shard_iterator)?;
+        let inner = self.mock.inner.read();
+        let (_, stream) = stream_for(&inner, &stream_arn)?;
+        let start = position.min(stream.records.len());
+        let records: Vec<StreamsRecord> = stream.records[start..]
+            .iter()
+            .take(limit)
+            .map(|record| wire_record(record, stream.view_type()))
+            .collect();
+        let next = encode_iterator(&stream_arn, start + records.len());
+        Ok(GetRecordsOutput {
+            records,
+            next_shard_iterator: Some(next),
+        })
+    }
+}
+
+/// The only shard id a stream exposes.
+#[cfg(feature = "streams")]
+const fn shard_id() -> &'static str {
+    StreamState::SHARD_ID
+}
+
+/// Resolve a stream ARN to its table name and stream state.
+#[cfg(feature = "streams")]
+fn stream_for<'inner>(
+    inner: &'inner Inner,
+    stream_arn: &str,
+) -> Result<(String, &'inner StreamState)> {
+    inner
+        .tables
+        .values()
+        .find_map(|table| {
+            table
+                .stream
+                .as_ref()
+                .filter(|stream| stream.arn == stream_arn)
+                .map(|stream| (table.definition.table_name.clone(), stream))
+        })
+        .ok_or_else(|| Error::ResourceNotFound {
+            resource: format!("stream `{stream_arn}`"),
+            message: format!("Requested resource not found: Stream: {stream_arn} not found"),
+        })
+}
+
+/// The number of streams the mock holds.
+#[cfg(feature = "streams")]
+fn inner_stream_count(inner: &Inner) -> usize {
+    inner
+        .tables
+        .values()
+        .filter(|table| table.stream.is_some())
+        .count()
+}
+
+/// The first sequence number a shard can return.
+#[cfg(feature = "streams")]
+fn starting_sequence_number(stream: &StreamState) -> String {
+    stream.records.first().map_or_else(
+        || format!("{:021}", stream.next_sequence),
+        |record| record.sequence_number.clone(),
+    )
+}
+
+/// Validate a page limit against the service's range for the operation.
+#[cfg(feature = "streams")]
+fn checked_page_limit(limit: Option<u32>, maximum: u32) -> Result<usize> {
+    match limit {
+        None => Ok(usize::try_from(maximum).unwrap_or(usize::MAX)),
+        Some(limit) if limit == 0 => Err(Error::validation(format!(
+            "1 validation error detected: Value '{limit}' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
+        ))),
+        Some(limit) if limit > maximum => Err(Error::validation(format!(
+            "1 validation error detected: Value '{limit}' at 'limit' failed to satisfy constraint: Member must have value less than or equal to {maximum}"
+        ))),
+        Some(limit) => Ok(usize::try_from(limit).unwrap_or(1)),
+    }
+}
+
+/// Encode an opaque shard iterator: version, stream, shard and log position.
+#[cfg(feature = "streams")]
+fn encode_iterator(stream_arn: &str, position: usize) -> String {
+    format!("v1|{stream_arn}|{}|{position}", shard_id())
+}
+
+/// Decode a shard iterator this mock issued.
+#[cfg(feature = "streams")]
+fn decode_iterator(token: &str) -> Result<(String, usize)> {
+    let invalid = || {
+        let shown: String = token.chars().take(80).collect();
+        Error::validation(format!("Invalid ShardIterator: {shown}"))
+    };
+    let mut parts = token.split('|');
+    let (Some("v1"), Some(stream_arn), Some(shard), Some(position), None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return Err(invalid());
+    };
+    if shard != shard_id() {
+        return Err(invalid());
+    }
+    position
+        .parse::<usize>()
+        .map(|position| (stream_arn.to_string(), position))
+        .map_err(|_| invalid())
 }
 
 // ---------------------------------------------------------------------------

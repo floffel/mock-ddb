@@ -64,6 +64,7 @@
 //! | Expressions | conditions, updates (`SET`/`REMOVE`/`ADD`/`DELETE`), projections |
 //! | TTL | `update_time_to_live`, `describe_time_to_live`, lazy expiry, `purge_expired` |
 //! | Streams | one ordered log per table, `get_records`, `list_streams` (feature `streams`) |
+//! | Streams API | `ListStreams`, `DescribeStream`, `GetShardIterator` and `GetRecords` with their wire shapes, limits and iterators, through [`MockDdb::streams`] |
 //!
 //! # Deliberate differences from the service
 //!
@@ -76,8 +77,13 @@
 //! - Capacity, throttling, `ConsumedCapacity` and item-collection size limits
 //!   are not modelled.
 //! - A `Query` without a key condition returns every item instead of failing.
-//! - Streams are read through [`MockDdb::get_records`] rather than the
-//!   `GetRecords`/shard-iterator API, and every table has a single shard.
+//! - Streams have a single open shard and unlimited retention: shard iterators
+//!   never expire, never split and never trim, where the service keeps 24 hours
+//!   and closes a shard after four hours of inactivity. The Streams API
+//!   (`ListStreams`, `DescribeStream`, `GetShardIterator`, `GetRecords`) is
+//!   modelled in full, including its paging and limits; the short
+//!   [`MockDdb::get_records`] reader stays for tests that do not care about
+//!   iterators.
 //!
 //! The README carries the full supported/not-supported matrix and the reasoning
 //! behind each difference.
@@ -128,7 +134,15 @@ pub use schema::{
     Projection, SecondaryIndex, StreamSpecification, StreamViewType, TableDescription,
 };
 #[cfg(feature = "streams")]
-pub use stream::{StreamEventName, StreamRecord};
+pub use stream::StreamEventName;
+#[cfg(feature = "streams")]
+pub use stream::{
+    DescribeStreamOutput, DescribeStreamRequest, GetRecordsOutput, GetRecordsRequest,
+    GetShardIteratorOutput, GetShardIteratorRequest, ListStreamsOutput, ListStreamsRequest,
+    SequenceNumberRange, Shard, ShardIteratorType, StreamDescription, StreamRecord, StreamSummary,
+    StreamsApi, StreamsRecord, StreamsRecordData, MAX_RECORDS_PER_GET, MAX_SHARDS_PER_DESCRIBE,
+    MAX_STREAMS_PER_LIST, STREAM_CREATION_EPOCH_SECONDS, STREAM_REGION,
+};
 
 /// A DynamoDB item: attribute name → value.
 ///

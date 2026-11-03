@@ -127,6 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | Transactions | `transact_write_items` (100 actions: `Put`, `Update`, `Delete`, `ConditionCheck`; atomic; per-member cancellation reasons; `ClientRequestToken` idempotency), `transact_get_items` |
 | TTL | `update_time_to_live`, `describe_time_to_live`, lazy expiry on every read path, `purge_expired` |
 | Streams | one ordered log per table, `get_records`, `list_streams`, `NEW_IMAGE` / `OLD_IMAGE` / `NEW_AND_OLD_IMAGES` / `KEYS_ONLY` (feature `streams`, on by default) |
+| Streams API | `MockDdb::streams()` returns the wire API: `list_streams` (with `ExclusiveStartStreamArn` and limit), `describe_stream` (label, view type, shard, sequence range), `get_shard_iterator` (`TRIM_HORIZON`, `LATEST`, `AT_SEQUENCE_NUMBER`, `AFTER_SEQUENCE_NUMBER`) and `get_records` (limit 1–1000, `NextShardIterator`), with records in the Kinesis adapter's shape |
 | Test helpers | `seed`, `dump`, `count`, `clear`, `set_clock`, `purge_expired`, `item_to_value` / `item_from_value` for embedding an item as `AttributeValue::M` |
 
 ### Expressions
@@ -204,10 +205,15 @@ that changes what a caller must do is called out.
    `scan`, `dump` and `count` the moment its timestamp passes, but its row is
    only removed when it is read or `purge_expired` runs. The service deletes
    within 48 hours in the background.
-8. **Streams are a log, not a shard API.** One shard per table, read through
-   `MockDdb::get_records`; there are no shard iterators, no 24-hour retention
-   and no trimming. `get_records` returns records from the start of the log
-   every time.
+8. **Streams are one open shard with unlimited retention.** A table's log is
+   readable through the in-process `get_records`/`list_streams` helpers or
+   through `MockDdb::streams()`, which speaks `ListStreams`, `DescribeStream`,
+   `GetShardIterator` and `GetRecords` with their real shapes, limits and
+   `NextShardIterator` chaining. Because there is no trimming, an iterator never
+   expires and `GetRecords` from `TRIM_HORIZON` always reaches the first record;
+   the service keeps 24 hours and closes a shard after four hours without
+   traffic. There are no shard splits, so `ParentShardId` is always absent and
+   `DescribeStream` returns exactly one shard.
 9. **Transaction conflicts do not happen.** Nothing else writes concurrently
    inside the mock, so a transaction either commits or is cancelled by a failed
    condition. `ClientRequestToken` deduplicates in-process for the life of the
@@ -238,7 +244,6 @@ that changes what a caller must do is called out.
 ## Not modelled at all
 
 - PartiQL / `ExecuteStatement`.
-- DynamoDB Streams' Kinesis adapter, shard iterators and `GetRecords` wire API.
 - DAX, global tables, backups, point-in-time recovery, tags, resource policies.
 - `ConditionExpression` on `BatchWriteItem` (the service does not have one
   either) and `ReturnValues` on `BatchGetItem`.
@@ -288,11 +293,11 @@ cargo +nightly fuzz run parse_expression -- -max_total_time=60
 cargo +nightly fuzz run random_items -- -max_total_time=60
 ```
 
-- 392 tests (295 test functions plus 97 doctests): unit tests per module, an integration suite per area
+- 425 tests (314 test functions plus 111 doctests): unit tests per module, an integration suite per area
   (`surface`, `expressions`, `query_scan`, `batch_transact`, `ttl_streams`,
-  `edge_cases`, `concurrency`, `coverage`), property tests with `proptest`, and
-  a doctest on every public type, every operation and every error method.
-  Builder setters are exercised by their request type's example.
+  `streams_api`, `edge_cases`, `concurrency`, `coverage`), property tests with
+  `proptest`, and a doctest on every public type, every operation and every
+  error method. Builder setters are exercised by their request type's example.
 - Line coverage is 97 %+ with all features on (`cargo llvm-cov --all-features`).
 - Two fuzz targets: `parse_expression` (the condition/update/projection
   parsers and evaluators) and `random_items` (arbitrary attribute trees through
@@ -303,7 +308,7 @@ cargo +nightly fuzz run random_items -- -max_total_time=60
 
 | Feature | Default | Effect |
 | --- | --- | --- |
-| `streams` | on | DynamoDB Streams emulation: stream ARNs on create, records on every mutation, `get_records`, `list_streams`. With the feature off, `create_table` rejects a `StreamSpecification` instead of silently ignoring it. |
+| `streams` | on | DynamoDB Streams emulation: stream ARNs on create, records on every mutation, `get_records`, `list_streams`, and the wire API behind `MockDdb::streams()` (`ListStreams`, `DescribeStream`, `GetShardIterator`, `GetRecords`). With the feature off, `create_table` rejects a `StreamSpecification` instead of silently ignoring it. |
 
 ## License
 

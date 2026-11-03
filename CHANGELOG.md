@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- The DynamoDB Streams wire API, reached through `MockDdb::streams()`:
+  `ListStreams`, `DescribeStream`, `GetShardIterator` and `GetRecords`, with
+  paging cursors, the service's limits (`1..=100` streams and shards,
+  `1..=1000` records) validated before anything is read, opaque shard iterators
+  for `TRIM_HORIZON`, `LATEST`, `AT_SEQUENCE_NUMBER` and
+  `AFTER_SEQUENCE_NUMBER`, and records in the Kinesis adapter's shape
+  (`eventSource`, `eventVersion`, `awsRegion`, and a `dynamodb` member carrying
+  keys, images, sequence number and size). `StreamRecord` also reports
+  `approximate_creation_date_time` now. The in-process `get_records`/
+  `list_streams` helpers stay as they were.
 - An `Internal` failure can now carry the lower-layer error that caused it.
   `Error::internal_from(message, cause)` stores the cause as
   `std::error::Error::source`, so a caller walks from the rendered message to the

@@ -617,3 +617,91 @@ fn code_is_unique_and_names_the_service_class() {
         );
     }
 }
+
+#[cfg(feature = "streams")]
+mod stream_paging {
+    use super::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// Paging a stream through shard iterators joins back into exactly the
+        /// unpaginated log: every record once, in write order, never a gap.
+        #[test]
+        fn stream_paging_is_lossless(count in 1_usize..12, limit in 1_u32..4) {
+            run(async {
+                let mock = MockDdb::new();
+                let table = mock
+                    .create_table(
+                        mock_ddb::CreateTableRequest::new(
+                            "events",
+                            KeySchema::hash("pk", KeyType::String),
+                        )
+                        .with_stream(mock_ddb::StreamViewType::NewAndOldImages),
+                    )
+                    .await
+                    .unwrap();
+                let arn = table.latest_stream_arn.unwrap();
+                for id in 0..count {
+                    mock.put_item(PutItemRequest::new("events", item([("pk", s(id.to_string()))])))
+                        .await
+                        .unwrap();
+                }
+
+                let shard_id = mock
+                    .streams()
+                    .describe_stream(mock_ddb::DescribeStreamRequest::new(&arn))
+                    .await
+                    .unwrap()
+                    .stream_description
+                    .shards
+                    .first()
+                    .expect("one shard")
+                    .shard_id
+                    .clone();
+                let mut token = mock
+                    .streams()
+                    .get_shard_iterator(mock_ddb::GetShardIteratorRequest::new(
+                        &arn,
+                        shard_id,
+                        mock_ddb::ShardIteratorType::TrimHorizon,
+                    ))
+                    .await
+                    .unwrap()
+                    .shard_iterator;
+
+                let mut seen = Vec::new();
+                let mut times = Vec::new();
+                loop {
+                    let page = mock
+                        .streams()
+                        .get_records(mock_ddb::GetRecordsRequest::new(token).with_limit(limit))
+                        .await
+                        .unwrap();
+                    if page.records.is_empty() {
+                        break;
+                    }
+                    for record in page.records {
+                        let data = record.dynamodb.expect("the dynamodb member");
+                        seen.push(data.sequence_number);
+                        times.push(data.approximate_creation_date_time);
+                    }
+                    token = page.next_shard_iterator.expect("a next iterator");
+                }
+
+                let expected: Vec<String> = mock
+                    .get_records(&arn)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|record| record.sequence_number)
+                    .collect();
+                assert_eq!(seen, expected);
+                assert!(
+                    times.windows(2).all(|pair| pair[0] <= pair[1]),
+                    "creation times must not go backwards: {times:?}"
+                );
+            });
+        }
+    }
+}
