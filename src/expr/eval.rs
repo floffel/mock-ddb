@@ -5,6 +5,12 @@
 //! false. `attribute_not_exists` is the way to test for absence, which is why
 //! the write path passes `None` for a missing item.
 //!
+//! An operand of the wrong type is not false: `begins_with(count, :s)` and
+//! `contains(count, :s)` are rejected with the service's `ValidationException`
+//! ("Incorrect operand type for operator or function"), so a test asserting a
+//! conditional write is refused fails for the same reason the service would
+//! refuse it.
+//!
 //! Reads borrow: a condition only compares, so the value an operand names stays
 //! in the item (or in the value map) and no attribute value is copied. Paths
 //! without an `#alias` are used as they are, without being rebuilt either.
@@ -145,14 +151,17 @@ pub(crate) fn evaluate(condition: &Condition, item: Option<&Item>, ctx: &Ctx<'_>
             ctx.path_value(path, item)?,
             ctx.operand_value(prefix, item)?,
         ) {
-            (Some(value), Some(prefix)) => Ok(begins_with(value, &prefix)),
+            (Some(value), Some(prefix)) => begins_with(value, &prefix),
+            // A missing attribute satisfies no condition. A missing placeholder
+            // is an undefined-value error and was already raised by
+            // `operand_value`.
             _ => Ok(false),
         },
         Condition::Contains(path, needle) => match (
             ctx.path_value(path, item)?,
             ctx.operand_value(needle, item)?,
         ) {
-            (Some(value), Some(needle)) => Ok(contains(value, &needle)),
+            (Some(value), Some(needle)) => contains(value, &needle),
             _ => Ok(false),
         },
         Condition::Compare(left, operator, right) => {
@@ -230,35 +239,72 @@ fn compare(left: &AttributeValue, operator: CmpOp, right: &AttributeValue) -> Re
     })
 }
 
+/// The service's rejection of an operand whose type the function cannot use.
+///
+/// The message is the one DynamoDB returns for e.g. `begins_with(count, :s)`,
+/// so a test that matches on the text keeps working when it is pointed at the
+/// real service.
+fn operand_type_error(function: &str, offender: &AttributeValue) -> Error {
+    Error::validation(format!(
+        "Invalid ConditionExpression: Incorrect operand type for operator or function; \
+         operator or function: {function}, operand type: {}",
+        type_name(offender)
+    ))
+}
+
 /// `begins_with` semantics for strings and binary.
-fn begins_with(value: &AttributeValue, prefix: &AttributeValue) -> bool {
+///
+/// A prefix exists only for `S` and `B`; every other pair — a number, a set, a
+/// map, a string prefix on a binary value — is the service's
+/// `ValidationException`, not a condition that happens to be false.
+fn begins_with(value: &AttributeValue, prefix: &AttributeValue) -> Result<bool> {
     match (value, prefix) {
-        (AttributeValue::S(value), AttributeValue::S(prefix)) => value.starts_with(prefix),
+        (AttributeValue::S(value), AttributeValue::S(prefix)) => Ok(value.starts_with(prefix)),
         (AttributeValue::B(value), AttributeValue::B(prefix)) => {
-            value.as_ref().starts_with(prefix.as_ref())
+            Ok(value.as_ref().starts_with(prefix.as_ref()))
         }
-        _ => false,
+        // The prefix is the offending operand when the value could take one.
+        (AttributeValue::S(_) | AttributeValue::B(_), prefix) => {
+            Err(operand_type_error("begins_with", prefix))
+        }
+        (value, _) => Err(operand_type_error("begins_with", value)),
     }
 }
 
 /// `contains` semantics: substring for strings, membership for sets and lists.
-fn contains(value: &AttributeValue, needle: &AttributeValue) -> bool {
+///
+/// A set holds members of one type, so its needle has to have that type;
+/// `contains` on a number, a map or a NULL is a type error rather than false.
+fn contains(value: &AttributeValue, needle: &AttributeValue) -> Result<bool> {
     match (value, needle) {
-        (AttributeValue::S(value), AttributeValue::S(needle)) => value.contains(needle.as_str()),
-        (AttributeValue::Ss(members), AttributeValue::S(needle)) => members.contains(needle),
-        (AttributeValue::Ns(members), AttributeValue::N(needle)) => members.iter().any(|member| {
-            matches!(
-                (crate::number::Number::parse(member), crate::number::Number::parse(needle)),
-                (Some(left), Some(right)) if left == right
-            )
-        }),
-        (AttributeValue::Bs(members), AttributeValue::B(needle)) => members
-            .iter()
-            .any(|member| member.as_ref() == needle.as_ref()),
-        (AttributeValue::L(elements), needle) => {
-            elements.iter().any(|element| value_eq(element, needle))
+        (AttributeValue::S(value), AttributeValue::S(needle)) => {
+            Ok(value.contains(needle.as_str()))
         }
-        _ => false,
+        (AttributeValue::Ss(members), AttributeValue::S(needle)) => Ok(members.contains(needle)),
+        (AttributeValue::Ns(members), AttributeValue::N(needle)) => {
+            Ok(members.iter().any(|member| {
+                matches!(
+                    (crate::number::Number::parse(member), crate::number::Number::parse(needle)),
+                    (Some(left), Some(right)) if left == right
+                )
+            }))
+        }
+        (AttributeValue::Bs(members), AttributeValue::B(needle)) => Ok(members
+            .iter()
+            .any(|member| member.as_ref() == needle.as_ref())),
+        (AttributeValue::L(elements), needle) => {
+            Ok(elements.iter().any(|element| value_eq(element, needle)))
+        }
+        // A string, set or binary value the function knows, with a needle of
+        // the wrong type: the needle is the operand to name.
+        (
+            AttributeValue::S(_)
+            | AttributeValue::Ss(_)
+            | AttributeValue::Ns(_)
+            | AttributeValue::Bs(_),
+            needle,
+        ) => Err(operand_type_error("contains", needle)),
+        (value, _) => Err(operand_type_error("contains", value)),
     }
 }
 
@@ -357,8 +403,71 @@ mod tests {
             &[("prefix", AttributeValue::B(crate::Blob::new(vec![9])))]
         )
         .unwrap());
-        assert!(!evaluate_str("begins_with(count, :prefix)", &[("prefix", n("1"))]).unwrap());
-        assert!(!evaluate_str("contains(flag, :v)", &[("v", AttributeValue::Bool(true))]).unwrap());
+        assert!(evaluate_str("begins_with(count, :prefix)", &[("prefix", n("1"))]).is_err());
+        assert!(evaluate_str("contains(flag, :v)", &[("v", AttributeValue::Bool(true))]).is_err());
+    }
+
+    /// The service rejects a wrongly typed operand of `begins_with`/`contains`
+    /// with a `ValidationException`; answering "condition not met" would let a
+    /// test that asserts a conditional write is refused pass for the wrong
+    /// reason.
+    #[test]
+    fn a_type_mismatched_operand_is_a_validation_error_not_false() {
+        let message = |expression: &str, values: &[(&str, AttributeValue)]| {
+            let error = evaluate_str(expression, values).unwrap_err();
+            assert_eq!(error.code(), "ValidationException", "{expression}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Incorrect operand type for operator or function"),
+                "{expression}: {error}"
+            );
+            error.to_string()
+        };
+
+        // just inside: a string with a string prefix, a binary with a binary one
+        assert!(evaluate_str("begins_with(pk, :p)", &[("p", s("a"))]).unwrap());
+        assert!(evaluate_str(
+            "begins_with(blob, :p)",
+            &[("p", AttributeValue::B(crate::Blob::new(vec![1])))]
+        )
+        .unwrap());
+        // just outside: the value, then the prefix, of the wrong type
+        assert!(message("begins_with(count, :p)", &[("p", s("1"))])
+            .contains("operator or function: begins_with, operand type: N"));
+        assert!(message("begins_with(pk, :p)", &[("p", n("1"))])
+            .contains("operator or function: begins_with, operand type: N"));
+        assert!(message(
+            "begins_with(blob, :p)",
+            &[("p", AttributeValue::S("a".into()))]
+        )
+        .contains("operator or function: begins_with, operand type: S"));
+        assert!(message("begins_with(tags, :p)", &[("p", s("red"))])
+            .contains("operator or function: begins_with, operand type: SS"));
+        assert!(message("begins_with(profile, :p)", &[("p", s("Ber"))]).contains("operand type: M"));
+
+        // `contains` keeps accepting every shape it has a meaning for, and
+        // rejects a needle whose type the shape cannot hold a member of.
+        assert!(evaluate_str("contains(pk, :v)", &[("v", s("a"))]).unwrap());
+        assert!(evaluate_str("contains(tags, :v)", &[("v", s("red"))]).unwrap());
+        assert!(evaluate_str(
+            "contains(blobs, :v)",
+            &[("v", AttributeValue::B(crate::Blob::new(vec![1])))]
+        )
+        .unwrap());
+        assert!(message("contains(count, :v)", &[("v", s("3"))])
+            .contains("operator or function: contains, operand type: N"));
+        assert!(message("contains(tags, :v)", &[("v", n("3"))])
+            .contains("operator or function: contains, operand type: N"));
+        assert!(
+            message("contains(flag, :v)", &[("v", AttributeValue::Bool(true))])
+                .contains("operator or function: contains, operand type: BOOL")
+        );
+
+        // A missing attribute has no operand to compare, so the wrong-typed
+        // needle stays false instead of failing.
+        assert!(!evaluate_str("begins_with(absent, :v)", &[("v", n("1"))]).unwrap());
+        assert!(!evaluate_str("contains(absent, :v)", &[("v", n("1"))]).unwrap());
     }
 
     #[test]
@@ -470,11 +579,12 @@ mod tests {
     #[test]
     fn empty_needles_scalar_sizes_and_out_of_range_indices() {
         // An empty needle is a substring of every string and a prefix of every
-        // string, but a set holds members, not substrings.
+        // string, but a set holds members, not substrings — and a string set
+        // cannot begin with a string at all.
         assert!(evaluate_str("contains(pk, :empty)", &[("empty", s(""))]).unwrap());
         assert!(evaluate_str("begins_with(pk, :empty)", &[("empty", s(""))]).unwrap());
         assert!(!evaluate_str("contains(tags, :empty)", &[("empty", s(""))]).unwrap());
-        assert!(!evaluate_str("begins_with(tags, :empty)", &[("empty", s(""))]).unwrap());
+        assert!(evaluate_str("begins_with(tags, :empty)", &[("empty", s(""))]).is_err());
 
         // A number has no length, so `size()` reports 0 for it instead of
         // failing or inventing a count.
@@ -684,27 +794,27 @@ mod tests {
         fn contains_accepts_every_member_it_holds(value in attribute()) {
             match &value {
                 AttributeValue::S(text) => {
-                    prop_assert!(contains(&value, &AttributeValue::S(text.clone())));
-                    prop_assert!(begins_with(&value, &AttributeValue::S(text.clone())));
+                    prop_assert!(contains(&value, &AttributeValue::S(text.clone()))?);
+                    prop_assert!(begins_with(&value, &AttributeValue::S(text.clone()))?);
                 }
                 AttributeValue::Ss(members) => {
                     for member in members {
-                        prop_assert!(contains(&value, &AttributeValue::S(member.clone())));
+                        prop_assert!(contains(&value, &AttributeValue::S(member.clone()))?);
                     }
                 }
                 AttributeValue::Ns(members) => {
                     for member in members {
-                        prop_assert!(contains(&value, &AttributeValue::N(member.clone())));
+                        prop_assert!(contains(&value, &AttributeValue::N(member.clone()))?);
                     }
                 }
                 AttributeValue::Bs(members) => {
                     for member in members {
-                        prop_assert!(contains(&value, &AttributeValue::B(member.clone())));
+                        prop_assert!(contains(&value, &AttributeValue::B(member.clone()))?);
                     }
                 }
                 AttributeValue::L(elements) => {
                     for element in elements {
-                        prop_assert!(contains(&value, element));
+                        prop_assert!(contains(&value, element)?);
                     }
                 }
                 _ => {}
@@ -732,23 +842,24 @@ mod tests {
         }
 
         /// The empty needle is a substring and a prefix of every string and a
-        /// prefix of every binary — including of an empty one.
+        /// prefix of every binary — including of an empty one. Every other
+        /// value shape rejects the binary prefix as a type mismatch.
         #[test]
         fn an_empty_needle_matches_every_string_and_binary(value in attribute()) {
             let empty_string = AttributeValue::S(String::new());
             let empty_blob = AttributeValue::B(crate::Blob::new(Vec::new()));
             match &value {
                 AttributeValue::S(text) => {
-                    prop_assert!(contains(&value, &empty_string));
-                    prop_assert!(begins_with(&value, &empty_string));
-                    prop_assert!(text.is_empty() || !begins_with(&empty_string, &value));
+                    prop_assert!(contains(&value, &empty_string)?);
+                    prop_assert!(begins_with(&value, &empty_string)?);
+                    prop_assert!(text.is_empty() || !begins_with(&empty_string, &value)?);
                 }
                 AttributeValue::B(blob) => {
-                    prop_assert!(begins_with(&value, &empty_blob));
-                    prop_assert!(blob.as_ref().is_empty() || !begins_with(&empty_blob, &value));
+                    prop_assert!(begins_with(&value, &empty_blob)?);
+                    prop_assert!(blob.as_ref().is_empty() || !begins_with(&empty_blob, &value)?);
                 }
                 _ => {
-                    prop_assert!(!begins_with(&value, &empty_blob));
+                    prop_assert!(begins_with(&value, &empty_blob).is_err());
                 }
             }
         }

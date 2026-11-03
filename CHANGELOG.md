@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A wrongly typed operand of `begins_with` or `contains` is now a
+  `ValidationException` instead of a condition that evaluates to false.
+  `begins_with(count, :s)`, `begins_with(blob, :s)`, `begins_with(tags, :s)` and
+  `contains(count, :s)` are all requests the service rejects with "Incorrect
+  operand type for operator or function"; the mock answered "condition not met",
+  so a test asserting that a conditional write is refused passed for the wrong
+  reason and the same expression failed against DynamoDB. A *missing* attribute
+  still satisfies nothing and stays false — there is no operand to compare — and
+  `contains` still accepts every needle a list can hold.
 - `UpdateExpression::apply` now takes the table's `KeySchema` and validates
   against it, instead of substituting a defaulted `pk`-only schema: an
   expression that rewrites a key attribute of the table it belongs to is
