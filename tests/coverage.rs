@@ -551,13 +551,22 @@ async fn update_expression_error_branches() {
         .await
         .is_err());
 
-    // DELETE from an attribute that does not exist is a no-op.
+    // DELETE from an attribute that does not exist is a no-op — but only with
+    // a set operand: the same expression with a scalar is refused whether or
+    // not the attribute is there.
     mock.update_item(
         UpdateItemRequest::new("users", item([("pk", s("u#1"))]), "DELETE absent :v")
-            .with_values(values([(":v", s("x"))])),
+            .with_values(values([(":v", AttributeValue::Ss(vec!["x".into()]))])),
     )
     .await
     .unwrap();
+    assert!(mock
+        .update_item(
+            UpdateItemRequest::new("users", item([("pk", s("u#1"))]), "DELETE absent :scalar")
+                .with_values(values([(":scalar", s("x"))])),
+        )
+        .await
+        .is_err());
 
     // Number arithmetic with an unparseable expression value.
     mock.update_item(
