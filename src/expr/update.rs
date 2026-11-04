@@ -104,20 +104,10 @@ pub(crate) fn apply(
                         .operand_value(operand, Some(&work))?
                         .map(Cow::into_owned)
                         .ok_or_else(|| undefined_operand(operand))?;
+                    let delta = validate_add_delta(&delta, &render(&resolved))?;
                     let current = get_path(&work, &resolved).cloned();
                     let updated = match current {
-                        None => {
-                            if !matches!(
-                                delta,
-                                AttributeValue::N(_)
-                                    | AttributeValue::Ss(_)
-                                    | AttributeValue::Ns(_)
-                                    | AttributeValue::Bs(_)
-                            ) {
-                                return Err(add_type_error(&delta));
-                            }
-                            delta
-                        }
+                        None => delta,
                         Some(current) => add_values(&current, &delta)?,
                     };
                     touched.insert(name);
@@ -234,22 +224,78 @@ fn arithmetic(
     Ok(AttributeValue::N(rendered))
 }
 
+/// Validate an `ADD` operand and return the value the item stores.
+///
+/// `ADD` on an absent attribute stores its delta as it stands, so the checks
+/// belong here rather than on the arithmetic path alone: an unparseable number
+/// or an empty set would otherwise land in the item, where `PutItem` would have
+/// refused the same value and every later arithmetic read of it fails. Both
+/// arms run through this, so a present and an absent attribute reject the same
+/// operands with the same errors.
+///
+/// A number comes back rendered plain (`1e3` → `1000`), the form the sum path
+/// produces. Set members keep their spelling, as they do on the union path.
+fn validate_add_delta(delta: &AttributeValue, path: &str) -> Result<AttributeValue> {
+    match delta {
+        AttributeValue::N(text) => Ok(AttributeValue::N(render_number(text)?)),
+        AttributeValue::Ns(members) => {
+            refuse_empty_set(members.is_empty(), "number", path)?;
+            members
+                .iter()
+                .try_for_each(|member| Number::parse(member).map(|_| ()))
+                .ok_or_else(unparseable_number)?;
+            Ok(delta.clone())
+        }
+        AttributeValue::Ss(members) => {
+            refuse_empty_set(members.is_empty(), "string", path)?;
+            Ok(delta.clone())
+        }
+        AttributeValue::Bs(members) => {
+            refuse_empty_set(members.is_empty(), "binary", path)?;
+            Ok(delta.clone())
+        }
+        _ => Err(add_type_error(delta)),
+    }
+}
+
+/// The one place `ADD` and the arithmetic chain reject an unparseable number,
+/// so both sides of a boundary report the same thing.
+fn unparseable_number() -> Error {
+    Error::validation("Invalid UpdateExpression: a number operand could not be parsed")
+}
+
+fn number_out_of_range() -> Error {
+    Error::validation("Invalid UpdateExpression: number out of range")
+}
+
+/// Parse a number operand and render it the way the item stores it.
+fn render_number(text: &str) -> Result<String> {
+    let number = Number::parse(text).ok_or_else(unparseable_number)?;
+    number.to_plain_string().ok_or_else(number_out_of_range)
+}
+
+/// Reject an empty set operand, with the wording `PutItem` uses for one.
+fn refuse_empty_set(is_empty: bool, kind: &str, path: &str) -> Result<()> {
+    if is_empty {
+        return Err(Error::validation(format!(
+            "One or more parameter values were invalid: An {kind} set may not be empty ({path})"
+        )));
+    }
+    Ok(())
+}
+
 /// `ADD` semantics: numbers add, sets union.
 fn add_values(current: &AttributeValue, delta: &AttributeValue) -> Result<AttributeValue> {
     match (current, delta) {
         (AttributeValue::N(left), AttributeValue::N(right)) => {
-            let (Some(left), Some(right)) = (Number::parse(left), Number::parse(right)) else {
-                return Err(Error::validation(
-                    "Invalid UpdateExpression: a number operand could not be parsed",
-                ));
-            };
-            let sum = left.add(&right).ok_or_else(|| {
-                Error::validation("Invalid UpdateExpression: number out of range")
-            })?;
-            let rendered = sum.to_plain_string().ok_or_else(|| {
-                Error::validation("Invalid UpdateExpression: number out of range")
-            })?;
-            Ok(AttributeValue::N(rendered))
+            let (left, right) = (
+                Number::parse(left).ok_or_else(unparseable_number)?,
+                Number::parse(right).ok_or_else(unparseable_number)?,
+            );
+            let sum = left.add(&right).ok_or_else(number_out_of_range)?;
+            Ok(AttributeValue::N(
+                sum.to_plain_string().ok_or_else(number_out_of_range)?,
+            ))
         }
         _ => set_union(current, delta).ok_or_else(|| add_type_error(delta)),
     }
@@ -441,10 +487,129 @@ mod tests {
     }
 
     #[test]
-    fn add_rejects_an_unparseable_number() {
+    fn add_rejects_an_unparseable_number_on_both_sides_of_the_boundary() {
+        let values = crate::values([(":bad", n("not-a-number")), (":one", n("1"))]);
+
+        // Present attribute: the arithmetic path parses the operand.
         let mut target = item([("pk", s("a")), ("count", n("1"))]);
-        let values = crate::values([(":bad", n("not-a-number"))]);
-        assert!(apply("ADD count :bad", &mut target, &values).is_err());
+        let error = apply("ADD count :bad", &mut target, &values).unwrap_err();
+        assert!(
+            error.to_string().contains("could not be parsed"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(target.get("count"), Some(&n("1")));
+
+        // Absent attribute: the delta used to be stored verbatim, which put an
+        // unparseable number into the item.
+        let mut target = item([("pk", s("a"))]);
+        let error = apply("ADD absent :bad", &mut target, &values).unwrap_err();
+        assert!(
+            error.to_string().contains("could not be parsed"),
+            "unexpected error: {error}"
+        );
+        assert!(!target.contains_key("absent"));
+
+        // Just inside: the same shape with a parseable operand lands.
+        let mut target = item([("pk", s("a"))]);
+        apply("ADD absent :one", &mut target, &values).unwrap();
+        assert_eq!(target.get("absent"), Some(&n("1")));
+    }
+
+    #[test]
+    fn add_stores_a_missing_number_in_the_rendering_the_sum_path_produces() {
+        let values = crate::values([(":n", n("1e3")), (":far", n("1e500"))]);
+
+        let mut target = item([("pk", s("a"))]);
+        apply("ADD absent :n", &mut target, &values).unwrap();
+        assert_eq!(target.get("absent"), Some(&n("1000")));
+
+        // Just outside: a number that cannot be rendered is refused instead of
+        // being stored in a spelling no read could use.
+        let mut target = item([("pk", s("a"))]);
+        let error = apply("ADD absent :far", &mut target, &values).unwrap_err();
+        assert!(
+            error.to_string().contains("out of range"),
+            "unexpected error: {error}"
+        );
+        assert!(!target.contains_key("absent"));
+    }
+
+    #[test]
+    fn add_refuses_an_empty_set_wherever_the_attribute_is() {
+        use crate::Blob;
+
+        let values = crate::values([
+            (":empty_s", AttributeValue::Ss(Vec::new())),
+            (":empty_n", AttributeValue::Ns(Vec::new())),
+            (":empty_b", AttributeValue::Bs(Vec::new())),
+        ]);
+
+        // Just outside: the empty set would become the stored value (absent) or
+        // leave one behind (present, where the union keeps it).
+        let cases = [
+            (
+                AttributeValue::Ss(vec!["seed".into()]),
+                ":empty_s",
+                "string",
+            ),
+            (AttributeValue::Ns(vec!["1".into()]), ":empty_n", "number"),
+            (
+                AttributeValue::Bs(vec![Blob::new(vec![1u8])]),
+                ":empty_b",
+                "binary",
+            ),
+        ];
+        for (present, operand, kind) in cases {
+            let mut target = item([("pk", s("a"))]);
+            let error = apply(&format!("ADD absent {operand}"), &mut target, &values).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{kind} set may not be empty")),
+                "unexpected error: {error}"
+            );
+            assert!(!target.contains_key("absent"));
+
+            let mut target = item([("pk", s("a")), ("existing", present.clone())]);
+            let error =
+                apply(&format!("ADD existing {operand}"), &mut target, &values).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{kind} set may not be empty")),
+                "unexpected error: {error}"
+            );
+            assert_eq!(target.get("existing"), Some(&present));
+        }
+
+        // Just inside: a set with one member is accepted on both sides.
+        let values = crate::values([
+            (":one_s", AttributeValue::Ss(vec!["a".into()])),
+            (":bad_n", AttributeValue::Ns(vec!["nope".into()])),
+            (":one_n", AttributeValue::Ns(vec!["1".into()])),
+        ]);
+
+        let mut target = item([("pk", s("a"))]);
+        apply("ADD absent :one_s", &mut target, &values).unwrap();
+        assert_eq!(
+            target.get("absent"),
+            Some(&AttributeValue::Ss(vec!["a".into()]))
+        );
+
+        // A number-set member has to parse, too.
+        let mut target = item([("pk", s("a"))]);
+        let error = apply("ADD absent :bad_n", &mut target, &values).unwrap_err();
+        assert!(
+            error.to_string().contains("could not be parsed"),
+            "unexpected error: {error}"
+        );
+
+        let mut target = item([("pk", s("a"))]);
+        apply("ADD absent :one_n", &mut target, &values).unwrap();
+        assert_eq!(
+            target.get("absent"),
+            Some(&AttributeValue::Ns(vec!["1".into()]))
+        );
     }
 
     #[test]
