@@ -11,6 +11,10 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use crate::capacity::{
+    read_units, size_estimate_range, write_units, Breakdown, ItemCollectionMetrics,
+    ReturnConsumedCapacity, ReturnItemCollectionMetrics, Units,
+};
 use crate::clock::{epoch_seconds, Clock, SystemClock};
 use crate::error::{CancellationReason, CancellationReasonCode, Error, Result};
 use crate::expr::{
@@ -22,12 +26,13 @@ use crate::request::{
     DeleteItemOutput, DeleteItemRequest, GetItemOutput, GetItemRequest, ListTablesOutput,
     ListTablesRequest, PutItemOutput, PutItemRequest, QueryOutput, QueryRequest, ReturnValues,
     ScanOutput, ScanRequest, Select, TimeToLiveDescription, TimeToLiveStatus,
-    TransactGetItemsOutput, TransactGetItemsRequest, TransactWriteItem, TransactWriteItemsRequest,
-    UpdateItemOutput, UpdateItemRequest, UpdateTimeToLiveRequest, WriteRequest,
+    TransactGetItemsOutput, TransactGetItemsRequest, TransactWriteItem, TransactWriteItemsOutput,
+    TransactWriteItemsRequest, UpdateItemOutput, UpdateItemRequest, UpdateTimeToLiveRequest,
+    WriteRequest,
 };
 use crate::schema::{CreateTableRequest, KeySchema, TableDescription};
 use crate::table::{index_key, IndexKey, ItemKey, Table, TableDefinition, Ttl};
-use crate::value::Scalar;
+use crate::value::{item_size, Scalar};
 use crate::Item;
 
 #[cfg(feature = "streams")]
@@ -503,6 +508,18 @@ impl MockDdb {
 
         table.store(key, request.item.clone(), previous.as_ref());
         table.on_put(previous_live.as_ref(), &request.item);
+        let mut breakdown = Breakdown::new();
+        charge_write(
+            table,
+            &mut breakdown,
+            [previous_live.as_ref(), Some(&request.item)],
+        );
+        let item_collection_metrics = collection_metrics(
+            table,
+            &request.item,
+            request.return_item_collection_metrics,
+            now,
+        );
         Ok(PutItemOutput {
             attributes: match request.return_values {
                 // An expired item is logically absent, so it is not "the old
@@ -510,6 +527,9 @@ impl MockDdb {
                 ReturnValues::AllOld => previous_live,
                 _ => None,
             },
+            consumed_capacity: breakdown
+                .consume(&request.table_name, request.return_consumed_capacity),
+            item_collection_metrics,
         })
     }
 
@@ -549,12 +569,19 @@ impl MockDdb {
             .get(&request.table_name)
             .ok_or_else(|| Error::table_not_found(&request.table_name))?;
         let key = table.lookup_key(&request.key)?;
-        let item = table
+        let stored = table
             .items
             .get(&key)
             .filter(|item| !table.is_expired(item, now));
 
-        let item = match item {
+        let mut breakdown = Breakdown::new();
+        charge_read(
+            table,
+            &mut breakdown,
+            None,
+            read_units(stored.map_or(0, item_size)),
+        );
+        let item = match stored {
             None => None,
             Some(item) => match &request.projection_expression {
                 None => Some(item.clone()),
@@ -567,7 +594,11 @@ impl MockDdb {
                 }
             },
         };
-        Ok(GetItemOutput { item })
+        Ok(GetItemOutput {
+            item,
+            consumed_capacity: breakdown
+                .consume(&request.table_name, request.return_consumed_capacity),
+        })
     }
 
     ///
@@ -643,11 +674,19 @@ impl MockDdb {
         if let Some(item) = &previous_live {
             table.on_delete(item);
         }
+        let mut breakdown = Breakdown::new();
+        charge_write(table, &mut breakdown, [previous_live.as_ref(), None]);
+        let item_collection_metrics = previous_live.as_ref().and_then(|item| {
+            collection_metrics(table, item, request.return_item_collection_metrics, now)
+        });
         Ok(DeleteItemOutput {
             attributes: match request.return_values {
                 ReturnValues::AllOld => removed.filter(|_| previous_live.is_some()),
                 _ => None,
             },
+            consumed_capacity: breakdown
+                .consume(&request.table_name, request.return_consumed_capacity),
+            item_collection_metrics,
         })
     }
 
@@ -734,6 +773,11 @@ impl MockDdb {
         table.store(key, item.clone(), previous.as_ref());
         table.on_update(previous_live.as_ref(), &item);
 
+        let mut breakdown = Breakdown::new();
+        charge_write(table, &mut breakdown, [previous_live.as_ref(), Some(&item)]);
+        let item_collection_metrics =
+            collection_metrics(table, &item, request.return_item_collection_metrics, now);
+
         let attributes = match request.return_values {
             ReturnValues::None => None,
             ReturnValues::AllNew => Some(item),
@@ -743,7 +787,12 @@ impl MockDdb {
                 .as_ref()
                 .map(|old| select_attributes(old, &touched)),
         };
-        Ok(UpdateItemOutput { attributes })
+        Ok(UpdateItemOutput {
+            attributes,
+            consumed_capacity: breakdown
+                .consume(&request.table_name, request.return_consumed_capacity),
+            item_collection_metrics,
+        })
     }
 
     /// Query a table or index by key.
@@ -830,7 +879,7 @@ impl MockDdb {
             values: &values,
             descending: !request.scan_index_forward.unwrap_or(true),
         };
-        let (items, count, scanned_count, last_evaluated_key) = collect_page(
+        let collected = collect_page(
             table,
             index_name,
             request.exclusive_start_key.as_ref(),
@@ -838,11 +887,15 @@ impl MockDdb {
             now,
             None,
         )?;
+        let mut breakdown = Breakdown::new();
+        charge_read(table, &mut breakdown, index_name, collected.read_units);
         Ok(QueryOutput {
-            items,
-            count,
-            scanned_count,
-            last_evaluated_key,
+            items: collected.items,
+            count: collected.count,
+            scanned_count: collected.scanned_count,
+            last_evaluated_key: collected.last_evaluated_key,
+            consumed_capacity: breakdown
+                .consume(&request.table_name, request.return_consumed_capacity),
         })
     }
 
@@ -927,7 +980,7 @@ impl MockDdb {
             values: &values,
             descending: false,
         };
-        let (items, count, scanned_count, last_evaluated_key) = collect_page(
+        let collected = collect_page(
             table,
             index_name,
             request.exclusive_start_key.as_ref(),
@@ -935,11 +988,15 @@ impl MockDdb {
             now,
             segment,
         )?;
+        let mut breakdown = Breakdown::new();
+        charge_read(table, &mut breakdown, index_name, collected.read_units);
         Ok(ScanOutput {
-            items,
-            count,
-            scanned_count,
-            last_evaluated_key,
+            items: collected.items,
+            count: collected.count,
+            scanned_count: collected.scanned_count,
+            last_evaluated_key: collected.last_evaluated_key,
+            consumed_capacity: breakdown
+                .consume(&request.table_name, request.return_consumed_capacity),
         })
     }
 
@@ -1007,12 +1064,15 @@ impl MockDdb {
             }
         }
 
+        let mut breakdowns: BTreeMap<String, Breakdown> = BTreeMap::new();
+        let mut collections: BTreeMap<String, ItemCollectionMetrics> = BTreeMap::new();
         for (table_name, writes) in request.request_items {
             let table = inner
                 .tables
                 .get_mut(&table_name)
                 .ok_or_else(|| Error::table_not_found(&table_name))?;
             for write in writes {
+                let mut breakdown = Breakdown::new();
                 match write {
                     WriteRequest::Put { item } => {
                         let key = table.item_key(&item)?;
@@ -1020,21 +1080,57 @@ impl MockDdb {
                         let previous_live = previous
                             .clone()
                             .filter(|existing| !table.is_expired(existing, now));
+                        charge_write(table, &mut breakdown, [previous_live.as_ref(), Some(&item)]);
                         table.store(key, item.clone(), previous.as_ref());
                         table.on_put(previous_live.as_ref(), &item);
+                        note_collection(
+                            table,
+                            &item,
+                            request.return_item_collection_metrics,
+                            now,
+                            &table_name,
+                            &mut collections,
+                        );
                     }
                     WriteRequest::Delete { key } => {
                         let key = table.lookup_key(&key)?;
+                        let previous = table.items.get(&key).cloned();
+                        let previous_live = previous
+                            .clone()
+                            .filter(|existing| !table.is_expired(existing, now));
+                        charge_write(table, &mut breakdown, [previous_live.as_ref(), None]);
                         if let Some(previous) = table.discard(&key) {
                             if !table.is_expired(&previous, now) {
                                 table.on_delete(&previous);
                             }
+                            note_collection(
+                                table,
+                                &previous,
+                                request.return_item_collection_metrics,
+                                now,
+                                &table_name,
+                                &mut collections,
+                            );
                         }
                     }
                 }
+                breakdowns
+                    .entry(table_name.clone())
+                    .or_default()
+                    .merge(&breakdown);
             }
         }
-        Ok(BatchWriteItemOutput::default())
+        let consumed_capacity = breakdowns
+            .iter()
+            .filter_map(|(table_name, breakdown)| {
+                breakdown.consume(table_name, request.return_consumed_capacity)
+            })
+            .collect();
+        Ok(BatchWriteItemOutput {
+            unprocessed_items: BTreeMap::new(),
+            consumed_capacity,
+            item_collection_metrics: collections,
+        })
     }
 
     ///
@@ -1081,6 +1177,7 @@ impl MockDdb {
         }
 
         let mut responses: BTreeMap<String, Vec<Item>> = BTreeMap::new();
+        let mut breakdowns: BTreeMap<String, Breakdown> = BTreeMap::new();
         for (table_name, attributes) in &request.request_items {
             let table = inner
                 .tables
@@ -1091,13 +1188,16 @@ impl MockDdb {
                 .clone()
                 .unwrap_or_default();
             let mut found = Vec::new();
+            let mut breakdown = Breakdown::new();
             for key in &attributes.keys {
                 let key = table.lookup_key(key)?;
-                let Some(item) = table
+                let stored = table
                     .items
                     .get(&key)
-                    .filter(|item| !table.is_expired(item, now))
-                else {
+                    .filter(|item| !table.is_expired(item, now));
+                // A key the table does not hold still costs a read unit.
+                breakdown.charge_table(Units::read(read_units(stored.map_or(0, item_size))));
+                let Some(item) = stored else {
                     continue;
                 };
                 let item = match &attributes.projection_expression {
@@ -1111,10 +1211,18 @@ impl MockDdb {
             if !found.is_empty() {
                 responses.insert(table_name.clone(), found);
             }
+            breakdowns.insert(table_name.clone(), breakdown);
         }
+        let consumed_capacity = breakdowns
+            .iter()
+            .filter_map(|(table_name, breakdown)| {
+                breakdown.consume(table_name, request.return_consumed_capacity)
+            })
+            .collect();
         Ok(BatchGetItemOutput {
             responses,
             unprocessed_keys: BTreeMap::new(),
+            consumed_capacity,
         })
     }
 
@@ -1143,11 +1251,17 @@ impl MockDdb {
     /// expression; [`Error::ResourceNotFound`] for an unknown table; and
     /// [`Error::TransactionCanceled`] when any condition fails. A cancelled
     /// transaction writes nothing.
-    pub async fn transact_write_items(&self, request: TransactWriteItemsRequest) -> Result<()> {
-        self.transact_write_items_inner(request)
+    pub async fn transact_write_items(
+        &self,
+        request: TransactWriteItemsRequest,
+    ) -> Result<TransactWriteItemsOutput> {
+        self.transact_write_items_inner(&request)
     }
 
-    fn transact_write_items_inner(&self, request: TransactWriteItemsRequest) -> Result<()> {
+    fn transact_write_items_inner(
+        &self,
+        request: &TransactWriteItemsRequest,
+    ) -> Result<TransactWriteItemsOutput> {
         let mut inner = self.inner.write();
         let now = epoch_seconds(inner.clock.now());
         if request.transact_items.is_empty() || request.transact_items.len() > 100 {
@@ -1163,7 +1277,7 @@ impl MockDdb {
                 ));
             }
             if inner.applied_tokens.contains(token) {
-                return Ok(());
+                return Ok(TransactWriteItemsOutput::default());
             }
         }
 
@@ -1223,34 +1337,18 @@ impl MockDdb {
             });
         }
 
-        for action in prepared {
-            let table = inner
-                .tables
-                .get_mut(&action.table_name)
-                .ok_or_else(|| Error::table_not_found(&action.table_name))?;
-            match action.kind {
-                ActionKind::Put(item) => {
-                    table.store(action.key, item.clone(), action.previous.as_ref());
-                    table.on_put(action.previous.as_ref(), &item);
-                }
-                ActionKind::Update(item) => {
-                    table.store(action.key, item.clone(), action.previous.as_ref());
-                    table.on_update(action.previous.as_ref(), &item);
-                }
-                ActionKind::Delete => {
-                    let _ = table.discard(&action.key);
-                    if let Some(previous) = &action.previous {
-                        table.on_delete(previous);
-                    }
-                }
-                ActionKind::ConditionCheck => {}
-            }
-        }
+        let output = apply_transaction(
+            &mut inner,
+            prepared,
+            request.return_consumed_capacity,
+            request.return_item_collection_metrics,
+            now,
+        )?;
 
-        if let Some(token) = request.client_request_token {
-            inner.applied_tokens.insert(token);
+        if let Some(token) = &request.client_request_token {
+            inner.applied_tokens.insert(token.clone());
         }
-        Ok(())
+        Ok(output)
     }
 
     ///
@@ -1300,17 +1398,22 @@ impl MockDdb {
             )));
         }
         let mut responses = Vec::with_capacity(request.transact_items.len());
+        let mut breakdowns: BTreeMap<String, Breakdown> = BTreeMap::new();
         for get in &request.transact_items {
             let table = inner
                 .tables
                 .get(&get.table_name)
                 .ok_or_else(|| Error::table_not_found(&get.table_name))?;
             let key = table.lookup_key(&get.key)?;
-            let item = table
+            let stored = table
                 .items
                 .get(&key)
                 .filter(|item| !table.is_expired(item, now));
-            let item = match item {
+            breakdowns
+                .entry(get.table_name.clone())
+                .or_default()
+                .charge_table(Units::read(read_units(stored.map_or(0, item_size))));
+            let item = match stored {
                 None => None,
                 Some(item) => match &get.projection_expression {
                     None => Some(item.clone()),
@@ -1322,7 +1425,16 @@ impl MockDdb {
             };
             responses.push(item);
         }
-        Ok(TransactGetItemsOutput { responses })
+        let consumed_capacity = breakdowns
+            .iter()
+            .filter_map(|(table_name, breakdown)| {
+                breakdown.consume(table_name, request.return_consumed_capacity)
+            })
+            .collect();
+        Ok(TransactGetItemsOutput {
+            responses,
+            consumed_capacity,
+        })
     }
 
     // -- TTL ----------------------------------------------------------------
@@ -1998,6 +2110,18 @@ struct Page<'a> {
     descending: bool,
 }
 
+/// One page of a query or scan, plus what reading it charged.
+struct PageResult {
+    items: Vec<Item>,
+    count: usize,
+    scanned_count: usize,
+    last_evaluated_key: Option<Item>,
+    /// Read units the page consumed: one per started 4 KiB of every item it
+    /// examined, filtered ones included, and one in total when it examined
+    /// nothing.
+    read_units: f64,
+}
+
 /// The position of an item in a query result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CursorKey {
@@ -2205,7 +2329,6 @@ fn projected_item(
 }
 
 /// Collect one page of a query or scan.
-#[allow(clippy::type_complexity)]
 fn collect_page(
     table: &Table,
     index_name: Option<&str>,
@@ -2213,7 +2336,7 @@ fn collect_page(
     page: &Page<'_>,
     now: i64,
     segment: Option<(u32, u32)>,
-) -> Result<(Vec<Item>, usize, usize, Option<Item>)> {
+) -> Result<PageResult> {
     if page.select == Select::SpecificAttributes && page.projection.is_none() {
         return Err(Error::validation(
             "Select type SPECIFIC_ATTRIBUTES requires a projection expression",
@@ -2243,6 +2366,7 @@ fn collect_page(
     let mut count = 0_usize;
     let mut scanned = 0_usize;
     let mut last_evaluated_key = None;
+    let mut charged = 0.0_f64;
 
     for (position, (cursor, item)) in entries.iter().enumerate() {
         if let Some(start) = &start {
@@ -2264,6 +2388,7 @@ fn collect_page(
             continue;
         }
         scanned += 1;
+        charged += read_units(item_size(item));
         let matches = match page.filter {
             None => true,
             Some(expression) => ConditionExpression::parse(expression)?.evaluate(
@@ -2295,7 +2420,18 @@ fn collect_page(
         }
     }
 
-    Ok((items, count, scanned, last_evaluated_key))
+    Ok(PageResult {
+        items,
+        count,
+        scanned_count: scanned,
+        last_evaluated_key,
+        // A page that examined no item still costs the minimum one unit.
+        read_units: if charged > 0.0 {
+            charged
+        } else {
+            read_units(0)
+        },
+    })
 }
 
 /// FNV-1a over the key's bytes, used to assign items to parallel scan segments.
@@ -2465,12 +2601,182 @@ fn key_only_item(key_schema: &KeySchema, key: &Item) -> Item {
     item
 }
 
+/// Apply the validated transaction actions and report what they charged.
+///
+/// The actions are already validated and their conditions hold, so this only
+/// writes, maintains every index, and accumulates the capacity per table. One
+/// entry per table, because a transaction can span tables.
+fn apply_transaction(
+    inner: &mut Inner,
+    prepared: Vec<PreparedAction>,
+    mode: ReturnConsumedCapacity,
+    metrics_mode: ReturnItemCollectionMetrics,
+    now: i64,
+) -> Result<TransactWriteItemsOutput> {
+    let mut breakdowns: BTreeMap<String, Breakdown> = BTreeMap::new();
+    let mut collections: BTreeMap<String, ItemCollectionMetrics> = BTreeMap::new();
+    for action in prepared {
+        let table = inner
+            .tables
+            .get_mut(&action.table_name)
+            .ok_or_else(|| Error::table_not_found(&action.table_name))?;
+        let mut breakdown = Breakdown::new();
+        match action.kind {
+            ActionKind::Put(item) => {
+                charge_write(
+                    table,
+                    &mut breakdown,
+                    [action.previous.as_ref(), Some(&item)],
+                );
+                table.store(action.key, item.clone(), action.previous.as_ref());
+                table.on_put(action.previous.as_ref(), &item);
+                note_collection(
+                    table,
+                    &item,
+                    metrics_mode,
+                    now,
+                    &action.table_name,
+                    &mut collections,
+                );
+            }
+            ActionKind::Update(item) => {
+                charge_write(
+                    table,
+                    &mut breakdown,
+                    [action.previous.as_ref(), Some(&item)],
+                );
+                table.store(action.key, item.clone(), action.previous.as_ref());
+                table.on_update(action.previous.as_ref(), &item);
+                note_collection(
+                    table,
+                    &item,
+                    metrics_mode,
+                    now,
+                    &action.table_name,
+                    &mut collections,
+                );
+            }
+            ActionKind::Delete => {
+                charge_write(table, &mut breakdown, [action.previous.as_ref(), None]);
+                let _ = table.discard(&action.key);
+                if let Some(previous) = &action.previous {
+                    table.on_delete(previous);
+                    note_collection(
+                        table,
+                        previous,
+                        metrics_mode,
+                        now,
+                        &action.table_name,
+                        &mut collections,
+                    );
+                }
+            }
+            ActionKind::ConditionCheck => {
+                // A condition check reads the item and writes nothing.
+                let bytes = action.previous.as_ref().map_or(0, item_size);
+                breakdown.charge_table(Units::read(read_units(bytes)));
+            }
+        }
+        breakdowns
+            .entry(action.table_name.clone())
+            .or_default()
+            .merge(&breakdown);
+    }
+    let consumed_capacity = breakdowns
+        .iter()
+        .filter_map(|(table_name, breakdown)| breakdown.consume(table_name, mode))
+        .collect();
+    Ok(TransactWriteItemsOutput {
+        consumed_capacity,
+        item_collection_metrics: collections,
+    })
+}
+
+/// Record the collection a write touched, keeping the first one per table: the
+/// response map is keyed by table name, and the service reports one entry per
+/// table.
+fn note_collection(
+    table: &Table,
+    item: &Item,
+    mode: ReturnItemCollectionMetrics,
+    now: i64,
+    table_name: &str,
+    collections: &mut BTreeMap<String, ItemCollectionMetrics>,
+) {
+    if let Some(metrics) = collection_metrics(table, item, mode, now) {
+        collections.entry(table_name.to_string()).or_insert(metrics);
+    }
+}
+
 /// Keep only the named attributes that exist.
 fn select_attributes(item: &Item, names: &BTreeSet<String>) -> Item {
     item.iter()
         .filter(|(name, _)| names.contains(*name))
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Capacity helpers
+// ---------------------------------------------------------------------------
+
+/// Charge one write: the larger of the old and the new image, on the table and
+/// on every index that holds either image.
+///
+/// The service charges the larger of the two sizes, because removing the old
+/// entry and adding the new one both cost capacity, and it does not charge an
+/// index the item does not appear in — which is how a sparse index stays free.
+fn charge_write(table: &Table, breakdown: &mut Breakdown, images: [Option<&Item>; 2]) {
+    let bytes = images
+        .iter()
+        .flatten()
+        .map(|item| item_size(item))
+        .max()
+        .unwrap_or(0);
+    let units = Units::write(write_units(bytes));
+    breakdown.charge_table(units);
+    let mut names: BTreeSet<&str> = BTreeSet::new();
+    for image in images.into_iter().flatten() {
+        names.extend(table.index_membership(image));
+    }
+    for name in names {
+        if let Some(scope) = table.index_scope(name) {
+            breakdown.charge_index(scope, name, units);
+        }
+    }
+}
+
+/// Charge one read: the index that was read when the operation names one,
+/// otherwise the table.
+fn charge_read(table: &Table, breakdown: &mut Breakdown, index_name: Option<&str>, units: f64) {
+    let units = Units::read(units);
+    match index_name.and_then(|name| table.index_scope(name).map(|scope| (scope, name))) {
+        Some((scope, name)) => breakdown.charge_index(scope, name, units),
+        None => breakdown.charge_table(units),
+    }
+}
+
+/// The item collection a write touched, when the request asks for it and the
+/// table has a local secondary index — the service's own rule, because only
+/// then does it track a collection's size.
+fn collection_metrics(
+    table: &Table,
+    item: &Item,
+    mode: ReturnItemCollectionMetrics,
+    now: i64,
+) -> Option<ItemCollectionMetrics> {
+    if mode == ReturnItemCollectionMetrics::None || !table.has_local_secondary_indexes() {
+        return None;
+    }
+    let (partition, _) = table.item_key(item).ok()?;
+    let name = table.key_schema().partition_key.attribute_name.clone();
+    let value = item.get(&name)?.clone();
+    let mut key = Item::new();
+    key.insert(name, value);
+    Some(ItemCollectionMetrics {
+        item_collection_key: Some(key),
+        size_estimate_range_gb: Some(size_estimate_range(table.collection_size(&partition, now))),
+    })
 }
 
 #[cfg(test)]

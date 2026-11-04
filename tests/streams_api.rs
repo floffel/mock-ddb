@@ -190,7 +190,7 @@ async fn describe_stream_past_its_only_shard_returns_an_empty_page() {
         )
         .await
         .unwrap();
-    assert!(page.stream_description.shards.is_empty());
+    assert_eq!(page.stream_description.shards, []);
     assert!(page.stream_description.last_evaluated_shard_id.is_none());
 
     let unknown = mock
@@ -262,7 +262,7 @@ async fn trim_horizon_reads_the_whole_log_and_latest_only_what_follows() {
         .get_records(GetRecordsRequest::new(latest.shard_iterator.clone()))
         .await
         .unwrap();
-    assert!(empty.records.is_empty());
+    assert_eq!(empty.records, []);
 
     put(&mock, "u#3").await;
     let after_write = streams
@@ -452,7 +452,7 @@ async fn get_records_pages_with_the_limit_and_chains_the_next_iterator() {
         .get_records(GetRecordsRequest::new(second.next_shard_iterator.unwrap()))
         .await
         .unwrap();
-    assert!(tail.records.is_empty());
+    assert_eq!(tail.records, []);
     assert!(tail.next_shard_iterator.is_some());
 }
 
@@ -524,7 +524,7 @@ async fn a_deleted_stream_takes_its_iterators_with_it() {
         .shard_iterator;
 
     mock.delete_table("table_1").await.unwrap();
-    assert!(mock.list_streams().is_empty());
+    assert_eq!(mock.list_streams(), Vec::<String>::new());
 
     let error = mock
         .streams()
@@ -665,7 +665,7 @@ async fn errors_keep_the_service_class() {
         .list_streams(ListStreamsRequest::new())
         .await
         .unwrap();
-    assert!(empty.streams.is_empty());
+    assert_eq!(empty.streams, []);
 
     let error = mock
         .streams()

@@ -82,6 +82,18 @@ impl TableDefinition {
     }
 }
 
+/// Which list of a table definition an index lives in.
+///
+/// Capacity is reported separately for the two, so the breakdown needs to know
+/// where an index belongs; a name is unique across both lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IndexScope {
+    /// A global secondary index: its own provisioned throughput.
+    Global,
+    /// A local secondary index: shares the table's partition.
+    Local,
+}
+
 /// A table's TTL setting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Ttl {
@@ -381,6 +393,55 @@ impl Table {
             None => None,
         };
         Some((partition, sort))
+    }
+
+    /// Whether an item can belong to an item collection the service tracks:
+    /// only a table with a local secondary index groups items by partition key
+    /// for the collection-size metric.
+    pub(crate) fn has_local_secondary_indexes(&self) -> bool {
+        !self.definition.local_secondary_indexes.is_empty()
+    }
+
+    /// The name of every index that holds this item image. A sparse index an
+    /// item does not qualify for is not charged.
+    pub(crate) fn index_membership(&self, item: &Item) -> Vec<&str> {
+        self.definition
+            .indexes()
+            .filter(|index| index_key(&index.key_schema, item).is_some())
+            .map(|index| index.index_name.as_str())
+            .collect()
+    }
+
+    /// Whether `name` is a global or a local index, or neither.
+    pub(crate) fn index_scope(&self, name: &str) -> Option<IndexScope> {
+        if self
+            .definition
+            .global_secondary_indexes
+            .iter()
+            .any(|index| index.index_name == name)
+        {
+            Some(IndexScope::Global)
+        } else if self
+            .definition
+            .local_secondary_indexes
+            .iter()
+            .any(|index| index.index_name == name)
+        {
+            Some(IndexScope::Local)
+        } else {
+            None
+        }
+    }
+
+    /// The bytes of every live item that shares `partition`: one item
+    /// collection, which is what the size estimate covers.
+    pub(crate) fn collection_size(&self, partition: &Scalar, now_seconds: i64) -> usize {
+        self.items
+            .iter()
+            .filter(|((hash, _), _)| hash == partition)
+            .filter(|(_, item)| !self.is_expired(item, now_seconds))
+            .map(|(_, item)| item_size(item))
+            .sum()
     }
 
     /// The projected attributes an index exposes, or `None` for "all".

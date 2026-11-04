@@ -28,6 +28,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use aws_sdk_dynamodb::types::AttributeValue;
 
+use crate::capacity::{
+    ConsumedCapacity, ItemCollectionMetrics, ReturnConsumedCapacity, ReturnItemCollectionMetrics,
+};
 use crate::schema::TableDescription;
 use crate::Item;
 
@@ -150,6 +153,10 @@ pub struct PutItemRequest {
     pub return_values: ReturnValues,
     /// Return the existing item when the condition fails.
     pub return_values_on_condition_check_failure: bool,
+    /// Whether to report the capacity the write consumed.
+    pub return_consumed_capacity: ReturnConsumedCapacity,
+    /// Whether to report the item collection the write touched.
+    pub return_item_collection_metrics: ReturnItemCollectionMetrics,
 }
 
 impl PutItemRequest {
@@ -198,6 +205,23 @@ impl PutItemRequest {
         self.return_values_on_condition_check_failure = true;
         self
     }
+
+    /// Choose what the response reports about consumed capacity.
+    #[must_use]
+    pub fn with_return_consumed_capacity(mut self, mode: ReturnConsumedCapacity) -> Self {
+        self.return_consumed_capacity = mode;
+        self
+    }
+
+    /// Choose whether the response reports the written item's collection size.
+    #[must_use]
+    pub fn with_return_item_collection_metrics(
+        mut self,
+        mode: ReturnItemCollectionMetrics,
+    ) -> Self {
+        self.return_item_collection_metrics = mode;
+        self
+    }
 }
 
 /// `PutItem` output.
@@ -205,6 +229,11 @@ impl PutItemRequest {
 pub struct PutItemOutput {
     /// The previous item, when `ReturnValues::AllOld` was requested.
     pub attributes: Option<Item>,
+    /// The capacity the write consumed, when requested.
+    pub consumed_capacity: Option<ConsumedCapacity>,
+    /// The written item collection, when requested and the table has a local
+    /// secondary index.
+    pub item_collection_metrics: Option<ItemCollectionMetrics>,
 }
 
 /// `GetItem` input.
@@ -220,6 +249,8 @@ pub struct GetItemRequest {
     pub projection_expression: Option<String>,
     /// `#alias` → attribute name.
     pub expression_attribute_names: Option<HashMap<String, String>>,
+    /// Whether to report the capacity the read consumed.
+    pub return_consumed_capacity: ReturnConsumedCapacity,
 }
 
 impl GetItemRequest {
@@ -246,6 +277,13 @@ impl GetItemRequest {
         self.expression_attribute_names = Some(names);
         self
     }
+
+    /// Choose what the response reports about consumed capacity.
+    #[must_use]
+    pub fn with_return_consumed_capacity(mut self, mode: ReturnConsumedCapacity) -> Self {
+        self.return_consumed_capacity = mode;
+        self
+    }
 }
 
 /// `GetItem` output. `item` is `None` when the key is absent or expired.
@@ -253,6 +291,8 @@ impl GetItemRequest {
 pub struct GetItemOutput {
     /// The item, if it exists.
     pub item: Option<Item>,
+    /// The capacity the read consumed, when requested.
+    pub consumed_capacity: Option<ConsumedCapacity>,
 }
 
 /// `DeleteItem` input.
@@ -272,6 +312,10 @@ pub struct DeleteItemRequest {
     pub return_values: ReturnValues,
     /// Return the existing item when the condition fails.
     pub return_values_on_condition_check_failure: bool,
+    /// Whether to report the capacity the write consumed.
+    pub return_consumed_capacity: ReturnConsumedCapacity,
+    /// Whether to report the item collection the write touched.
+    pub return_item_collection_metrics: ReturnItemCollectionMetrics,
 }
 
 impl DeleteItemRequest {
@@ -320,6 +364,23 @@ impl DeleteItemRequest {
         self.return_values_on_condition_check_failure = true;
         self
     }
+
+    /// Choose what the response reports about consumed capacity.
+    #[must_use]
+    pub fn with_return_consumed_capacity(mut self, mode: ReturnConsumedCapacity) -> Self {
+        self.return_consumed_capacity = mode;
+        self
+    }
+
+    /// Choose whether the response reports the written item's collection size.
+    #[must_use]
+    pub fn with_return_item_collection_metrics(
+        mut self,
+        mode: ReturnItemCollectionMetrics,
+    ) -> Self {
+        self.return_item_collection_metrics = mode;
+        self
+    }
 }
 
 /// `DeleteItem` output.
@@ -327,6 +388,11 @@ impl DeleteItemRequest {
 pub struct DeleteItemOutput {
     /// The deleted item, when `ReturnValues::AllOld` was requested.
     pub attributes: Option<Item>,
+    /// The capacity the write consumed, when requested.
+    pub consumed_capacity: Option<ConsumedCapacity>,
+    /// The touched item collection, when requested and the table has a local
+    /// secondary index.
+    pub item_collection_metrics: Option<ItemCollectionMetrics>,
 }
 
 /// `UpdateItem` input.
@@ -348,6 +414,10 @@ pub struct UpdateItemRequest {
     pub return_values: ReturnValues,
     /// Return the existing item when the condition fails.
     pub return_values_on_condition_check_failure: bool,
+    /// Whether to report the capacity the write consumed.
+    pub return_consumed_capacity: ReturnConsumedCapacity,
+    /// Whether to report the item collection the write touched.
+    pub return_item_collection_metrics: ReturnItemCollectionMetrics,
 }
 
 impl UpdateItemRequest {
@@ -397,6 +467,23 @@ impl UpdateItemRequest {
         self.return_values_on_condition_check_failure = true;
         self
     }
+
+    /// Choose what the response reports about consumed capacity.
+    #[must_use]
+    pub fn with_return_consumed_capacity(mut self, mode: ReturnConsumedCapacity) -> Self {
+        self.return_consumed_capacity = mode;
+        self
+    }
+
+    /// Choose whether the response reports the written item's collection size.
+    #[must_use]
+    pub fn with_return_item_collection_metrics(
+        mut self,
+        mode: ReturnItemCollectionMetrics,
+    ) -> Self {
+        self.return_item_collection_metrics = mode;
+        self
+    }
 }
 
 /// `UpdateItem` output.
@@ -404,6 +491,11 @@ impl UpdateItemRequest {
 pub struct UpdateItemOutput {
     /// The attributes selected by `return_values`.
     pub attributes: Option<Item>,
+    /// The capacity the write consumed, when requested.
+    pub consumed_capacity: Option<ConsumedCapacity>,
+    /// The touched item collection, when requested and the table has a local
+    /// secondary index.
+    pub item_collection_metrics: Option<ItemCollectionMetrics>,
 }
 
 /// `Query` input.
@@ -439,6 +531,8 @@ pub struct QueryRequest {
     pub consistent_read: bool,
     /// What to return.
     pub select: Select,
+    /// Whether to report the capacity the read consumed.
+    pub return_consumed_capacity: ReturnConsumedCapacity,
 }
 
 impl QueryRequest {
@@ -514,6 +608,13 @@ impl QueryRequest {
         self.select = select;
         self
     }
+
+    /// Choose what the response reports about consumed capacity.
+    #[must_use]
+    pub fn with_return_consumed_capacity(mut self, mode: ReturnConsumedCapacity) -> Self {
+        self.return_consumed_capacity = mode;
+        self
+    }
 }
 
 /// `Query` output.
@@ -527,6 +628,8 @@ pub struct QueryOutput {
     pub scanned_count: usize,
     /// Cursor for the next page, when the limit stopped the read early.
     pub last_evaluated_key: Option<Item>,
+    /// The capacity the read consumed, when requested.
+    pub consumed_capacity: Option<ConsumedCapacity>,
 }
 
 /// `Scan` input.
@@ -556,6 +659,8 @@ pub struct ScanRequest {
     pub consistent_read: bool,
     /// What to return.
     pub select: Select,
+    /// Whether to report the capacity the read consumed.
+    pub return_consumed_capacity: ReturnConsumedCapacity,
 }
 
 impl ScanRequest {
@@ -631,6 +736,13 @@ impl ScanRequest {
         self.select = select;
         self
     }
+
+    /// Choose what the response reports about consumed capacity.
+    #[must_use]
+    pub fn with_return_consumed_capacity(mut self, mode: ReturnConsumedCapacity) -> Self {
+        self.return_consumed_capacity = mode;
+        self
+    }
 }
 
 /// `Scan` output.
@@ -644,6 +756,8 @@ pub struct ScanOutput {
     pub scanned_count: usize,
     /// Cursor for the next page, when the limit stopped the scan early.
     pub last_evaluated_key: Option<Item>,
+    /// The capacity the read consumed, when requested.
+    pub consumed_capacity: Option<ConsumedCapacity>,
 }
 
 /// One write in a `BatchWriteItem` request.
@@ -667,6 +781,10 @@ pub enum WriteRequest {
 pub struct BatchWriteItemRequest {
     /// Table name → writes. At most 25 writes in total.
     pub request_items: BTreeMap<String, Vec<WriteRequest>>,
+    /// Whether to report the capacity each table consumed.
+    pub return_consumed_capacity: ReturnConsumedCapacity,
+    /// Whether to report the item collections the writes touched.
+    pub return_item_collection_metrics: ReturnItemCollectionMetrics,
 }
 
 impl BatchWriteItemRequest {
@@ -685,6 +803,23 @@ impl BatchWriteItemRequest {
             .push(write);
         self
     }
+
+    /// Choose what the response reports about consumed capacity.
+    #[must_use]
+    pub fn with_return_consumed_capacity(mut self, mode: ReturnConsumedCapacity) -> Self {
+        self.return_consumed_capacity = mode;
+        self
+    }
+
+    /// Choose whether the response reports the touched item collections.
+    #[must_use]
+    pub fn with_return_item_collection_metrics(
+        mut self,
+        mode: ReturnItemCollectionMetrics,
+    ) -> Self {
+        self.return_item_collection_metrics = mode;
+        self
+    }
 }
 
 /// `BatchWriteItem` output.
@@ -692,6 +827,10 @@ impl BatchWriteItemRequest {
 pub struct BatchWriteItemOutput {
     /// Writes the service did not process. Always empty in the mock.
     pub unprocessed_items: BTreeMap<String, Vec<WriteRequest>>,
+    /// One entry per table the batch wrote to, when requested.
+    pub consumed_capacity: Vec<ConsumedCapacity>,
+    /// Table name → the collection its writes touched, when requested.
+    pub item_collection_metrics: BTreeMap<String, ItemCollectionMetrics>,
 }
 
 /// The keys and options for one table in a `BatchGetItem` request.
@@ -730,6 +869,8 @@ impl KeysAndAttributes {
 pub struct BatchGetItemRequest {
     /// Table name → keys. At most 100 keys in total.
     pub request_items: BTreeMap<String, KeysAndAttributes>,
+    /// Whether to report the capacity each table consumed.
+    pub return_consumed_capacity: ReturnConsumedCapacity,
 }
 
 impl BatchGetItemRequest {
@@ -745,6 +886,13 @@ impl BatchGetItemRequest {
         self.request_items.insert(table_name.into(), keys);
         self
     }
+
+    /// Choose what the response reports about consumed capacity.
+    #[must_use]
+    pub fn with_return_consumed_capacity(mut self, mode: ReturnConsumedCapacity) -> Self {
+        self.return_consumed_capacity = mode;
+        self
+    }
 }
 
 /// `BatchGetItem` output.
@@ -754,6 +902,8 @@ pub struct BatchGetItemOutput {
     pub responses: BTreeMap<String, Vec<Item>>,
     /// Keys the service did not process. Always empty in the mock.
     pub unprocessed_keys: BTreeMap<String, KeysAndAttributes>,
+    /// One entry per table the batch read from, when requested.
+    pub consumed_capacity: Vec<ConsumedCapacity>,
 }
 
 /// The `Put` action of a transaction.
@@ -943,6 +1093,10 @@ pub struct TransactWriteItemsRequest {
     pub transact_items: Vec<TransactWriteItem>,
     /// Idempotency token: repeating a request with the same token is a no-op.
     pub client_request_token: Option<String>,
+    /// Whether to report the capacity each table consumed.
+    pub return_consumed_capacity: ReturnConsumedCapacity,
+    /// Whether to report the item collections the writes touched.
+    pub return_item_collection_metrics: ReturnItemCollectionMetrics,
 }
 
 impl TransactWriteItemsRequest {
@@ -952,6 +1106,7 @@ impl TransactWriteItemsRequest {
         Self {
             transact_items,
             client_request_token: None,
+            ..Self::default()
         }
     }
 
@@ -961,6 +1116,35 @@ impl TransactWriteItemsRequest {
         self.client_request_token = Some(token.into());
         self
     }
+
+    /// Choose what the response reports about consumed capacity.
+    #[must_use]
+    pub fn with_return_consumed_capacity(mut self, mode: ReturnConsumedCapacity) -> Self {
+        self.return_consumed_capacity = mode;
+        self
+    }
+
+    /// Choose whether the response reports the touched item collections.
+    #[must_use]
+    pub fn with_return_item_collection_metrics(
+        mut self,
+        mode: ReturnItemCollectionMetrics,
+    ) -> Self {
+        self.return_item_collection_metrics = mode;
+        self
+    }
+}
+
+/// `TransactWriteItems` output.
+///
+/// A transaction writes to several tables at once, so the capacity is one entry
+/// per table, in table-name order.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TransactWriteItemsOutput {
+    /// One entry per table the transaction wrote to, when requested.
+    pub consumed_capacity: Vec<ConsumedCapacity>,
+    /// Table name → the collection its writes touched, when requested.
+    pub item_collection_metrics: BTreeMap<String, ItemCollectionMetrics>,
 }
 
 /// One `Get` action of a transaction.
@@ -993,13 +1177,25 @@ impl TransactGet {
 pub struct TransactGetItemsRequest {
     /// The reads. At most 100.
     pub transact_items: Vec<TransactGet>,
+    /// Whether to report the capacity each table consumed.
+    pub return_consumed_capacity: ReturnConsumedCapacity,
 }
 
 impl TransactGetItemsRequest {
     /// A transaction over `transact_items`.
     #[must_use]
     pub fn new(transact_items: Vec<TransactGet>) -> Self {
-        Self { transact_items }
+        Self {
+            transact_items,
+            ..Self::default()
+        }
+    }
+
+    /// Choose what the response reports about consumed capacity.
+    #[must_use]
+    pub fn with_return_consumed_capacity(mut self, mode: ReturnConsumedCapacity) -> Self {
+        self.return_consumed_capacity = mode;
+        self
     }
 }
 
@@ -1008,6 +1204,8 @@ impl TransactGetItemsRequest {
 pub struct TransactGetItemsOutput {
     /// One entry per request, in order. `None` when the key was absent.
     pub responses: Vec<Option<Item>>,
+    /// One entry per table the transaction read from, when requested.
+    pub consumed_capacity: Vec<ConsumedCapacity>,
 }
 
 /// `UpdateTimeToLive` input.

@@ -62,6 +62,7 @@
 //! | Batches | `batch_write_item` (25), `batch_get_item` (100) |
 //! | Transactions | `transact_write_items` (100, atomic, cancellation reasons, idempotency token), `transact_get_items` |
 //! | Expressions | conditions, updates (`SET`/`REMOVE`/`ADD`/`DELETE`), projections |
+//! | Capacity | `ConsumedCapacity` (`TOTAL`/`INDEXES`) and `ItemCollectionMetrics` on every data-plane response, computed from the real item sizes |
 //! | TTL | `update_time_to_live`, `describe_time_to_live`, lazy expiry, `purge_expired` |
 //! | Streams | one ordered log per table, `get_records`, `list_streams` (feature `streams`) |
 //! | Streams API | `ListStreams`, `DescribeStream`, `GetShardIterator` and `GetRecords` with their wire shapes, limits and iterators, through [`MockDdb::streams`] |
@@ -74,8 +75,13 @@
 //!   consistent.
 //! - TTL expiry hides an item from every read immediately and deletes it when
 //!   it is read or purged, where the service deletes within 48 hours.
-//! - Capacity, throttling, `ConsumedCapacity` and item-collection size limits
-//!   are not modelled.
+//! - Capacity is reported, never enforced. `return_consumed_capacity` fills
+//!   `consumed_capacity` with units computed from the real item sizes — one read
+//!   unit per started 4 KiB of an item read, one write unit per started 1 KiB of
+//!   an item written, split per table and per index for `INDEXES` — and
+//!   `return_item_collection_metrics` reports the collection a write touched,
+//!   but there is no provisioned throughput, no throttling, no
+//!   `ProvisionedThroughputExceededException` and no 10 GB collection limit.
 //! - A `Query` without a key condition returns every item instead of failing.
 //! - Streams have a single open shard and unlimited retention: shard iterators
 //!   never expire, never split and never trim, where the service keeps 24 hours
@@ -98,6 +104,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+mod capacity;
 mod clock;
 mod error;
 mod expr;
@@ -115,6 +122,11 @@ use std::collections::HashMap;
 pub use aws_sdk_dynamodb::primitives::Blob;
 pub use aws_sdk_dynamodb::types::AttributeValue;
 
+pub use capacity::{
+    read_units, size_estimate_range, write_units, Capacity, ConsumedCapacity,
+    ItemCollectionMetrics, ReturnConsumedCapacity, ReturnItemCollectionMetrics,
+    COLLECTION_ESTIMATE_STEP_BYTES, READ_UNIT_BYTES, WRITE_UNIT_BYTES,
+};
 pub use clock::{Clock, MockClock, SystemClock};
 pub use error::{n, s, CancellationReason, CancellationReasonCode, Error, Result};
 pub use expr::{ConditionExpression, ProjectionExpression, UpdateExpression};
@@ -126,8 +138,8 @@ pub use request::{
     PutItemRequest, QueryOutput, QueryRequest, ReturnValues, ScanOutput, ScanRequest, Select,
     TimeToLiveDescription, TimeToLiveStatus, TransactConditionCheck, TransactDelete, TransactGet,
     TransactGetItemsOutput, TransactGetItemsRequest, TransactPut, TransactUpdate,
-    TransactWriteItem, TransactWriteItemsRequest, UpdateItemOutput, UpdateItemRequest,
-    UpdateTimeToLiveRequest, WriteRequest,
+    TransactWriteItem, TransactWriteItemsOutput, TransactWriteItemsRequest, UpdateItemOutput,
+    UpdateItemRequest, UpdateTimeToLiveRequest, WriteRequest,
 };
 pub use schema::{
     AttributeDefinition, BillingMode, CreateTableRequest, KeySchema, KeySchemaElement, KeyType,
