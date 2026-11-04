@@ -55,8 +55,16 @@ struct Inner {
     /// Counter that seeds stream sequence numbers, so records from two tables
     /// never compare equal.
     sequence: u64,
-    /// Client request tokens that have already been applied.
-    applied_tokens: BTreeSet<String>,
+    /// Client request tokens that have already been applied, each with the
+    /// transaction that spent it and the moment it was spent.
+    ///
+    /// A token names a request, not a slot: the service compares a resubmitted
+    /// token against the request that consumed it, refuses the transaction when
+    /// the two differ, and forgets the token ten minutes after it spent it. The
+    /// mock keeps the same record, so a caller that reuses one constant token
+    /// cannot have a different write silently discarded, and the map cannot grow
+    /// without bound.
+    applied_tokens: BTreeMap<String, AppliedToken>,
     /// PartiQL `NextToken` → the key the next page starts after.
     ///
     /// A `NextToken` is opaque state on the service's side, so it is opaque
@@ -71,6 +79,33 @@ struct Inner {
 
 /// How many PartiQL paging tokens one mock remembers.
 const MAX_NEXT_TOKENS: usize = 256;
+
+/// How long one mock remembers a `ClientRequestToken`, in seconds.
+///
+/// The service forgets a token ten minutes after the transaction that spent it,
+/// so a request that resubmits the token later is a new request rather than a
+/// replay. Age is measured against the injected [`Clock`], so a test can walk up
+/// to the boundary instead of sleeping.
+const TOKEN_EXPIRY_SECONDS: i64 = 600;
+
+/// A `ClientRequestToken` and the transaction that consumed it.
+struct AppliedToken {
+    /// The transaction as the token remembers it: its actions, in request
+    /// order. The token itself and the flags that only shape the response are
+    /// cleared, because they do not describe the write.
+    payload: TransactWriteItemsRequest,
+    /// Epoch seconds at which the transaction consumed the token.
+    applied_at: i64,
+}
+
+/// The part of a transaction a token remembers, with the token and the
+/// response-shaping flags cleared.
+fn transaction_payload(request: &TransactWriteItemsRequest) -> TransactWriteItemsRequest {
+    TransactWriteItemsRequest {
+        transact_items: request.transact_items.clone(),
+        ..TransactWriteItemsRequest::default()
+    }
+}
 
 /// An in-process DynamoDB.
 ///
@@ -154,7 +189,7 @@ impl MockDdb {
                 tables: BTreeMap::new(),
                 clock,
                 sequence: 1,
-                applied_tokens: BTreeSet::new(),
+                applied_tokens: BTreeMap::new(),
                 next_tokens: VecDeque::new(),
                 token_sequence: 0,
             })),
@@ -1405,13 +1440,48 @@ impl MockDdb {
     /// ```
     /// Run an atomic transaction of up to 100 actions.
     ///
+    /// A [`client_request_token`](TransactWriteItemsRequest::client_request_token)
+    /// makes the call idempotent for ten minutes, measured on the injected
+    /// clock: a second transaction that carries the same token and the same
+    /// actions writes nothing and returns an empty output, while the same token
+    /// with different actions is refused instead of silently discarding the
+    /// second write.
+    ///
+    /// ```rust
+    /// use mock_ddb::{
+    ///     item, s, KeySchema, KeyType, MockDdb, TransactWriteItem, TransactWriteItemsRequest,
+    /// };
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mock = MockDdb::with_table("users", KeySchema::hash("pk", KeyType::String))?;
+    /// let write = |value: &'static str| {
+    ///     TransactWriteItemsRequest::new(vec![TransactWriteItem::put(
+    ///         "users",
+    ///         item([("pk", s("u#1")), ("v", s(value))]),
+    ///     )])
+    ///     .with_client_request_token("token-1")
+    /// };
+    ///
+    /// // Inside: the same token and the same actions are a replay, not a write.
+    /// mock.transact_write_items(write("a")).await?;
+    /// mock.transact_write_items(write("a")).await?;
+    ///
+    /// // Outside: the same token with different actions is refused.
+    /// let error = mock.transact_write_items(write("b")).await.unwrap_err();
+    /// assert_eq!(error.code(), "IdempotentParameterMismatchException");
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Validation`] for an empty transaction, more than 100
     /// actions, two actions on the same item, an oversized token or a malformed
-    /// expression; [`Error::ResourceNotFound`] for an unknown table; and
-    /// [`Error::TransactionCanceled`] when any condition fails. A cancelled
-    /// transaction writes nothing.
+    /// expression; [`Error::ResourceNotFound`] for an unknown table;
+    /// [`Error::IdempotentParameterMismatch`] when the token was already spent
+    /// on a different transaction; and [`Error::TransactionCanceled`] when any
+    /// condition fails. A cancelled transaction writes nothing.
     pub async fn transact_write_items(
         &self,
         request: TransactWriteItemsRequest,
@@ -1437,7 +1507,17 @@ impl MockDdb {
                     "1 validation error detected: Value at 'clientRequestToken' failed to satisfy constraint: Member must have length between 1 and 36",
                 ));
             }
-            if inner.applied_tokens.contains(token) {
+            // The service forgets a token ten minutes after the transaction
+            // that spent it, so drop the spent ones before consulting the map:
+            // the answer for an expired token is "a new request", and the map
+            // stays bounded by the traffic of the last ten minutes.
+            inner
+                .applied_tokens
+                .retain(|_, applied| now.saturating_sub(applied.applied_at) < TOKEN_EXPIRY_SECONDS);
+            if let Some(applied) = inner.applied_tokens.get(token) {
+                if applied.payload != transaction_payload(request) {
+                    return Err(Error::idempotent_parameter_mismatch());
+                }
                 return Ok(TransactWriteItemsOutput::default());
             }
         }
@@ -1507,7 +1587,13 @@ impl MockDdb {
         )?;
 
         if let Some(token) = &request.client_request_token {
-            inner.applied_tokens.insert(token.clone());
+            inner.applied_tokens.insert(
+                token.clone(),
+                AppliedToken {
+                    payload: transaction_payload(request),
+                    applied_at: now,
+                },
+            );
         }
         Ok(output)
     }

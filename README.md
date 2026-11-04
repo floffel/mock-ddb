@@ -225,8 +225,14 @@ that changes what a caller must do is called out.
    `DescribeStream` returns exactly one shard.
 9. **Transaction conflicts do not happen.** Nothing else writes concurrently
    inside the mock, so a transaction either commits or is cancelled by a failed
-   condition. `ClientRequestToken` deduplicates in-process for the life of the
-   mock instead of the service's 10-minute window.
+   condition. `ClientRequestToken` follows the service: the transaction that
+   spends a token is remembered for ten minutes on the mock's clock, a replay of
+   the same actions writes nothing, and a non-identical request that reuses the
+   token fails with `IdempotentParameterMismatchException`. Two differences
+   remain: a replay returns an empty response instead of the original
+   `ConsumedCapacity`/`ItemCollectionMetrics`, and only a transaction that
+   applied spends its token, so a retry of a cancelled one re-evaluates the
+   conditions.
 10. **Batch writes are never partial.** Up to 25 writes are validated first and
     then applied; `UnprocessedItems` and `UnprocessedKeys` are always empty. The
     service can return unprocessed work under load.

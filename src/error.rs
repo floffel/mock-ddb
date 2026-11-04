@@ -3,7 +3,7 @@
 //! DynamoDB distinguishes failures by a small set of error codes
 //! (`ResourceNotFoundException`, `ValidationException`,
 //! `ConditionalCheckFailedException`, `ResourceInUseException`,
-//! `TransactionCanceledException`). Tests usually assert on the class rather
+//! `TransactionCanceledException`, `IdempotentParameterMismatchException`). Tests usually assert on the class rather
 //! than the wording, so [`Error::code`] returns the code the real service
 //! would have used and the variants carry the details a test needs.
 //!
@@ -129,6 +129,22 @@ pub enum Error {
         message: String,
     },
 
+    /// A `ClientRequestToken` was reused for a transaction whose actions differ
+    /// from the one that consumed the token.
+    ///
+    /// The service compares the request that carries a token against the one
+    /// that already consumed it and refuses the second, non-identical request
+    /// instead of replaying the first. It reports this class as
+    /// `IdempotentParameterMismatchException`, and the mock reports it for the
+    /// same reason: a caller that reuses one constant token would otherwise have
+    /// every second write silently discarded, and the lost write would ship
+    /// green.
+    #[error("{message}")]
+    IdempotentParameterMismatch {
+        /// The message the service would have returned.
+        message: String,
+    },
+
     /// An invariant of the mock itself was violated. Reaching this is a bug in
     /// `mock-ddb`, not a property of the request.
     ///
@@ -201,6 +217,14 @@ impl PartialEq for Error {
                     message: left_message,
                 },
                 Self::DuplicateItem {
+                    message: right_message,
+                },
+            )
+            | (
+                Self::IdempotentParameterMismatch {
+                    message: left_message,
+                },
+                Self::IdempotentParameterMismatch {
                     message: right_message,
                 },
             ) => left_message == right_message,
@@ -308,6 +332,12 @@ impl Error {
             },
             Self::DuplicateItem { .. } => Class {
                 code: "DuplicateItemException",
+                retry: Retry::Terminal,
+            },
+            // A retry presents the same token and the same payload again, so it
+            // meets the same rejection.
+            Self::IdempotentParameterMismatch { .. } => Class {
+                code: "IdempotentParameterMismatchException",
                 retry: Retry::Terminal,
             },
             // A 5xx: the request was never decided, which is exactly the class a
@@ -557,6 +587,30 @@ impl Error {
             table: table.to_string(),
             message: format!("condition `{expression}` evaluated to false"),
             item,
+        }
+    }
+
+    /// Build an `IdempotentParameterMismatchException`.
+    ///
+    /// The mock raises it when a `ClientRequestToken` is reused for a
+    /// transaction whose actions differ from the one that already consumed the
+    /// token, the way the service refuses a non-identical request that carries a
+    /// spent token.
+    ///
+    /// ```rust
+    /// use mock_ddb::Error;
+    ///
+    /// let error = Error::idempotent_parameter_mismatch();
+    /// assert_eq!(error.code(), "IdempotentParameterMismatchException");
+    /// // Terminal: a retry carries the same token and the same payload again.
+    /// assert!(!error.is_retryable());
+    /// ```
+    #[must_use]
+    pub fn idempotent_parameter_mismatch() -> Self {
+        Self::IdempotentParameterMismatch {
+            message: "The request uses the same client token as a previous, but non-identical \
+                      request."
+                .to_string(),
         }
     }
 
