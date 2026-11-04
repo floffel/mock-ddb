@@ -124,6 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | Reads | `query` and `scan` with `FilterExpression`, `ProjectionExpression`, `Limit`, `ExclusiveStartKey`, `ScanIndexForward`, `Select` (`ALL_ATTRIBUTES`, `COUNT`, `SPECIFIC_ATTRIBUTES`), index reads |
 | Parallel scan | `Segment` / `TotalSegments`, disjoint and complete |
 | Batches | `batch_write_item` (25 writes, duplicate-key detection), `batch_get_item` (100 keys, per-table projection) |
+| Capacity | `ReturnConsumedCapacity` (`NONE`/`TOTAL`/`INDEXES`) and `ReturnItemCollectionMetrics` (`SIZE`) on every data-plane operation, with the units computed from the stored items and split per table and per index |
 | Transactions | `transact_write_items` (100 actions: `Put`, `Update`, `Delete`, `ConditionCheck`; atomic; per-member cancellation reasons; `ClientRequestToken` idempotency), `transact_get_items` |
 | TTL | `update_time_to_live`, `describe_time_to_live`, lazy expiry on every read path, `purge_expired` |
 | Streams | one ordered log per table, `get_records`, `list_streams`, `NEW_IMAGE` / `OLD_IMAGE` / `NEW_AND_OLD_IMAGES` / `KEYS_ONLY` (feature `streams`, on by default) |
@@ -179,9 +180,16 @@ that changes what a caller must do is called out.
 
 1. **No table lifecycle.** `create_table` returns with `TableStatus = ACTIVE`;
    there is no `CREATING`/`DELETING` window to poll.
-2. **No capacity.** `ConsumedCapacity`, provisioned throughput, throttling and
-   `ProvisionedThroughputExceededException` are not modelled. `BillingMode` is
-   reported back, never enforced.
+2. **Capacity is reported, not enforced.** `ConsumedCapacity` is computed from
+   the item sizes the mock actually stores — one read unit per started 4 KiB of
+   an item read, one write unit per started 1 KiB of an item written, items the
+   filter rejected included, and a minimum of one unit per operation — and split
+   per table and per secondary index for `ReturnConsumedCapacity=INDEXES`.
+   `ItemCollectionMetrics` reports the collection a write touched, keyed by its
+   partition key and sized in whole gibibytes, for a table with a local
+   secondary index. Provisioned throughput, throttling,
+   `ProvisionedThroughputExceededException` and the 10 GB collection limit stay
+   unmodelled: `BillingMode` is reported back, never enforced.
 3. **Always strongly consistent.** `ConsistentRead` is accepted and ignored.
    Global-secondary-index reads are immediately consistent too; the service's
    eventual consistency is not simulated.
@@ -247,7 +255,6 @@ that changes what a caller must do is called out.
 - DAX, global tables, backups, point-in-time recovery, tags, resource policies.
 - `ConditionExpression` on `BatchWriteItem` (the service does not have one
   either) and `ReturnValues` on `BatchGetItem`.
-- `ConsumedCapacity` and `ItemCollectionMetrics` in every response.
 
 If you need one of these for a test, the mock is the wrong tool for that
 assertion — integration tests against DynamoDB Local or a real account still

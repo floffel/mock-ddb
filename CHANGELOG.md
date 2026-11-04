@@ -8,6 +8,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `ConsumedCapacity` and `ItemCollectionMetrics` on every data-plane response.
+  `PutItemRequest`, `GetItemRequest`, `DeleteItemRequest`, `UpdateItemRequest`,
+  `QueryRequest`, `ScanRequest`, `BatchWriteItemRequest`, `BatchGetItemRequest`,
+  `TransactWriteItemsRequest` and `TransactGetItemsRequest` take
+  `return_consumed_capacity` (`NONE`, `TOTAL`, `INDEXES`) and the writes also
+  take `return_item_collection_metrics` (`NONE`, `SIZE`), and the matching
+  outputs carry the result. The units are computed from the item sizes the mock
+  actually stores — one read unit per started 4 KiB of an item read, one write
+  unit per started 1 KiB of an item written, the larger image of a replace, one
+  unit minimum per operation and per key — and `INDEXES` splits them per table,
+  per local and per global secondary index, charging a sparse index only for the
+  items that reach it. `ItemCollectionMetrics` reports the collection key and a
+  whole-gibibyte size estimate for tables with a local secondary index, which is
+  the service's own rule. `read_units`, `write_units` and `size_estimate_range`
+  expose the arithmetic, `READ_UNIT_BYTES`, `WRITE_UNIT_BYTES` and
+  `COLLECTION_ESTIMATE_STEP_BYTES` the limits. Nothing is enforced: there is
+  still no provisioned throughput, no throttling and no 10 GB collection limit.
+  `MockDdb::transact_write_items` now returns `TransactWriteItemsOutput` instead
+  of `()` — a statement that discarded the value keeps compiling.
 - The DynamoDB Streams wire API, reached through `MockDdb::streams()`:
   `ListStreams`, `DescribeStream`, `GetShardIterator` and `GetRecords`, with
   paging cursors, the service's limits (`1..=100` streams and shards,
