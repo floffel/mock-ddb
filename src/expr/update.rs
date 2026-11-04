@@ -33,8 +33,7 @@ use super::path::{get_path, invalid_nested_path, remove_path, render, root, set_
 use crate::number::Number;
 use crate::schema::KeySchema;
 use crate::value::{
-    is_set, item_size, item_too_large, list_size, set_difference, set_union, type_name,
-    MAX_ITEM_SIZE,
+    item_size, item_too_large, list_size, set_difference, set_union, type_name, MAX_ITEM_SIZE,
 };
 use crate::{Error, Item, Result};
 
@@ -153,8 +152,16 @@ pub(crate) fn apply(
                     // subtracted from this value.
                     let remaining = set_difference(&current, &delta)
                         .ok_or_else(|| delete_type_error(&current))?;
+                    // A value the mock cannot classify is never "empty": that
+                    // answer removes the attribute outright, and it is the one
+                    // outcome that loses members nobody counted. Today
+                    // [`set_difference`] builds only the three known set types,
+                    // so the refusal answers for its extension rather than for
+                    // a state this code can reach.
+                    let drained = empty_set(&remaining)
+                        .ok_or_else(|| unclassified_set(&remaining, &rendered))?;
                     touched.insert(name);
-                    if is_empty_set(&remaining) {
+                    if drained {
                         mutations.push(Mutation::Remove(resolved));
                     } else {
                         mutations.push(Mutation::Set(resolved, remaining));
@@ -443,12 +450,18 @@ fn refuse_empty_set(is_empty: bool, kind: &str, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// `ADD` semantics: numbers add, sets union.
+/// `ADD` semantics: numbers add, sets of one member type union.
 ///
 /// The stored side is read here, so it is the one place a corrupt number in the
 /// item can surface: it is reported as the broken invariant it is rather than as
 /// the caller's mistake. The delta was parsed by [`validate_add_delta`], so its
 /// arm cannot fire; it is spelled out so a future caller cannot lose the class.
+///
+/// The set pairs are named here instead of being inferred from
+/// [`set_union`]'s `None`, because that `None` means "not a pair I handle" and
+/// what it handles grows with the SDK: the day it learns another set type, a
+/// value the update cannot read would start unioning instead of being refused.
+/// Naming the pairs keeps `ADD` closed to everything else.
 fn add_values(
     current: &AttributeValue,
     delta: &AttributeValue,
@@ -467,7 +480,12 @@ fn add_values(
                 || number_overflow(path, &format!("{left} + {right}")),
             )?))
         }
-        _ => set_union(current, delta).ok_or_else(|| add_type_error(delta)),
+        (AttributeValue::Ss(_), AttributeValue::Ss(_))
+        | (AttributeValue::Ns(_), AttributeValue::Ns(_))
+        | (AttributeValue::Bs(_), AttributeValue::Bs(_)) => {
+            set_union(current, delta).ok_or_else(|| add_type_error(delta))
+        }
+        _ => Err(add_type_error(delta)),
     }
 }
 
@@ -487,6 +505,20 @@ fn delete_type_error(offending: &AttributeValue) -> Error {
     Error::validation(format!(
         "Invalid UpdateExpression: Incorrect operand type for operator or function; operator: DELETE, operand type: {}",
         type_name(offending)
+    ))
+}
+
+/// The error for a stored value the update cannot subtract from because it is
+/// not one of the three set types — reached only if [`set_difference`] starts
+/// returning a shape [`empty_set`] does not know.
+///
+/// It is an internal error, not a `ValidationException`: the request was fine,
+/// the store handed back something the mock cannot read, and telling the caller
+/// to change its expression would hide that.
+fn unclassified_set(value: &AttributeValue, path: &str) -> Error {
+    Error::internal(format!(
+        "the item holds a {} at `{path}`, which is not a set the update can classify",
+        type_name(value)
     ))
 }
 
@@ -512,14 +544,25 @@ fn reject_key_attribute(name: &str, key_schema: &KeySchema) -> Result<()> {
     Ok(())
 }
 
-fn is_empty_set(value: &AttributeValue) -> bool {
+/// Whether a stored value is an empty set, or `None` if it is not a set this
+/// update can read.
+///
+/// The two answers used to be one: everything that is not `Ss`/`Ns`/`Bs` was
+/// reported as an *empty* set, which is the answer that removes the attribute.
+/// A variant a later SDK release adds — `AttributeValue` is `#[non_exhaustive]`
+/// — would therefore have been deleted wholesale the moment
+/// [`set_difference`] learned to subtract it. Keeping "not a set" apart from
+/// "an empty set" is what makes that fail closed.
+fn empty_set(value: &AttributeValue) -> Option<bool> {
     match value {
         // The three arms cannot merge: each set type has its own member type.
         #[allow(clippy::match_same_arms)]
-        AttributeValue::Ss(members) => members.is_empty(),
-        AttributeValue::Ns(members) => members.is_empty(),
-        AttributeValue::Bs(members) => members.is_empty(),
-        _ => !is_set(value),
+        AttributeValue::Ss(members) => Some(members.is_empty()),
+        AttributeValue::Ns(members) => Some(members.is_empty()),
+        AttributeValue::Bs(members) => Some(members.is_empty()),
+        // A scalar, a list, a map, a boolean, a null — or a variant that did
+        // not exist when this match was written.
+        _ => None,
     }
 }
 
@@ -1037,6 +1080,90 @@ mod tests {
         assert_eq!(
             target.get("absent"),
             Some(&AttributeValue::Ns(vec!["1".into()]))
+        );
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_set_is_never_reported_as_an_empty_set() {
+        // Just inside: each of the three set types answers for its own members.
+        assert_eq!(empty_set(&AttributeValue::Ss(Vec::new())), Some(true));
+        assert_eq!(
+            empty_set(&AttributeValue::Ss(vec!["a".into()])),
+            Some(false)
+        );
+        assert_eq!(
+            empty_set(&AttributeValue::Ns(vec!["1".into()])),
+            Some(false)
+        );
+        assert_eq!(
+            empty_set(&AttributeValue::Bs(vec![crate::Blob::new(vec![1])])),
+            Some(false)
+        );
+
+        // Just outside: every other shape is not a set, and "not a set" must
+        // not reach the caller as "empty" — that answer removes the attribute.
+        // A variant a later SDK release adds lands in this branch too.
+        for value in [
+            AttributeValue::S("x".into()),
+            AttributeValue::N("1".into()),
+            AttributeValue::B(crate::Blob::new(vec![1])),
+            AttributeValue::Bool(true),
+            AttributeValue::Null(true),
+            AttributeValue::L(Vec::new()),
+            AttributeValue::M(HashMap::new()),
+        ] {
+            assert_eq!(
+                empty_set(&value),
+                None,
+                "{} is not a set and must not be classified as one",
+                type_name(&value)
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_value_of_another_type_is_refused_instead_of_unioned() {
+        let strings = AttributeValue::Ss(vec!["a".into()]);
+
+        // Just inside: a stored set of the delta's own type unions.
+        let united = add_values(&AttributeValue::Ss(vec!["x".into()]), &strings, "tags").unwrap();
+        assert_eq!(united, AttributeValue::Ss(vec!["x".into(), "a".into()]));
+
+        // Just outside: a stored scalar, and a stored set of another member
+        // type, both name the operand the service holds responsible.
+        let error = add_values(&AttributeValue::S("x".into()), &strings, "tags").unwrap_err();
+        assert_eq!(error.code(), "ValidationException");
+        assert!(
+            error
+                .to_string()
+                .contains("operator: ADD, operand type: SS"),
+            "unexpected error: {error}"
+        );
+
+        let numbers = AttributeValue::Ns(vec!["1".into()]);
+        let error = add_values(&strings, &numbers, "tags").unwrap_err();
+        assert_eq!(error.code(), "ValidationException");
+        assert!(
+            error
+                .to_string()
+                .contains("operator: ADD, operand type: NS"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn an_unclassifiable_stored_value_is_an_internal_error() {
+        // The guard that keeps a DELETE from removing an attribute whose
+        // remaining members nobody counted. It is unreachable while
+        // `set_difference` builds only the three known set types, so it is
+        // exercised here rather than through an expression.
+        let error = unclassified_set(&AttributeValue::Bool(true), "tags");
+        assert_eq!(error.code(), "InternalServerError");
+        assert!(
+            error.to_string().contains(
+                "the item holds a BOOL at `tags`, which is not a set the update can classify"
+            ),
+            "unexpected error: {error}"
         );
     }
 
