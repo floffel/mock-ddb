@@ -397,10 +397,10 @@ mod tests {
         item.insert("pk".into(), s("a"));
         item.insert(
             "profile".into(),
-            AttributeValue::M(HashMap::from([(
-                "city".to_string(),
-                AttributeValue::S("Berlin".into()),
-            )])),
+            AttributeValue::M(HashMap::from([
+                ("city".to_string(), AttributeValue::S("Berlin".into())),
+                ("country".to_string(), AttributeValue::S("DE".into())),
+            ])),
         );
         item.insert("tags".into(), AttributeValue::L(vec![s("x"), s("y")]));
         item
@@ -506,9 +506,19 @@ mod tests {
                 ],
             ],
         );
-        assert_eq!(projected.len(), 2);
-        assert!(projected.contains_key("pk"));
-        assert!(!projected.contains_key("tags"));
+        // The whole item, not just the key set: a projection that kept an
+        // extra key inside `profile` or widened `tags` into the result would
+        // still satisfy a `len` check.
+        assert_eq!(
+            projected,
+            Item::from([
+                ("pk".to_string(), s("a")),
+                (
+                    "profile".to_string(),
+                    AttributeValue::M(HashMap::from([("city".to_string(), s("Berlin"),)])),
+                ),
+            ])
+        );
         assert_eq!(
             get_path(
                 &projected,
@@ -710,6 +720,92 @@ mod tests {
             ]),
         );
         item
+    }
+
+    /// An item that already carries every parent `path` needs, with a
+    /// placeholder where the path ends, so a write at `path` must succeed.
+    fn skeleton(path: &[Segment]) -> Item {
+        match path.split_first() {
+            Some((Segment::Name(root), rest)) => Item::from([(root.clone(), container(rest))]),
+            _ => Item::new(),
+        }
+    }
+
+    /// The container a path's remaining steps need: maps and lists down to the
+    /// last step, with a placeholder below it.
+    fn container(segments: &[Segment]) -> AttributeValue {
+        match segments.split_first() {
+            None => s("placeholder"),
+            Some((Segment::Name(name), rest)) => {
+                AttributeValue::M(HashMap::from([(name.clone(), container(rest))]))
+            }
+            Some((Segment::Index(index), rest)) => {
+                let mut elements: Vec<AttributeValue> = (0..=*index)
+                    .map(|_| AttributeValue::M(HashMap::new()))
+                    .collect();
+                elements[*index] = container(rest);
+                AttributeValue::L(elements)
+            }
+        }
+    }
+
+    /// A name a key or a path segment may carry: plain, empty, dotted,
+    /// bracketed, aliased or non-ASCII.
+    fn arbitrary_name() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "[a-zA-Z0-9 _üöä-]{0,6}",
+            Just(String::new()),
+            Just("a.b".to_string()),
+            Just("a[0]".to_string()),
+            Just("Grüße".to_string()),
+            Just("#alias".to_string()),
+            Just(":value".to_string()),
+        ]
+    }
+
+    /// One path step: an arbitrary name, or an index that reaches just inside
+    /// and just past a list of up to four elements.
+    fn arbitrary_segment() -> impl Strategy<Value = Segment> {
+        prop_oneof![
+            2 => arbitrary_name().prop_map(Segment::Name),
+            1 => (0_usize..5).prop_map(Segment::Index),
+        ]
+    }
+
+    /// A value an item may hold: leaves, and containers built from them.
+    fn arbitrary_value() -> impl Strategy<Value = AttributeValue> {
+        let leaf = prop_oneof![
+            arbitrary_name().prop_map(AttributeValue::S),
+            (-1_000_i64..1_000).prop_map(|value| n(value.to_string())),
+            any::<bool>().prop_map(AttributeValue::Bool),
+            Just(AttributeValue::Null(true)),
+        ];
+        leaf.prop_recursive(2, 4, 4, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..3).prop_map(AttributeValue::L),
+                prop::collection::hash_map(arbitrary_name(), inner, 0..3)
+                    .prop_map(AttributeValue::M),
+            ]
+        })
+    }
+
+    /// An item with up to three attributes of any shape.
+    fn arbitrary_item() -> impl Strategy<Value = Item> {
+        prop::collection::hash_map(arbitrary_name(), arbitrary_value(), 0..3)
+    }
+
+    /// An arbitrary path that starts at an attribute name, as every path that
+    /// reaches this module does.
+    fn arbitrary_named_path() -> impl Strategy<Value = Vec<Segment>> {
+        (
+            arbitrary_name().prop_map(Segment::Name),
+            prop::collection::vec(arbitrary_segment(), 0..4),
+        )
+            .prop_map(|(root, rest)| {
+                let mut path = vec![root];
+                path.extend(rest);
+                path
+            })
     }
 
     #[test]
@@ -994,6 +1090,168 @@ mod tests {
             prop_assume!(!rendered_left.ends_with(TRUNCATION_MARK));
             prop_assume!(!rendered_right.ends_with(TRUNCATION_MARK));
             prop_assert_ne!(rendered_left, rendered_right);
+        }
+
+        /// A write either lands where it says, or it fails before touching the
+        /// item: a rejected path never leaves half an update behind.
+        #[test]
+        fn a_write_reads_back_or_leaves_the_item_alone(
+            mut item in arbitrary_item(),
+            path in prop::collection::vec(arbitrary_segment(), 0..4),
+            value in arbitrary_value(),
+        ) {
+            let before = item.clone();
+            match set_path(&mut item, &path, value.clone()) {
+                Ok(()) => prop_assert_eq!(get_path(&item, &path), Some(&value)),
+                Err(error) => {
+                    prop_assert_eq!(error.code(), "ValidationException");
+                    prop_assert_eq!(&item, &before);
+                }
+            }
+        }
+
+        /// For a path the item carries, `/set/` then `/get/` returns the value
+        /// just written — for maps, lists, empty and non-ASCII names alike.
+        #[test]
+        fn a_path_the_item_carries_reads_back_after_a_write(
+            path in arbitrary_named_path(),
+            value in arbitrary_value(),
+        ) {
+            let mut item = skeleton(&path);
+            set_path(&mut item, &path, value.clone()).unwrap();
+            prop_assert_eq!(get_path(&item, &path), Some(&value));
+            // Writing twice is the same as writing once.
+            let once = item.clone();
+            set_path(&mut item, &path, value).unwrap();
+            prop_assert_eq!(&item, &once);
+        }
+
+        /// A removal a map key ends is a no-op when repeated, and the key reads
+        /// absent afterwards even when the path runs through lists.
+        #[test]
+        fn a_removal_that_ends_at_a_name_leaves_it_absent_and_repeats_harmlessly(
+            mut item in arbitrary_item(),
+            prefix in prop::collection::vec(arbitrary_segment(), 0..3),
+            name in arbitrary_name(),
+        ) {
+            let mut path = prefix;
+            path.push(Segment::Name(name));
+            remove_path(&mut item, &path);
+            prop_assert!(get_path(&item, &path).is_none());
+            let once = item.clone();
+            remove_path(&mut item, &path);
+            prop_assert_eq!(&item, &once);
+        }
+
+        /// A removal a list index ends takes out exactly one element — and none
+        /// when the index is past the end.
+        #[test]
+        fn a_removal_that_ends_at_an_index_takes_out_one_element(
+            values in prop::collection::vec(arbitrary_value(), 0..4),
+            index in 0_usize..5,
+        ) {
+            let mut item = Item::new();
+            item.insert("rows".into(), AttributeValue::L(values.clone()));
+            remove_path(&mut item, &[name("rows"), Segment::Index(index)]);
+            let mut expected = values;
+            if index < expected.len() {
+                expected.remove(index);
+            }
+            let remaining = item.get("rows").and_then(|value| value.as_l().ok());
+            prop_assert_eq!(remaining, Some(&expected));
+        }
+
+        /// Naming every root selects the whole item: a projection of all
+        /// top-level attributes is the item itself.
+        #[test]
+        fn a_projection_of_every_root_returns_the_item(item in arbitrary_item()) {
+            let roots: Vec<Vec<Segment>> = item
+                .keys()
+                .map(|key| vec![Segment::Name(key.clone())])
+                .collect();
+            let paths: Vec<&[Segment]> = roots.iter().map(Vec::as_slice).collect();
+            prop_assert_eq!(&project(&item, &paths), &item);
+        }
+
+        /// A projection only ever selects attributes the item carries; it never
+        /// invents a key, whatever the paths name.
+        #[test]
+        fn a_projection_keeps_only_roots_the_item_carries(
+            item in arbitrary_item(),
+            paths in prop::collection::vec(
+                prop::collection::vec(arbitrary_segment(), 0..4),
+                0..4,
+            ),
+        ) {
+            let paths: Vec<&[Segment]> = paths.iter().map(Vec::as_slice).collect();
+            for key in project(&item, &paths).keys() {
+                prop_assert!(item.contains_key(key), "projection invented a key");
+            }
+        }
+
+        /// Projecting name-only paths again changes nothing: the second pass
+        /// finds exactly what the first kept. (A list index is excluded: the
+        /// projection compacts the list, so the index points elsewhere after.)
+        #[test]
+        fn a_projection_of_name_paths_is_idempotent(
+            item in arbitrary_item(),
+            paths in prop::collection::vec(
+                prop::collection::vec(arbitrary_name().prop_map(Segment::Name), 0..3),
+                0..3,
+            ),
+        ) {
+            let paths: Vec<&[Segment]> = paths.iter().map(Vec::as_slice).collect();
+            let once = project(&item, &paths);
+            prop_assert_eq!(&project(&once, &paths), &once);
+        }
+
+        /// The list index boundary: the last element inside is writable, the
+        /// first one past the end is rejected and names the path that failed.
+        #[test]
+        fn a_write_at_the_last_index_succeeds_and_one_past_it_fails(
+            values in prop::collection::vec(arbitrary_value(), 0..4),
+        ) {
+            let mut item = Item::new();
+            item.insert("rows".into(), AttributeValue::L(values.clone()));
+            if values.is_empty() {
+                // No element inside, so even index 0 is past the end.
+                prop_assert!(set_path(&mut item, &[name("rows"), index(0)], s("x")).is_err());
+            } else {
+                let inside = [name("rows"), index(values.len() - 1)];
+                set_path(&mut item, &inside, s("x")).unwrap();
+                prop_assert_eq!(get_path(&item, &inside), Some(&s("x")));
+
+                let outside = [name("rows"), index(values.len())];
+                let error = set_path(&mut item, &outside, s("x")).unwrap_err();
+                let needle = format!("rows[{}]", values.len());
+                prop_assert!(error.to_string().contains(&needle));
+                prop_assert!(get_path(&item, &outside).is_none());
+                prop_assert_eq!(get_path(&item, &inside), Some(&s("x")));
+            }
+        }
+
+        /// For the paths the grammar itself can spell — plain names and list
+        /// indices — the rendered text parses back to the same segments, so a
+        /// message names the path the request contained. Names the grammar
+        /// cannot spell need `#alias`, and the renderer quotes those, which is
+        /// why the round trip only covers the spellable ones.
+        #[test]
+        fn a_rendered_path_parses_back_to_the_same_segments(
+            root in "[a-zA-Z0-9_]{1,4}",
+            rest in prop::collection::vec(
+                prop_oneof![
+                    "[a-zA-Z0-9_]{1,4}".prop_map(Segment::Name),
+                    (0_usize..10).prop_map(Segment::Index),
+                ],
+                0..3,
+            ),
+        ) {
+            let mut path = vec![Segment::Name(root)];
+            path.extend(rest);
+            let rendered = render(&path);
+            prop_assume!(!rendered.ends_with(TRUNCATION_MARK));
+            let parsed = crate::expr::parse::parse_projection(&rendered).unwrap();
+            prop_assert_eq!(parsed, vec![path]);
         }
     }
 
