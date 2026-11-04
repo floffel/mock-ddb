@@ -728,20 +728,24 @@ fn cancellation_reason_edges_between_variants() {
         reasons: vec![reason.clone()],
     };
     assert_eq!(cancelled.cancellation_reasons(), [reason]);
-    assert!(Error::TransactionCanceled {
-        message: "cancelled".to_string(),
-        reasons: Vec::new(),
-    }
-    .cancellation_reasons()
-    .is_empty());
-    assert!(Error::validation("bad").cancellation_reasons().is_empty());
-    assert!(Error::ConditionalCheckFailed {
-        table: "users".to_string(),
-        message: "condition failed".to_string(),
-        item: None,
-    }
-    .cancellation_reasons()
-    .is_empty());
+    assert_eq!(
+        Error::TransactionCanceled {
+            message: "cancelled".to_string(),
+            reasons: Vec::new(),
+        }
+        .cancellation_reasons(),
+        []
+    );
+    assert_eq!(Error::validation("bad").cancellation_reasons(), []);
+    assert_eq!(
+        Error::ConditionalCheckFailed {
+            table: "users".to_string(),
+            message: "condition failed".to_string(),
+            item: None,
+        }
+        .cancellation_reasons(),
+        []
+    );
 }
 
 /// The clock surface is total over its input range: an instant past the last

@@ -3,6 +3,8 @@
 
 mod common;
 
+use std::collections::BTreeMap;
+
 use common::{orders, users};
 use mock_ddb::{
     item, n, s, values, BatchGetItemRequest, BatchWriteItemRequest, Capacity, CreateTableRequest,
@@ -291,7 +293,7 @@ async fn a_query_charges_every_item_it_examines_including_filtered_ones() {
         )
         .await
         .unwrap();
-    assert!(counted.items.is_empty());
+    assert_eq!(counted.items, []);
     assert!(same(
         counted.consumed_capacity.unwrap().capacity_units.unwrap(),
         3.0
@@ -349,8 +351,9 @@ async fn a_sparse_index_an_item_does_not_reach_is_not_charged() {
         .consumed_capacity
         .unwrap();
     assert!(same(capacity.capacity_units.unwrap(), 1.0));
-    assert!(
-        capacity.global_secondary_indexes.is_empty(),
+    assert_eq!(
+        capacity.global_secondary_indexes,
+        BTreeMap::new(),
         "an item without the index key costs the index nothing"
     );
 }
