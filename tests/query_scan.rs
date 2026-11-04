@@ -774,7 +774,7 @@ async fn a_projection_is_validated_before_any_item_is_read() {
         .await
         .unwrap();
     assert_eq!(page.count, 0);
-    assert!(page.items.is_empty());
+    assert_eq!(page.items.len(), 0);
 }
 
 #[tokio::test]
