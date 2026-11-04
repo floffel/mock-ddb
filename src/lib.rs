@@ -191,8 +191,70 @@ pub fn item_to_value(item: Item) -> AttributeValue {
     AttributeValue::M(item)
 }
 
-/// Unwrap an `AttributeValue::M` back into an item. Returns `None` for any
-/// other value type, so a caller cannot mistake a scalar for a document.
+/// Borrow the map behind an `AttributeValue::M` as an item, without copying it.
+/// Returns `None` for any other value type, so a caller cannot mistake a
+/// scalar for a document.
+///
+/// This is the form to use when reading: the borrow keeps the attribute alive
+/// and hands out the stored entries themselves, so inspecting an attribute of
+/// any size costs nothing. The embedded document is whatever the caller stored;
+/// neither this function nor [`into_item`] validates its size or its nesting
+/// depth.
+///
+/// ```
+/// use mock_ddb::{s, item_ref_from_value, AttributeValue};
+///
+/// let document = AttributeValue::M(std::collections::HashMap::from([(
+///     "pk".to_string(),
+///     s("u#1"),
+/// )]));
+/// assert_eq!(
+///     item_ref_from_value(&document).and_then(|item| item.get("pk")),
+///     Some(&s("u#1"))
+/// );
+/// assert!(item_ref_from_value(&AttributeValue::Null(true)).is_none());
+/// ```
+#[must_use]
+pub fn item_ref_from_value(value: &AttributeValue) -> Option<&Item> {
+    match value {
+        AttributeValue::M(entries) => Some(entries),
+        _ => None,
+    }
+}
+
+/// Consume an `AttributeValue::M` and take ownership of the item it holds.
+/// Returns `None` for any other value type, so a caller cannot mistake a
+/// scalar for a document.
+///
+/// Unlike [`item_from_value`] this moves the map out of the value instead of
+/// cloning it, so unwrapping a document the caller already owns is free. The
+/// size and nesting depth of the document are the caller's to bound — neither
+/// this function nor [`item_ref_from_value`] validates them.
+///
+/// ```
+/// use mock_ddb::{item_to_value, into_item, item, s};
+///
+/// let wrapped = item_to_value(item([("pk", s("u#1"))]));
+/// assert_eq!(into_item(wrapped).map(|item| item.len()), Some(1));
+/// assert!(into_item(s("scalar")).is_none());
+/// ```
+#[must_use]
+pub fn into_item(value: AttributeValue) -> Option<Item> {
+    match value {
+        AttributeValue::M(entries) => Some(entries),
+        _ => None,
+    }
+}
+
+/// Unwrap an `AttributeValue::M` back into an owned item, cloning it. Returns
+/// `None` for any other value type, so a caller cannot mistake a scalar for a
+/// document.
+///
+/// The clone copies the whole subtree the document holds, nested documents and
+/// binary payloads included, so a read path that only inspects an attribute
+/// wants [`item_ref_from_value`], and a value the caller already owns wants
+/// [`into_item`]. Neither form validates the size or the nesting depth of the
+/// document.
 ///
 /// ```
 /// use mock_ddb::{s, item_from_value, AttributeValue};
@@ -206,10 +268,7 @@ pub fn item_to_value(item: Item) -> AttributeValue {
 /// ```
 #[must_use]
 pub fn item_from_value(value: &AttributeValue) -> Option<Item> {
-    match value {
-        AttributeValue::M(entries) => Some(entries.clone()),
-        _ => None,
-    }
+    item_ref_from_value(value).cloned()
 }
 
 #[cfg(test)]
@@ -223,5 +282,56 @@ mod tests {
         assert!(matches!(wrapped, AttributeValue::M(_)));
         assert_eq!(item_from_value(&wrapped), Some(record));
         assert_eq!(item_from_value(&s("scalar")), None);
+    }
+
+    #[test]
+    fn item_ref_borrows_the_stored_entries_instead_of_copying_them() {
+        let record = request::item([
+            ("pk", s("u#1")),
+            (
+                "nested",
+                item_to_value(request::item([("inner", s("deep"))])),
+            ),
+            ("blob", AttributeValue::B(Blob::new(vec![0_u8; 64]))),
+        ]);
+        let wrapped = item_to_value(record.clone());
+        assert_eq!(item_ref_from_value(&wrapped), Some(&record));
+
+        let AttributeValue::M(entries) = &wrapped else {
+            panic!("item_to_value must produce a document");
+        };
+        // The borrowed form hands out the entries the value itself holds, so a
+        // read allocates no second document; `into_item` moves them out (a
+        // `HashMap` moves), which the content check below pins down.
+        assert!(std::ptr::eq(
+            item_ref_from_value(&wrapped).expect("a document"),
+            entries
+        ));
+
+        let owned = into_item(wrapped).expect("a document");
+        assert_eq!(owned, record);
+    }
+
+    #[test]
+    fn every_accessor_rejects_a_non_document_and_accepts_an_empty_one() {
+        let empty = AttributeValue::M(HashMap::new());
+        assert_eq!(item_ref_from_value(&empty), Some(&Item::default()));
+        assert_eq!(into_item(empty.clone()), Some(Item::default()));
+        assert_eq!(item_from_value(&empty), Some(Item::default()));
+
+        let not_a_document = [
+            s("scalar"),
+            n("2"),
+            AttributeValue::Null(true),
+            AttributeValue::Bool(false),
+            AttributeValue::L(Vec::new()),
+            AttributeValue::Ss(Vec::new()),
+            AttributeValue::B(Blob::new(Vec::new())),
+        ];
+        for value in &not_a_document {
+            assert_eq!(item_ref_from_value(value), None, "{value:?}");
+            assert_eq!(into_item(value.clone()), None, "{value:?}");
+            assert_eq!(item_from_value(value), None, "{value:?}");
+        }
     }
 }

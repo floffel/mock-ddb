@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `item_ref_from_value` borrows the map behind an `AttributeValue::M` and
+  `into_item` takes ownership of it, so reading a document attribute no longer
+  has to clone it: `item_from_value` copies the whole subtree, nested documents
+  and binary payloads included, and was the only way to read one back. All three
+  return `None` for any other value type and none of them bounds the size or the
+  nesting depth of the document they hand out.
 - PartiQL: `MockDdb::execute_statement` and `MockDdb::batch_execute_statement`
   accept `SELECT`, `INSERT`, `UPDATE` and `DELETE` (`BatchExecuteStatement` takes
   1–25 statements, all reads or all writes), with positional `?` parameters,
