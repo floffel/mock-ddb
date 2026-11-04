@@ -1262,4 +1262,327 @@ mod tests {
         let touched = super::apply(&empty, &mut target, &context, &key_schema()).unwrap();
         assert_eq!(touched.len(), 0);
     }
+
+    // The two invariants the module documents hold for *every* input, not for
+    // the examples above: each right-hand side reads the snapshot taken before
+    // the first clause, and the source order of the writes cannot change the
+    // result. Asserting them over generated input is the point of the block
+    // below — a hand-written example can only ever show one path through them.
+
+    use proptest::prelude::*;
+
+    /// A value the update can read, small enough to stay far from every limit.
+    fn stored_value() -> impl Strategy<Value = AttributeValue> {
+        prop_oneof![
+            "[a-z]{0,8}".prop_map(s),
+            small_number().prop_map(n),
+            prop::collection::vec(any::<u8>(), 0..4)
+                .prop_map(|bytes| AttributeValue::B(crate::Blob::new(bytes))),
+            prop::collection::vec("[a-z]{1,4}", 0..3)
+                .prop_map(|members| { AttributeValue::L(members.iter().map(s).collect()) }),
+            member_set(),
+        ]
+    }
+
+    /// A number the mock can read and render, far enough inside the service's
+    /// range that adding two of them cannot leave it.
+    fn small_number() -> impl Strategy<Value = String> {
+        (-1_000_000_i64..1_000_000).prop_map(|value| value.to_string())
+    }
+
+    /// A set of distinct members of one type: a set never holds a member twice,
+    /// and one with no members is refused on write.
+    fn member_set() -> impl Strategy<Value = AttributeValue> {
+        let strings = prop::collection::hash_set("[a-z]{1,6}", 1..5)
+            .prop_map(|members| AttributeValue::Ss(members.into_iter().collect()));
+        let numbers = prop::collection::hash_set(-1_000_i64..1_000, 1..5)
+            .prop_map(|members| AttributeValue::Ns(members.iter().map(i64::to_string).collect()));
+        let binaries = prop::collection::hash_set(prop::collection::vec(any::<u8>(), 1..4), 1..5)
+            .prop_map(|members| {
+                AttributeValue::Bs(members.into_iter().map(crate::Blob::new).collect())
+            });
+        prop_oneof![strings, numbers, binaries]
+    }
+
+    /// Two non-empty sets of one member type: the stored one and the delta an
+    /// `ADD` or `DELETE` would carry.
+    fn same_type_sets() -> impl Strategy<Value = (AttributeValue, AttributeValue)> {
+        (
+            0_usize..3,
+            prop::collection::hash_set("[a-z]{1,6}", 1..4),
+            prop::collection::hash_set("[a-z]{1,3}", 1..3),
+            prop::collection::hash_set(1_i64..1_000, 1..4),
+            prop::collection::hash_set(1_i64..1_000, 1..3),
+            prop::collection::hash_set(prop::collection::vec(any::<u8>(), 1..4), 1..4),
+            prop::collection::hash_set(prop::collection::vec(any::<u8>(), 1..4), 1..3),
+        )
+            .prop_map(
+                |(
+                    kind,
+                    stored_text,
+                    delta_text,
+                    stored_number,
+                    delta_number,
+                    stored_binary,
+                    delta_binary,
+                )| match kind {
+                    0 => (
+                        AttributeValue::Ss(stored_text.into_iter().collect()),
+                        AttributeValue::Ss(delta_text.into_iter().collect()),
+                    ),
+                    1 => (
+                        AttributeValue::Ns(stored_number.iter().map(i64::to_string).collect()),
+                        AttributeValue::Ns(delta_number.iter().map(i64::to_string).collect()),
+                    ),
+                    _ => (
+                        AttributeValue::Bs(
+                            stored_binary.into_iter().map(crate::Blob::new).collect(),
+                        ),
+                        AttributeValue::Bs(
+                            delta_binary.into_iter().map(crate::Blob::new).collect(),
+                        ),
+                    ),
+                },
+            )
+    }
+
+    /// Whether one set holds every member of the other.
+    fn covers(left: &AttributeValue, right: &AttributeValue) -> bool {
+        set_difference(right, left).and_then(|remaining| empty_set(&remaining)) == Some(true)
+    }
+
+    /// The clauses [`clause_order_cannot_change_the_result`] permutes: three
+    /// writes and one read of a value written by another clause, so a snapshot
+    /// taken after the first write instead of before it would show.
+    fn order_clauses() -> Vec<UpdateClause> {
+        let path = |name: &str| vec![Segment::Name(name.to_string())];
+        let assigned = |name: &str, value: &str| {
+            UpdateClause::Set(vec![(
+                path(name),
+                SetValue::Operand(Operand::Value(value.to_string())),
+            )])
+        };
+        vec![
+            assigned("a", "x"),
+            assigned("b", "y"),
+            UpdateClause::Set(vec![(
+                path("snapshot"),
+                SetValue::Operand(Operand::Path(path("a"))),
+            )]),
+            UpdateClause::Remove(vec![path("d")]),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Two assignments that name each other swap, because both right-hand
+        /// sides read the item as it was before the first clause.
+        #[test]
+        fn a_snapshot_swap_exchanges_both_attributes(
+            first in stored_value(),
+            second in stored_value(),
+        ) {
+            let update = parse_update("SET a = b, b = a").unwrap();
+            let values = ValueMap::new();
+            let context = Ctx {
+                names: &NameMap::new(),
+                values: &values,
+            };
+            let mut target = item([("pk", s("a")), ("a", first.clone()), ("b", second.clone())]);
+            super::apply(&update, &mut target, &context, &key_schema()).unwrap();
+            prop_assert_eq!(target.get("a"), Some(&second));
+            prop_assert_eq!(target.get("b"), Some(&first));
+
+            // Just outside: with the second attribute absent there is nothing
+            // to swap, so the reference is refused and the item is untouched.
+            let mut target = item([("pk", s("a")), ("a", first.clone())]);
+            let original = target.clone();
+            let error = super::apply(&update, &mut target, &context, &key_schema()).unwrap_err();
+            prop_assert_eq!(error.code(), "ValidationException");
+            prop_assert_eq!(target, original);
+        }
+
+        /// Source order cannot change the result: overlapping paths were
+        /// rejected, so the writes are independent and any permutation of the
+        /// clauses lands the same item — including the clause that reads `a`
+        /// after another clause has written it.
+        #[test]
+        fn clause_order_cannot_change_the_result(
+            first in stored_value(),
+            second in stored_value(),
+            keys in prop::collection::vec(0_usize..4, 4),
+        ) {
+            // Sort the positions by their key: the result is a permutation of
+            // the four clauses, not a selection that may repeat one of them.
+            let mut ordered: Vec<(usize, usize)> = keys.into_iter().zip(0..4).collect();
+            ordered.sort_unstable();
+            let base = order_clauses();
+            let clauses: Vec<UpdateClause> = ordered
+                .iter()
+                .map(|(_, index)| base[*index].clone())
+                .collect();
+            let values = crate::values([(":x", s("written")), (":y", second.clone())]);
+            let context = Ctx {
+                names: &NameMap::new(),
+                values: &values,
+            };
+            let mut target = item([
+                ("pk", s("a")),
+                ("a", first.clone()),
+                ("b", second.clone()),
+                ("d", s("gone")),
+            ]);
+            super::apply(&Update { clauses }, &mut target, &context, &key_schema()).unwrap();
+            prop_assert_eq!(target.get("a"), Some(&s("written")));
+            prop_assert_eq!(target.get("b"), Some(&second));
+            // Out of the snapshot, not out of the write that ran before it.
+            prop_assert_eq!(target.get("snapshot"), Some(&first));
+            prop_assert!(!target.contains_key("d"));
+        }
+
+        /// Addition of two numbers commutes, in the result as well as in the
+        /// rendering: both sides go through the same exact decimal sum.
+        #[test]
+        fn number_addition_is_commutative(
+            first in small_number(),
+            second in small_number(),
+        ) {
+            prop_assert_eq!(
+                add_values(&n(&first), &n(&second), "count"),
+                add_values(&n(&second), &n(&first), "count"),
+            );
+        }
+
+        /// `SET total = total + :a` followed by `- :a` is the value it started
+        /// with: the two steps run on exact decimals, so nothing is rounded
+        /// away in between.
+        #[test]
+        fn subtraction_inverts_addition(
+            first in small_number(),
+            second in small_number(),
+        ) {
+            let left = Evaluated {
+                value: n(&first),
+                origin: Origin::Request,
+            };
+            let right = Evaluated {
+                value: n(&second),
+                origin: Origin::Request,
+            };
+            let sum = arithmetic(&left, &right, ArithOp::Add, "total").unwrap();
+            let back = arithmetic(&sum, &right, ArithOp::Sub, "total").unwrap();
+            let restored = match &back.value {
+                AttributeValue::N(text) => Number::parse(text),
+                other => {
+                    prop_assert!(false, "arithmetic produced {:?}", other);
+                    return Ok(());
+                }
+            };
+            prop_assert_eq!(restored, Number::parse(&first));
+        }
+
+        /// A set that gains members and loses them again is the set it was:
+        /// the delta is exactly what the `DELETE` takes back.
+        #[test]
+        fn delete_after_add_restores_the_set((stored, delta) in same_type_sets()) {
+            let united = add_values(&stored, &delta, "members").unwrap();
+            let remaining = set_difference(&united, &delta).unwrap();
+            prop_assert_eq!(remaining, stored);
+        }
+
+        /// A union holds the same members whichever side comes first; only the
+        /// order they were appended in can differ.
+        #[test]
+        fn set_union_is_commutative((left, right) in same_type_sets()) {
+            let forward = add_values(&left, &right, "members").unwrap();
+            let backward = add_values(&right, &left, "members").unwrap();
+            prop_assert!(
+                covers(&forward, &backward) && covers(&backward, &forward),
+                "{:?} and {:?} hold different members",
+                forward,
+                backward
+            );
+        }
+
+        /// "Not a set" and "an empty set" stay apart for every value shape: the
+        /// second answer removes the attribute it is applied to.
+        #[test]
+        fn empty_set_classifies_only_sets(
+            value in prop_oneof![
+                stored_value(),
+                Just(AttributeValue::Ss(Vec::new())),
+                Just(AttributeValue::Ns(Vec::new())),
+                Just(AttributeValue::Bs(Vec::new())),
+            ],
+        ) {
+            match &value {
+                AttributeValue::Ss(members) => {
+                    prop_assert_eq!(empty_set(&value), Some(members.is_empty()));
+                }
+                AttributeValue::Ns(members) => {
+                    prop_assert_eq!(empty_set(&value), Some(members.is_empty()));
+                }
+                AttributeValue::Bs(members) => {
+                    prop_assert_eq!(empty_set(&value), Some(members.is_empty()));
+                }
+                _ => prop_assert_eq!(empty_set(&value), None),
+            }
+        }
+
+        /// `if_not_exists` prefers the stored value and falls back only where
+        /// the attribute is absent — the pair of items the function exists for.
+        #[test]
+        fn if_not_exists_prefers_the_stored_value(
+            existing in stored_value(),
+            fallback in stored_value(),
+        ) {
+            let update = parse_update("SET v = if_not_exists(v, :fallback)").unwrap();
+            let values = crate::values([(":fallback", fallback.clone())]);
+            let context = Ctx {
+                names: &NameMap::new(),
+                values: &values,
+            };
+
+            let mut present = item([("pk", s("a")), ("v", existing.clone())]);
+            super::apply(&update, &mut present, &context, &key_schema()).unwrap();
+            prop_assert_eq!(present.get("v"), Some(&existing));
+
+            let mut absent = item([("pk", s("a"))]);
+            super::apply(&update, &mut absent, &context, &key_schema()).unwrap();
+            prop_assert_eq!(absent.get("v"), Some(&fallback));
+        }
+
+        /// `rows[i]` is just inside the list up to its length and past the end
+        /// from there; the refusal must leave the item exactly as it was, and
+        /// the clause that wrote before it must not stick either.
+        #[test]
+        fn an_index_at_the_end_is_refused_and_leaves_the_item(
+            length in 0_usize..4,
+            index in 0_usize..5,
+        ) {
+            let mut target = item([
+                ("pk", s("a")),
+                ("rows", AttributeValue::L(vec![s("x"); length])),
+            ]);
+            let original = target.clone();
+            let values = crate::values([(":v", s("new"))]);
+            let expression = format!("SET marker = :v, rows[{index}] = :v");
+            let outcome = apply(&expression, &mut target, &values);
+            if index < length {
+                prop_assert!(outcome.is_ok(), "{outcome:?}");
+                prop_assert_eq!(target.get("marker"), Some(&s("new")));
+                prop_assert_eq!(
+                    get_path(
+                        &target,
+                        &[Segment::Name("rows".into()), Segment::Index(index)],
+                    ),
+                    Some(&s("new")),
+                );
+            } else {
+                prop_assert_eq!(outcome.unwrap_err().code(), "ValidationException");
+                prop_assert_eq!(target, original);
+            }
+        }
+    }
 }

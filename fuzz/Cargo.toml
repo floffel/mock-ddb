@@ -35,5 +35,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "update_apply"
+path = "fuzz_targets/update_apply.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]
