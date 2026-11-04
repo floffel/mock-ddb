@@ -1,0 +1,1 @@
+DELETE FROM "users" WHERE pk = ? AND sk BETWEEN ? AND ?

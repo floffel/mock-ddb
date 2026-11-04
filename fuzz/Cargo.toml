@@ -28,5 +28,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "parse_partiql"
+path = "fuzz_targets/parse_partiql.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

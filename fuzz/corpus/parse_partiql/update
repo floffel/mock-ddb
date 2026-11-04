@@ -1,0 +1,1 @@
+UPDATE "users" SET a = a + ? REMOVE b WHERE pk = ? AND begins_with(sk, ?)

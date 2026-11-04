@@ -117,6 +117,18 @@ pub enum Error {
         message: String,
     },
 
+    /// A PartiQL `INSERT` met an item that already holds the insert's primary
+    /// key.
+    ///
+    /// `INSERT` is not `PutItem`: it refuses to overwrite, so the mock reports
+    /// the class the service reports instead of silently replacing the row. The
+    /// native [`put_item`](crate::MockDdb::put_item) never raises it.
+    #[error("{message}")]
+    DuplicateItem {
+        /// The message the service would have returned.
+        message: String,
+    },
+
     /// An invariant of the mock itself was violated. Reaching this is a bug in
     /// `mock-ddb`, not a property of the request.
     ///
@@ -181,6 +193,14 @@ impl PartialEq for Error {
                     message: left_message,
                 },
                 Self::ItemCollectionSizeLimitExceeded {
+                    message: right_message,
+                },
+            )
+            | (
+                Self::DuplicateItem {
+                    message: left_message,
+                },
+                Self::DuplicateItem {
                     message: right_message,
                 },
             ) => left_message == right_message,
@@ -284,6 +304,10 @@ impl Error {
             },
             Self::ItemCollectionSizeLimitExceeded { .. } => Class {
                 code: "ItemCollectionSizeLimitExceededException",
+                retry: Retry::Terminal,
+            },
+            Self::DuplicateItem { .. } => Class {
+                code: "DuplicateItemException",
                 retry: Retry::Terminal,
             },
             // A 5xx: the request was never decided, which is exactly the class a
@@ -533,6 +557,13 @@ impl Error {
             table: table.to_string(),
             message: format!("condition `{expression}` evaluated to false"),
             item,
+        }
+    }
+
+    /// Build a `DuplicateItemException` for a PartiQL `INSERT`.
+    pub(crate) fn duplicate_item(table: &str) -> Self {
+        Self::DuplicateItem {
+            message: format!("Duplicate primary key exists in table {table}"),
         }
     }
 }

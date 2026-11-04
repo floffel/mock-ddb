@@ -6,7 +6,7 @@
 //! for their whole duration, which is what makes transactions atomic and batch
 //! writes all-or-nothing on validation errors.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -20,6 +20,10 @@ use crate::error::{CancellationReason, CancellationReasonCode, Error, Result};
 use crate::expr::{
     CmpOp, Condition, ConditionExpression, NameMap, Operand, ProjectionExpression, Segment,
     UpdateExpression, ValueMap,
+};
+use crate::partiql::{
+    BatchExecuteStatementOutput, BatchExecuteStatementRequest, ExecuteStatementOutput,
+    ExecuteStatementRequest,
 };
 use crate::request::{
     BatchGetItemOutput, BatchGetItemRequest, BatchWriteItemOutput, BatchWriteItemRequest,
@@ -53,7 +57,20 @@ struct Inner {
     sequence: u64,
     /// Client request tokens that have already been applied.
     applied_tokens: BTreeSet<String>,
+    /// PartiQL `NextToken` → the key the next page starts after.
+    ///
+    /// A `NextToken` is opaque state on the service's side, so it is opaque
+    /// state here too: the mock keeps the key it parked and hands out a token
+    /// that names it. Nothing is serialised, so a token cannot outlive the mock
+    /// — and only the most recent [`MAX_NEXT_TOKENS`] are kept, so a test that
+    /// pages forever cannot grow the map forever.
+    next_tokens: VecDeque<(String, Item)>,
+    /// Counter that names the next `NextToken`.
+    token_sequence: u64,
 }
+
+/// How many PartiQL paging tokens one mock remembers.
+const MAX_NEXT_TOKENS: usize = 256;
 
 /// An in-process DynamoDB.
 ///
@@ -138,6 +155,8 @@ impl MockDdb {
                 clock,
                 sequence: 1,
                 applied_tokens: BTreeSet::new(),
+                next_tokens: VecDeque::new(),
+                token_sequence: 0,
             })),
         }
     }
@@ -288,6 +307,7 @@ impl MockDdb {
         let mut inner = self.inner.write();
         inner.tables.clear();
         inner.applied_tokens.clear();
+        inner.next_tokens.clear();
     }
 
     // -- control plane ------------------------------------------------------
@@ -470,7 +490,7 @@ impl MockDdb {
         self.put_item_inner(&request)
     }
 
-    fn put_item_inner(&self, request: &PutItemRequest) -> Result<PutItemOutput> {
+    pub(crate) fn put_item_inner(&self, request: &PutItemRequest) -> Result<PutItemOutput> {
         let mut inner = self.inner.write();
         let now = epoch_seconds(inner.clock.now());
         let table = inner
@@ -635,7 +655,10 @@ impl MockDdb {
         self.delete_item_inner(&request)
     }
 
-    fn delete_item_inner(&self, request: &DeleteItemRequest) -> Result<DeleteItemOutput> {
+    pub(crate) fn delete_item_inner(
+        &self,
+        request: &DeleteItemRequest,
+    ) -> Result<DeleteItemOutput> {
         let mut inner = self.inner.write();
         let now = epoch_seconds(inner.clock.now());
         let table = inner
@@ -720,7 +743,10 @@ impl MockDdb {
         self.update_item_inner(&request)
     }
 
-    fn update_item_inner(&self, request: &UpdateItemRequest) -> Result<UpdateItemOutput> {
+    pub(crate) fn update_item_inner(
+        &self,
+        request: &UpdateItemRequest,
+    ) -> Result<UpdateItemOutput> {
         let mut inner = self.inner.write();
         let now = epoch_seconds(inner.clock.now());
         let table = inner
@@ -838,7 +864,7 @@ impl MockDdb {
         self.query_inner(&request)
     }
 
-    fn query_inner(&self, request: &QueryRequest) -> Result<QueryOutput> {
+    pub(crate) fn query_inner(&self, request: &QueryRequest) -> Result<QueryOutput> {
         validate_limit(request.limit)?;
         let inner = self.inner.read();
         let now = epoch_seconds(inner.clock.now());
@@ -927,7 +953,7 @@ impl MockDdb {
         self.scan_inner(&request)
     }
 
-    fn scan_inner(&self, request: &ScanRequest) -> Result<ScanOutput> {
+    pub(crate) fn scan_inner(&self, request: &ScanRequest) -> Result<ScanOutput> {
         validate_limit(request.limit)?;
         let segment = match (request.segment, request.total_segments) {
             (None, None) => None,
@@ -1224,6 +1250,141 @@ impl MockDdb {
             unprocessed_keys: BTreeMap::new(),
             consumed_capacity,
         })
+    }
+
+    /// Run one PartiQL statement — `SELECT`, `INSERT`, `UPDATE` or `DELETE`.
+    ///
+    /// ```
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// use mock_ddb::{s, ExecuteStatementRequest, KeySchema, KeyType, MockDdb};
+    ///
+    /// let mock = MockDdb::with_table("users", KeySchema::hash("pk", KeyType::String)).unwrap();
+    /// mock.execute_statement(
+    ///     ExecuteStatementRequest::new("INSERT INTO \"users\" VALUE {'pk': ?, 'name': 'Ada'}")
+    ///         .with_parameters(vec![s("u#1")]),
+    /// )
+    /// .await
+    /// .unwrap();
+    ///
+    /// let rows = mock
+    ///     .execute_statement(
+    ///         ExecuteStatementRequest::new("SELECT * FROM \"users\" WHERE pk = ?")
+    ///             .with_parameters(vec![s("u#1")]),
+    ///     )
+    ///     .await
+    ///     .unwrap();
+    /// assert_eq!(rows.items.expect("a read returns rows").len(), 1);
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] for a statement that is empty, longer than
+    /// [`MAX_STATEMENT_LENGTH`](crate::MAX_STATEMENT_LENGTH) or malformed, for a
+    /// parameter list that does not match the statement's `?` placeholders, and
+    /// for an `UPDATE`/`DELETE` whose `WHERE` clause does not name every key
+    /// attribute; [`Error::ResourceNotFound`] for an unknown table;
+    /// [`Error::DuplicateItem`] for an `INSERT` whose key already exists; and
+    /// [`Error::ConditionalCheckFailed`] when the `WHERE` clause of a write does
+    /// not hold.
+    pub async fn execute_statement(
+        &self,
+        request: ExecuteStatementRequest,
+    ) -> Result<ExecuteStatementOutput> {
+        crate::partiql::execute_statement(self, &request)
+    }
+
+    /// Run a batch of PartiQL statements, up to
+    /// [`MAX_BATCH_STATEMENTS`](crate::MAX_BATCH_STATEMENTS).
+    ///
+    /// The batch must be all reads or all writes, like the service's, and a
+    /// read must pin the whole primary key so it matches at most one item. One
+    /// member's failure does not roll the others back: it is reported in that
+    /// member's response, exactly as the service does.
+    ///
+    /// ```
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// use mock_ddb::{
+    ///     s, BatchExecuteStatementRequest, BatchStatementRequest, KeySchema, KeyType, MockDdb,
+    /// };
+    ///
+    /// let mock = MockDdb::with_table("users", KeySchema::hash("pk", KeyType::String)).unwrap();
+    /// let output = mock
+    ///     .batch_execute_statement(
+    ///         BatchExecuteStatementRequest::new()
+    ///             .with_statement(
+    ///                 BatchStatementRequest::new("INSERT INTO \"users\" VALUE {'pk': ?}")
+    ///                     .with_parameters(vec![s("u#1")]),
+    ///             )
+    ///             .with_statement(
+    ///                 BatchStatementRequest::new("INSERT INTO \"users\" VALUE {'pk': ?}")
+    ///                     .with_parameters(vec![s("u#1")]),
+    ///             ),
+    ///     )
+    ///     .await
+    ///     .unwrap();
+    /// assert!(output.responses[0].error.is_none());
+    /// assert_eq!(
+    ///     output.responses[1].error.as_ref().map(|error| error.code.as_str()),
+    ///     Some("DuplicateItem")
+    /// );
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] for an empty batch, for more than
+    /// [`MAX_BATCH_STATEMENTS`](crate::MAX_BATCH_STATEMENTS) members, for a
+    /// batch that mixes reads and writes, and for a member that does not parse;
+    /// [`Error::ResourceNotFound`] when a member names a table that does not
+    /// exist.
+    pub async fn batch_execute_statement(
+        &self,
+        request: BatchExecuteStatementRequest,
+    ) -> Result<BatchExecuteStatementOutput> {
+        crate::partiql::batch_execute_statement(self, &request)
+    }
+
+    /// The key schema of a table or one of its indexes.
+    pub(crate) fn key_schema_of(
+        &self,
+        table_name: &str,
+        index_name: Option<&str>,
+    ) -> Result<KeySchema> {
+        let inner = self.inner.read();
+        let table = inner
+            .tables
+            .get(table_name)
+            .ok_or_else(|| Error::table_not_found(table_name))?;
+        match index_name {
+            None => Ok(table.key_schema().clone()),
+            Some(name) => Ok(table.definition.index(name)?.key_schema.clone()),
+        }
+    }
+
+    /// Park the key a PartiQL read stopped at and return the token naming it.
+    pub(crate) fn store_next_token(&self, key: &Item) -> String {
+        let mut inner = self.inner.write();
+        inner.token_sequence += 1;
+        let token = format!("v1|partiql|{}", inner.token_sequence);
+        inner.next_tokens.push_back((token.clone(), key.clone()));
+        while inner.next_tokens.len() > MAX_NEXT_TOKENS {
+            inner.next_tokens.pop_front();
+        }
+        token
+    }
+
+    /// Resolve a `NextToken` this mock issued back to the key it parked.
+    pub(crate) fn take_next_token(&self, token: &str) -> Result<Item> {
+        let inner = self.inner.read();
+        inner
+            .next_tokens
+            .iter()
+            .find(|(issued, _)| issued == token)
+            .map(|(_, key)| key.clone())
+            .ok_or_else(|| Error::validation(format!("Invalid NextToken: {token}")))
     }
 
     ///

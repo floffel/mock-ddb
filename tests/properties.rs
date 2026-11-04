@@ -427,6 +427,9 @@ fn every_variant(payload: &str) -> Vec<Error> {
         Error::ItemCollectionSizeLimitExceeded {
             message: payload.to_string(),
         },
+        Error::DuplicateItem {
+            message: payload.to_string(),
+        },
         Error::internal(payload.to_string()),
     ]
 }
@@ -606,6 +609,7 @@ fn code_is_unique_and_names_the_service_class() {
             "ConditionalCheckFailedException",
             "TransactionCanceledException",
             "ItemCollectionSizeLimitExceededException",
+            "DuplicateItemException",
             "InternalServerError",
         ]
     );
