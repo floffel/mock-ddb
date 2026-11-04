@@ -20,7 +20,7 @@ use aws_sdk_dynamodb::types::AttributeValue;
 
 use super::eval::Ctx;
 use super::parse::{reject_overlapping, ArithOp, Operand, Path, SetValue, Update, UpdateClause};
-use super::path::{get_path, remove_path, render, root, set_path};
+use super::path::{get_path, invalid_nested_path, remove_path, render, root, set_path};
 use crate::number::Number;
 use crate::schema::KeySchema;
 use crate::value::{is_set, set_difference, set_union, type_name};
@@ -74,7 +74,7 @@ pub(crate) fn apply(
                 for (path, value) in assignments {
                     let resolved = ctx.resolve(path)?.into_owned();
                     let name = root(&resolved)
-                        .ok_or_else(|| invalid_path(&resolved))?
+                        .ok_or_else(|| invalid_nested_path(&resolved))?
                         .to_string();
                     reject_key_attribute(&name, key_schema)?;
                     let value = evaluate_set_value(value, &work, ctx)?;
@@ -86,7 +86,7 @@ pub(crate) fn apply(
                 for path in paths {
                     let resolved = ctx.resolve(path)?.into_owned();
                     let name = root(&resolved)
-                        .ok_or_else(|| invalid_path(&resolved))?
+                        .ok_or_else(|| invalid_nested_path(&resolved))?
                         .to_string();
                     reject_key_attribute(&name, key_schema)?;
                     touched.insert(name);
@@ -97,7 +97,7 @@ pub(crate) fn apply(
                 for (path, operand) in pairs {
                     let resolved = ctx.resolve(path)?.into_owned();
                     let name = root(&resolved)
-                        .ok_or_else(|| invalid_path(&resolved))?
+                        .ok_or_else(|| invalid_nested_path(&resolved))?
                         .to_string();
                     reject_key_attribute(&name, key_schema)?;
                     let delta = ctx
@@ -128,7 +128,7 @@ pub(crate) fn apply(
                 for (path, operand) in pairs {
                     let resolved = ctx.resolve(path)?.into_owned();
                     let name = root(&resolved)
-                        .ok_or_else(|| invalid_path(&resolved))?
+                        .ok_or_else(|| invalid_nested_path(&resolved))?
                         .to_string();
                     reject_key_attribute(&name, key_schema)?;
                     let delta = ctx
@@ -272,13 +272,6 @@ fn undefined_operand(operand: &Operand) -> Error {
             "Invalid UpdateExpression: The provided expression refers to an attribute that does not exist in the item",
         ),
     }
-}
-
-fn invalid_path(path: &[super::parse::Segment]) -> Error {
-    Error::validation(format!(
-        "Invalid UpdateExpression: The document path provided in the update expression is invalid for update: {}",
-        render(path)
-    ))
 }
 
 /// Reject an update that targets a key attribute.
@@ -523,7 +516,7 @@ mod tests {
         let original = target.clone();
         let error = apply("SET v = :v, rows[1] = :v", &mut target, &values).unwrap_err();
         assert!(
-            error.to_string().contains("list index is out of range"),
+            error.to_string().contains("rows[1]"),
             "unexpected error: {error}"
         );
         assert_eq!(target, original);
