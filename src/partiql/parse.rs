@@ -882,7 +882,7 @@ mod tests {
     fn parses_star_and_index_reference() {
         let parsed = parse_ok("select * from \"Music\".\"AlbumTitle-Index\" where \"Artist\" = ?");
         let select = expect_select(parsed.statement);
-        assert!(select.projection.is_empty());
+        assert_eq!(select.projection, Vec::<Path>::new());
         assert_eq!(select.index.as_deref(), Some("AlbumTitle-Index"));
     }
 
