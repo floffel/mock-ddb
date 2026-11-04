@@ -91,9 +91,7 @@ fn set_in(
         Segment::Index(index) => match target {
             AttributeValue::L(list) => {
                 let Some(child) = list.get_mut(*index) else {
-                    return Err(Error::validation(
-                        "Invalid UpdateExpression: The list index is out of range",
-                    ));
+                    return Err(invalid_nested_path(full_path));
                 };
                 if rest.is_empty() {
                     *child = value;
@@ -264,7 +262,12 @@ fn project_value(value: &AttributeValue, shape: &Shape) -> Option<AttributeValue
     }
 }
 
-fn invalid_nested_path(path: &[Segment]) -> Error {
+/// The one rejection for a path that cannot be written as it names itself.
+///
+/// Every strict nested write — a missing parent, a parent of the wrong type, a
+/// list index past the end — funnels through here, so one failure class has one
+/// message and every one of them names the path that failed.
+pub(crate) fn invalid_nested_path(path: &[Segment]) -> Error {
     Error::validation(format!(
         "Invalid UpdateExpression: The document path provided in the update expression is invalid for update: {}",
         render(path)
@@ -452,6 +455,23 @@ mod tests {
             s("z"),
         )
         .is_err());
+    }
+
+    #[test]
+    fn an_out_of_range_index_names_the_whole_path() {
+        // `tags` holds two elements: index 1 is the last one just inside, index 2
+        // is the first one past the end. Both the missing parent and the missing
+        // index share one message, and it names the path that failed.
+        let mut item = sample();
+        let inside = [Segment::Name("tags".into()), Segment::Index(1)];
+        set_path(&mut item, &inside, s("z")).unwrap();
+        assert_eq!(get_path(&item, &inside), Some(&s("z")));
+
+        let outside = [Segment::Name("tags".into()), Segment::Index(2)];
+        let error = set_path(&mut item, &outside, s("z")).unwrap_err();
+        assert_eq!(error.to_string(), invalid_nested_path(&outside).to_string());
+        assert!(error.to_string().contains("tags[2]"), "{error}");
+        assert_eq!(get_path(&item, &inside), Some(&s("z")));
     }
 
     #[test]
