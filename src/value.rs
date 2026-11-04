@@ -119,14 +119,6 @@ pub(crate) fn type_name(value: &AttributeValue) -> &'static str {
     }
 }
 
-/// Whether the value is a set type.
-pub(crate) fn is_set(value: &AttributeValue) -> bool {
-    matches!(
-        value,
-        AttributeValue::Ss(_) | AttributeValue::Ns(_) | AttributeValue::Bs(_)
-    )
-}
-
 /// Structural and numeric equality, with DynamoDB's number semantics.
 ///
 /// `"1.0"` equals `"1"`, `NULL` equals `NULL`, and sets compare without regard
@@ -477,8 +469,6 @@ mod tests {
         for (value, expected) in cases {
             assert_eq!(type_name(&value), expected);
         }
-        assert!(is_set(&AttributeValue::Ss(vec!["a".into()])));
-        assert!(!is_set(&AttributeValue::S("x".into())));
     }
 
     #[test]
