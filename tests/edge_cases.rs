@@ -100,6 +100,61 @@ async fn item_size_limit_is_exactly_400_kib() {
 }
 
 #[tokio::test]
+async fn an_update_that_would_pass_the_item_limit_is_refused_whole() {
+    let mock = users();
+    // pk 3 bytes, list: name 3 + 2 elements of MAX/2 - 16 bytes each.
+    let element = "x".repeat(400 * 1024 / 2 - 16);
+    let list = AttributeValue::L(vec![s(&element), s(&element)]);
+    mock.put_item(PutItemRequest::new(
+        "users",
+        item([("pk", s("a")), ("l", list.clone())]),
+    ))
+    .await
+    .expect("the list itself is inside the limit");
+
+    let error = mock
+        .update_item(
+            UpdateItemRequest::new("users", item([("pk", s("a"))]), "SET l = list_append(l, l)")
+                .with_return_values(ReturnValues::AllOld),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "ValidationException");
+    assert!(error.to_string().contains("maximum allowed size"));
+
+    // The stored item is exactly the one that was put: no half-applied growth.
+    let stored = mock
+        .get_item(GetItemRequest::new("users", item([("pk", s("a"))])))
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.item.and_then(|item| item.get("l").cloned()),
+        Some(list)
+    );
+
+    // Just inside: the same update on a list that doubles to the limit lands.
+    let half = "x".repeat(400 * 1024 / 2 - 16);
+    let small = AttributeValue::L(vec![s(&half)]);
+    mock.put_item(PutItemRequest::new(
+        "users",
+        item([("pk", s("b")), ("l", small)]),
+    ))
+    .await
+    .unwrap();
+    let updated = mock
+        .update_item(
+            UpdateItemRequest::new("users", item([("pk", s("b"))]), "SET l = list_append(l, l)")
+                .with_return_values(ReturnValues::AllNew),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        updated.attributes.expect("returned item")["l"],
+        AttributeValue::L(vec![s(&half), s(&half)])
+    );
+}
+
+#[tokio::test]
 async fn number_precision_and_ordering() {
     let mock = numbers();
     let values_to_store = ["-1", "0", "0.5", "1", "10", "1e2", "-1e-2"];
