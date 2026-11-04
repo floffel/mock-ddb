@@ -502,7 +502,7 @@ mod tests {
         let values = HashMap::from([
             (":v".to_string(), s("x")),
             (":one".to_string(), n("1")),
-            (":gone".to_string(), s("g")),
+            (":gone".to_string(), AttributeValue::Ss(vec!["g".into()])),
         ]);
         update.apply(&mut item, &schema(), &names, &values).unwrap();
         assert_eq!(item.get("a"), Some(&s("x")));

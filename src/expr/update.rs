@@ -137,15 +137,22 @@ pub(crate) fn apply(
                         .operand_value(operand, Some(item))?
                         .map(Cow::into_owned)
                         .ok_or_else(|| undefined_operand(operand))?;
+                    let rendered = render(&resolved);
+                    // The operand is checked before the item is consulted, so
+                    // a wrong operand is refused whether or not the attribute
+                    // happens to exist. Skipping the gate for a missing path
+                    // would let a client bug hide behind the stored state.
+                    validate_delete_delta(&delta, &rendered)?;
+                    // A path that is not there is the no-op the service
+                    // reports: nothing to remove, nothing written.
                     let Some(current) = get_path(item, &resolved).cloned() else {
                         continue;
                     };
-                    let remaining = set_difference(&current, &delta).ok_or_else(|| {
-                        Error::validation(format!(
-                            "Invalid UpdateExpression: Incorrect operand type for operator or function; operator: DELETE, operand type: {}",
-                            type_name(&delta)
-                        ))
-                    })?;
+                    // Only the stored side can be wrong now, so it is the one
+                    // the error names: a set of another member type cannot be
+                    // subtracted from this value.
+                    let remaining = set_difference(&current, &delta)
+                        .ok_or_else(|| delete_type_error(&current))?;
                     touched.insert(name);
                     if is_empty_set(&remaining) {
                         mutations.push(Mutation::Remove(resolved));
@@ -360,6 +367,29 @@ fn validate_add_delta(delta: &AttributeValue, path: &str) -> Result<AttributeVal
     }
 }
 
+/// Validate a `DELETE` operand.
+///
+/// `DELETE` subtracts members from a set, so the operand has to be a set of
+/// its own: a scalar can never name a member. The check belongs here, before
+/// the item is read, because the service validates the operand independently
+/// of the item — `DELETE tags :one` is the same rejected request whether or not
+/// `tags` is stored, and a mock that only checked where the path resolved
+/// accepted it on one item and refused it on the next.
+///
+/// Empty sets are refused with the wording `PutItem` uses, as `ADD` does: an
+/// empty operand can neither add nor remove anything, and storing it is what
+/// the service rejects. The member type of the *stored* set is not checked
+/// here — [`set_difference`] does that once the current value is known, and
+/// reports it against the value that is wrong.
+fn validate_delete_delta(delta: &AttributeValue, path: &str) -> Result<()> {
+    match delta {
+        AttributeValue::Ss(members) => refuse_empty_set(members.is_empty(), "string", path),
+        AttributeValue::Ns(members) => refuse_empty_set(members.is_empty(), "number", path),
+        AttributeValue::Bs(members) => refuse_empty_set(members.is_empty(), "binary", path),
+        _ => Err(delete_type_error(delta)),
+    }
+}
+
 /// The error for a number the arithmetic cannot read.
 ///
 /// Where the text came from decides the class, because it decides who has to
@@ -445,6 +475,18 @@ fn add_type_error(delta: &AttributeValue) -> Error {
     Error::validation(format!(
         "Invalid UpdateExpression: Incorrect operand type for operator or function; operator: ADD, operand type: {}",
         type_name(delta)
+    ))
+}
+
+/// The error for a `DELETE` value that is not a set of the stored member type.
+///
+/// The wording is the service's: one message for both directions, naming the
+/// value that cannot take part in the subtraction — the operand when it is not
+/// a set at all, the stored attribute when its member type is another one.
+fn delete_type_error(offending: &AttributeValue) -> Error {
+    Error::validation(format!(
+        "Invalid UpdateExpression: Incorrect operand type for operator or function; operator: DELETE, operand type: {}",
+        type_name(offending)
     ))
 }
 
@@ -681,6 +723,78 @@ mod tests {
             apply("DELETE members :members", &mut target, &values).unwrap();
             assert!(!target.contains_key("members"));
         }
+    }
+
+    #[test]
+    fn delete_validates_the_operand_wherever_the_attribute_is() {
+        let values = crate::values([
+            (":one", s("one")),
+            (":x", AttributeValue::Ss(vec!["x".into()])),
+            (":numbers", AttributeValue::Ns(vec!["1".into()])),
+            (":empty", AttributeValue::Ss(Vec::new())),
+        ]);
+        let stored = AttributeValue::Ss(vec!["x".into(), "y".into()]);
+
+        // Just outside, on both sides of the boundary that used to decide the
+        // outcome: a scalar can never name a member, so the absent attribute is
+        // refused just like the stored one instead of hiding it as a no-op.
+        for present in [false, true] {
+            let mut target = item([("pk", s("a"))]);
+            if present {
+                target.insert("tags".into(), stored.clone());
+            }
+            let error = apply("DELETE tags :one", &mut target, &values).unwrap_err();
+            assert_eq!(error.code(), "ValidationException");
+            assert!(
+                error
+                    .to_string()
+                    .contains("operator: DELETE, operand type: S"),
+                "unexpected error: {error}"
+            );
+            assert_eq!(target.get("tags"), present.then_some(&stored));
+
+            // An empty operand is refused the same way, wherever the attribute
+            // is: it can neither remove a member nor be stored.
+            let error = apply("DELETE tags :empty", &mut target, &values).unwrap_err();
+            assert!(
+                error.to_string().contains("string set may not be empty"),
+                "unexpected error: {error}"
+            );
+            assert_eq!(target.get("tags"), present.then_some(&stored));
+        }
+
+        // A set of another member type is a valid operand, so only the stored
+        // side can refuse it: absent it is the no-op, present the mismatch.
+        let mut target = item([("pk", s("a"))]);
+        apply("DELETE tags :numbers", &mut target, &values).unwrap();
+        assert!(!target.contains_key("tags"));
+
+        let mut target = item([("pk", s("a")), ("tags", stored.clone())]);
+        let error = apply("DELETE tags :numbers", &mut target, &values).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("operator: DELETE, operand type: SS"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(target.get("tags"), Some(&stored));
+
+        // Just inside: with a set operand the missing path is a plain no-op —
+        // it writes nothing and reports nothing as touched.
+        let mut target = item([("pk", s("a"))]);
+        let touched = apply("DELETE tags :x", &mut target, &values).unwrap();
+        assert!(touched.is_empty());
+        assert!(!target.contains_key("tags"));
+
+        // And on a stored set it removes the member, which is the write the
+        // no-op above is the absence of.
+        let mut target = item([("pk", s("a")), ("tags", stored)]);
+        let touched = apply("DELETE tags :x", &mut target, &values).unwrap();
+        assert_eq!(touched.iter().collect::<Vec<_>>(), vec!["tags"]);
+        assert_eq!(
+            target.get("tags"),
+            Some(&AttributeValue::Ss(vec!["y".into()]))
+        );
     }
 
     #[test]
