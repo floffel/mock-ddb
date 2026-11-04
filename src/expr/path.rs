@@ -4,6 +4,13 @@
 //! a concrete attribute name. Nested writes are strict — DynamoDB rejects
 //! `SET a.b = :v` when `a` does not exist — while removals are forgiving, since
 //! removing something that is not there is a no-op.
+//!
+//! Hand-rolled on purpose: a lookup found no maintained crate that resolves a
+//! DynamoDB document path against an item (`dynamodb-expression` only builds
+//! expression strings, `dynoxide` is a whole in-process DynamoDB rather than a
+//! reusable path helper), and `aws_sdk_dynamodb`'s `AttributeValue` carries no
+//! traversal helpers. Reuse here would mean pulling in a database engine for
+//! five recursive walks — do not re-litigate it without a new lookup.
 
 use std::collections::{BTreeMap, HashMap};
 
