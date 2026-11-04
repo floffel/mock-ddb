@@ -18,8 +18,8 @@ use crate::capacity::{
 use crate::clock::{epoch_seconds, Clock, SystemClock};
 use crate::error::{CancellationReason, CancellationReasonCode, Error, Result};
 use crate::expr::{
-    CmpOp, Condition, ConditionExpression, NameMap, Operand, ProjectionExpression, Segment,
-    UpdateExpression, ValueMap,
+    CmpOp, Condition, ConditionExpression, NameMap, Operand, ProjectionExpression,
+    ResolvedProjection, Segment, UpdateExpression, ValueMap,
 };
 use crate::partiql::{
     BatchExecuteStatementOutput, BatchExecuteStatementRequest, ExecuteStatementOutput,
@@ -611,7 +611,9 @@ impl MockDdb {
     ///
     /// Returns [`Error::ResourceNotFound`] for an unknown table,
     /// [`Error::Validation`] for a key that does not match the schema, and for
-    /// a malformed projection.
+    /// a malformed projection or an undefined `#name` placeholder. The
+    /// projection is parsed before the key is looked up, so a missing key does
+    /// not turn a bad expression into `None`.
     pub async fn get_item(&self, request: GetItemRequest) -> Result<GetItemOutput> {
         self.get_item_inner(&request)
     }
@@ -624,6 +626,23 @@ impl MockDdb {
             .get(&request.table_name)
             .ok_or_else(|| Error::table_not_found(&request.table_name))?;
         let key = table.lookup_key(&request.key)?;
+        // The projection is built before the key is looked up, so a malformed
+        // expression or an undefined `#alias` is rejected on a key the table
+        // does not hold too — the service validates the request, not the
+        // response.
+        let projection = match request.projection_expression.as_deref() {
+            None => None,
+            Some(expression) => {
+                let names = request
+                    .expression_attribute_names
+                    .clone()
+                    .unwrap_or_default();
+                Some(ResolvedProjection::new(
+                    &ProjectionExpression::parse(expression)?,
+                    &names,
+                )?)
+            }
+        };
         let stored = table
             .items
             .get(&key)
@@ -636,19 +655,10 @@ impl MockDdb {
             None,
             read_units(stored.map_or(0, item_size)),
         );
-        let item = match stored {
-            None => None,
-            Some(item) => match &request.projection_expression {
-                None => Some(item.clone()),
-                Some(expression) => {
-                    let names = request
-                        .expression_attribute_names
-                        .clone()
-                        .unwrap_or_default();
-                    Some(ProjectionExpression::parse(expression)?.project(item, &names)?)
-                }
-            },
-        };
+        let item = stored.map(|item| match &projection {
+            None => item.clone(),
+            Some(projection) => projection.project(item),
+        });
         Ok(GetItemOutput {
             item,
             consumed_capacity: breakdown
@@ -895,6 +905,11 @@ impl MockDdb {
     /// [`Error::Validation`] for a key condition that does not constrain the
     /// partition key or references a non-key attribute, and for a malformed
     /// filter or projection.
+    ///
+    /// The expressions and every `#name`/`:value` they use are validated before
+    /// the first item is read, so a page that reaches no item — an empty table,
+    /// or one where the key condition or TTL leaves nothing — still rejects them
+    /// instead of returning an empty `Ok`.
     pub async fn query(&self, request: QueryRequest) -> Result<QueryOutput> {
         self.query_inner(&request)
     }
@@ -926,15 +941,22 @@ impl MockDdb {
             Some(expression) => {
                 let condition = ConditionExpression::parse(expression)?;
                 validate_key_condition(condition.condition(), key_schema, &names)?;
+                condition.validate_maps(&names, &values)?;
                 Some(condition)
             }
         };
+        let (filter, projection) = read_expressions(
+            request.filter_expression.as_deref(),
+            request.projection_expression.as_deref(),
+            &names,
+            &values,
+        )?;
 
         let page = Page {
             limit: request.limit,
-            filter: request.filter_expression.as_deref(),
+            filter: filter.as_ref(),
             key_condition: key_condition.as_ref(),
-            projection: request.projection_expression.as_deref(),
+            projection: projection.as_ref(),
             select: request.select,
             names: &names,
             values: &values,
@@ -984,6 +1006,10 @@ impl MockDdb {
     /// Returns [`Error::ResourceNotFound`] for an unknown table or index,
     /// [`Error::Validation`] for an invalid segment range, filter, projection or
     /// limit, and for `Select::SpecificAttributes` without a projection.
+    ///
+    /// The filter, the projection and every `#name`/`:value` they use are
+    /// validated before the first item is read, so an empty table or an empty
+    /// segment still rejects them instead of returning an empty `Ok`.
     pub async fn scan(&self, request: ScanRequest) -> Result<ScanOutput> {
         self.scan_inner(&request)
     }
@@ -1031,11 +1057,18 @@ impl MockDdb {
             .clone()
             .unwrap_or_default();
 
+        let (filter, projection) = read_expressions(
+            request.filter_expression.as_deref(),
+            request.projection_expression.as_deref(),
+            &names,
+            &values,
+        )?;
+
         let page = Page {
             limit: request.limit,
-            filter: request.filter_expression.as_deref(),
+            filter: filter.as_ref(),
             key_condition: None,
-            projection: request.projection_expression.as_deref(),
+            projection: projection.as_ref(),
             select: request.select,
             names: &names,
             values: &values,
@@ -2346,11 +2379,15 @@ fn decode_iterator(token: &str) -> Result<(String, usize)> {
 // ---------------------------------------------------------------------------
 
 /// One page of a query or scan.
+///
+/// The filter and the projection are the *parsed* forms: a page parses neither,
+/// so the expression text is read once per request and the pre-parsed tree is
+/// evaluated (or applied) per item.
 struct Page<'a> {
     limit: Option<u32>,
-    filter: Option<&'a str>,
+    filter: Option<&'a ConditionExpression>,
     key_condition: Option<&'a ConditionExpression>,
-    projection: Option<&'a str>,
+    projection: Option<&'a ResolvedProjection>,
     select: Select,
     names: &'a NameMap,
     values: &'a ValueMap,
@@ -2553,14 +2590,46 @@ fn cursor_for(table: &Table, index_name: Option<&str>, item: &Item) -> Item {
     cursor
 }
 
+/// Parse the filter and projection of a read, and validate both against the
+/// request's maps, before any item is reached.
+///
+/// The service validates the expressions and every `#name`/`:value` they use
+/// before it reads anything, so a page that ends up empty — an empty table, or
+/// one where the key condition, TTL or a segment leaves nothing — still rejects
+/// a malformed filter or an undefined placeholder. Parsing once per request
+/// also means a page over n items lexes and parses the same text once, not n
+/// times.
+fn read_expressions(
+    filter: Option<&str>,
+    projection: Option<&str>,
+    names: &NameMap,
+    values: &ValueMap,
+) -> Result<(Option<ConditionExpression>, Option<ResolvedProjection>)> {
+    let filter = match filter {
+        None => None,
+        Some(expression) => {
+            let condition = ConditionExpression::parse(expression)?;
+            condition.validate_maps(names, values)?;
+            Some(condition)
+        }
+    };
+    let projection = match projection {
+        None => None,
+        Some(expression) => Some(ResolvedProjection::new(
+            &ProjectionExpression::parse(expression)?,
+            names,
+        )?),
+    };
+    Ok((filter, projection))
+}
+
 /// Apply an index's projection, then an explicit projection expression.
 fn projected_item(
     table: &Table,
     index_name: Option<&str>,
-    expression: Option<&str>,
+    projection: Option<&ResolvedProjection>,
     item: &Item,
-    names: &NameMap,
-) -> Result<Item> {
+) -> Item {
     let base = match index_name.and_then(|name| table.projected_attributes(name)) {
         None => item.clone(),
         Some(allowed) => item
@@ -2569,9 +2638,9 @@ fn projected_item(
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect(),
     };
-    match expression {
-        None => Ok(base),
-        Some(expression) => ProjectionExpression::parse(expression)?.project(&base, names),
+    match projection {
+        None => base,
+        Some(projection) => projection.project(&base),
     }
 }
 
@@ -2638,22 +2707,12 @@ fn collect_page(
         charged += read_units(item_size(item));
         let matches = match page.filter {
             None => true,
-            Some(expression) => ConditionExpression::parse(expression)?.evaluate(
-                Some(item),
-                page.names,
-                page.values,
-            )?,
+            Some(condition) => condition.evaluate(Some(item), page.names, page.values)?,
         };
         if matches {
             count += 1;
             if page.select != Select::Count {
-                items.push(projected_item(
-                    table,
-                    index_name,
-                    page.projection,
-                    item,
-                    page.names,
-                )?);
+                items.push(projected_item(table, index_name, page.projection, item));
             }
         }
         if limit.is_some_and(|limit| scanned >= limit) {

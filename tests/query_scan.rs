@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use common::orders;
 use mock_ddb::{
-    item, n, s, values, AttributeValue, CreateTableRequest, GetItemRequest, Item, KeySchema,
+    item, n, s, values, AttributeValue, CreateTableRequest, Error, GetItemRequest, Item, KeySchema,
     KeyType, MockDdb, Projection, PutItemRequest, QueryRequest, ScanRequest, SecondaryIndex,
     Select,
 };
@@ -688,4 +688,144 @@ async fn projection_selects_list_elements_through_every_read_path() {
         .unwrap();
     assert!(!past.contains_key("rows"));
     assert!(!past.contains_key("secret"));
+}
+
+#[tokio::test]
+async fn an_empty_table_still_validates_the_filter() {
+    // The filter used to be parsed inside the per-item loop, so a page that
+    // reached no item returned `Ok` where the service raises Validation.
+    let mock = orders();
+
+    let malformed = mock
+        .scan(ScanRequest::new("orders").with_filter("total >"))
+        .await
+        .unwrap_err();
+    assert!(matches!(malformed, Error::Validation { .. }), "{malformed}");
+
+    let undefined = mock
+        .scan(ScanRequest::new("orders").with_filter("total > :floor"))
+        .await
+        .unwrap_err();
+    assert!(undefined.to_string().contains(":floor"), "{undefined}");
+
+    // Edge pair: the same filter with its placeholder defined is valid, and an
+    // empty page is not an error.
+    let page = mock
+        .scan(
+            ScanRequest::new("orders")
+                .with_filter("total > :floor")
+                .with_values(values([(":floor", n("0"))])),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.count, 0);
+    assert_eq!(page.scanned_count, 0);
+}
+
+#[tokio::test]
+async fn a_filter_is_validated_where_the_key_condition_matches_nothing() {
+    let mock = orders();
+    mock.put_item(mock_ddb::PutItemRequest::new(
+        "orders",
+        common::order("c1", 1, "1"),
+    ))
+    .await
+    .unwrap();
+
+    let error = mock
+        .query(
+            QueryRequest::new("orders", "pk = :other")
+                .with_values(values([(":other", s("customer#c2"))]))
+                .with_filter("total > :missing"),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains(":missing"), "{error}");
+}
+
+#[tokio::test]
+async fn a_projection_is_validated_before_any_item_is_read() {
+    let mock = orders();
+
+    let malformed = mock
+        .scan(ScanRequest::new("orders").with_projection(""))
+        .await
+        .unwrap_err();
+    assert!(matches!(malformed, Error::Validation { .. }), "{malformed}");
+
+    let undefined = mock
+        .query(
+            QueryRequest::new("orders", "pk = :pk")
+                .with_values(values([(":pk", s("customer#c1"))]))
+                .with_projection("#missing"),
+        )
+        .await
+        .unwrap_err();
+    assert!(undefined.to_string().contains("#missing"), "{undefined}");
+
+    // Edge pair: a defined alias on an empty table is a valid, empty page.
+    let page = mock
+        .query(
+            QueryRequest::new("orders", "pk = :pk")
+                .with_values(values([(":pk", s("customer#c1"))]))
+                .with_projection("#total")
+                .with_names(mock_ddb::names([("#total", "total")])),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.count, 0);
+    assert_eq!(page.items.len(), 0);
+}
+
+#[tokio::test]
+async fn an_undefined_key_condition_value_is_rejected_on_an_empty_table() {
+    // The key condition is evaluated per candidate item too, so the same
+    // fail-open shape applied to it before the maps were checked up front.
+    let mock = orders();
+    let error = mock
+        .query(QueryRequest::new("orders", "pk = :pk"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains(":pk"), "{error}");
+}
+
+#[tokio::test]
+async fn get_item_validates_the_projection_before_looking_up_the_key() {
+    let mock = MockDdb::with_table("users", KeySchema::hash("pk", KeyType::String)).unwrap();
+    mock.put_item(mock_ddb::PutItemRequest::new(
+        "users",
+        common::user("u#1", "a@example.com"),
+    ))
+    .await
+    .unwrap();
+
+    let absent_key = item([("pk", s("u#2"))]);
+    let undefined = mock
+        .get_item(GetItemRequest::new("users", absent_key.clone()).with_projection("#missing"))
+        .await
+        .unwrap_err();
+    assert!(undefined.to_string().contains("#missing"), "{undefined}");
+
+    let malformed = mock
+        .get_item(GetItemRequest::new("users", absent_key.clone()).with_projection(""))
+        .await
+        .unwrap_err();
+    assert!(matches!(malformed, Error::Validation { .. }), "{malformed}");
+
+    // Edge pair: a valid projection on a missing key stays a `None` item...
+    let absent = mock
+        .get_item(GetItemRequest::new("users", absent_key).with_projection("email"))
+        .await
+        .unwrap();
+    assert!(absent.item.is_none());
+
+    // ...and a found item is still projected.
+    let found = mock
+        .get_item(GetItemRequest::new("users", item([("pk", s("u#1"))])).with_projection("email"))
+        .await
+        .unwrap()
+        .item
+        .unwrap();
+    assert_eq!(found.len(), 1);
+    assert!(found.contains_key("email"));
 }

@@ -191,6 +191,22 @@ impl ConditionExpression {
         eval::evaluate(&self.condition, item, &context)
     }
 
+    /// Check both maps against the whole expression without evaluating it.
+    ///
+    /// This is what lets a read validate its filter once, before the first item
+    /// is reached, instead of only where [`ConditionExpression::evaluate`]
+    /// happens to run: an empty page (or one whose items are all filtered out
+    /// by the key condition) must reject an undefined `#name` or `:value` too,
+    /// as the service does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`](crate::Error::Validation) for an undefined
+    /// `#name` or `:value` placeholder, in any branch.
+    pub(crate) fn validate_maps(&self, names: &NameMap, values: &ValueMap) -> Result<()> {
+        eval::validate(&self.condition, &Ctx { names, values })
+    }
+
     /// The parsed condition, for the operations that need to inspect it.
     pub(crate) fn condition(&self) -> &Condition {
         &self.condition
@@ -480,6 +496,42 @@ impl ProjectionExpression {
     }
 }
 
+/// A [`ProjectionExpression`] with its `#alias` segments resolved once.
+///
+/// [`ProjectionExpression::project`] resolves the aliases on every call, which
+/// is right for a one-shot read. A query or scan projects every item it
+/// returns, and the same text names the same paths each time, so the read
+/// resolves once here and then projects the pre-resolved paths per item — the
+/// expression is lexed, parsed and checked once per page rather than once per
+/// item, and an undefined `#alias` is rejected before the first item is
+/// reached.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedProjection {
+    paths: Vec<Path>,
+}
+
+impl ResolvedProjection {
+    /// Resolve a parsed projection against a names map, once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`](crate::Error::Validation) for an undefined
+    /// `#name` placeholder, or when the expression names more than 100
+    /// document paths.
+    pub(crate) fn new(expression: &ProjectionExpression, names: &NameMap) -> Result<Self> {
+        check_path_count(expression.paths.len())?;
+        Ok(Self {
+            paths: expression.resolve(names)?,
+        })
+    }
+
+    /// Keep only the projected attributes of one item.
+    pub(crate) fn project(&self, item: &Item) -> Item {
+        let paths = self.paths.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        project(item, &paths)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -721,5 +773,37 @@ mod tests {
         let names = HashMap::from([("#p".to_string(), "profile".to_string())]);
         let projected = projection.project(&item, &names).unwrap();
         assert_eq!(projected.len(), 2);
+    }
+
+    #[test]
+    fn a_resolved_projection_rejects_an_undefined_alias_before_any_item() {
+        let projection = ProjectionExpression::parse("#a, b").unwrap();
+        let error = ResolvedProjection::new(&projection, &HashMap::new()).unwrap_err();
+        assert!(
+            error.to_string().contains("#a"),
+            "unexpected error: {error}"
+        );
+
+        let names = HashMap::from([("#a".to_string(), "alpha".to_string())]);
+        let resolved = ResolvedProjection::new(&projection, &names).unwrap();
+        let mut item = Item::new();
+        item.insert("alpha".into(), s("x"));
+        item.insert("b".into(), s("y"));
+        item.insert("c".into(), s("z"));
+        // Both paths inside, the unnamed attribute outside.
+        let projected = resolved.project(&item);
+        assert_eq!(projected.len(), 2);
+        assert!(!projected.contains_key("c"));
+    }
+
+    #[test]
+    fn validate_maps_covers_branches_that_are_never_evaluated() {
+        let condition = ConditionExpression::parse("attribute_not_exists(pk) OR a = :v").unwrap();
+        let names = HashMap::new();
+        // Just outside: the placeholder is undefined, and `OR` would short-circuit.
+        assert!(condition.validate_maps(&names, &HashMap::new()).is_err());
+        // Just inside: defined, so the maps are consistent with the expression.
+        let values = HashMap::from([(":v".to_string(), s("x"))]);
+        assert!(condition.validate_maps(&names, &values).is_ok());
     }
 }
