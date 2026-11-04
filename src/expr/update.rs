@@ -77,7 +77,7 @@ pub(crate) fn apply(
                         .ok_or_else(|| invalid_nested_path(&resolved))?
                         .to_string();
                     reject_key_attribute(&name, key_schema)?;
-                    let value = evaluate_set_value(value, &work, ctx)?;
+                    let value = evaluate_set_value(value, &work, ctx, &render(&resolved))?.value;
                     touched.insert(name);
                     mutations.push(Mutation::Set(resolved, value));
                 }
@@ -104,11 +104,12 @@ pub(crate) fn apply(
                         .operand_value(operand, Some(&work))?
                         .map(Cow::into_owned)
                         .ok_or_else(|| undefined_operand(operand))?;
-                    let delta = validate_add_delta(&delta, &render(&resolved))?;
+                    let rendered = render(&resolved);
+                    let delta = validate_add_delta(&delta, &rendered)?;
                     let current = get_path(&work, &resolved).cloned();
                     let updated = match current {
                         None => delta,
-                        Some(current) => add_values(&current, &delta)?,
+                        Some(current) => add_values(&current, &delta, &rendered)?,
                     };
                     touched.insert(name);
                     mutations.push(Mutation::Set(resolved, updated));
@@ -155,24 +156,92 @@ pub(crate) fn apply(
     Ok(touched)
 }
 
+/// An evaluated `SET` right-hand side, plus where the numbers in it came from.
+///
+/// The origin decides the error class when a number cannot be read, so it is
+/// carried from the operand that produced the value up to the arithmetic that
+/// rejects it (see [`unusable_number`]).
+#[derive(Debug)]
+struct Evaluated {
+    /// The value the expression produced.
+    value: AttributeValue,
+    /// Whether it was read out of the item or carried by the request.
+    origin: Origin,
+}
+
+/// Whether an evaluated value was read out of the item or carried by the
+/// request.
+///
+/// A `:placeholder` the caller sent may hold a number the mock cannot read, and
+/// that is a rejected request. A value read out of the item cannot be
+/// unreadable — every write validates what it stores — so the same failure
+/// there is a broken invariant of the store and must not be reported as the
+/// caller's mistake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Origin {
+    /// Read out of the item: an attribute path, or `size()` of one.
+    Item,
+    /// Carried by the request: a `:placeholder` value.
+    Request,
+}
+
+impl Origin {
+    /// The origin of a value built out of two sides.
+    ///
+    /// The item-derived side wins: it is the one the request cannot have
+    /// corrupted, so a result built from it inherits its provenance rather than
+    /// hiding it behind a request value.
+    fn both(self, other: Self) -> Self {
+        if self == Self::Item || other == Self::Item {
+            Self::Item
+        } else {
+            Self::Request
+        }
+    }
+}
+
 /// Evaluate the right-hand side of a `SET`.
-fn evaluate_set_value(value: &SetValue, item: &Item, ctx: &Ctx<'_>) -> Result<AttributeValue> {
+///
+/// `path` is the rendered assignment target. Numbers travel as text, so a
+/// value that does not parse is only discovered where the arithmetic reads it;
+/// naming the attribute there is the difference between a test failure that
+/// points at one attribute and one that points at the expression.
+fn evaluate_set_value(
+    value: &SetValue,
+    item: &Item,
+    ctx: &Ctx<'_>,
+    path: &str,
+) -> Result<Evaluated> {
     match value {
-        SetValue::Operand(operand) => ctx
-            .operand_value(operand, Some(item))?
-            .map(Cow::into_owned)
-            .ok_or_else(|| undefined_operand(operand)),
-        SetValue::IfNotExists(path, fallback) => match ctx.path_value(path, Some(item))? {
-            Some(existing) => Ok(existing.clone()),
-            None => evaluate_set_value(fallback, item, ctx),
+        SetValue::Operand(operand) => {
+            let origin = match operand {
+                Operand::Value(_) => Origin::Request,
+                Operand::Path(_) | Operand::Size(_) => Origin::Item,
+            };
+            let value = ctx
+                .operand_value(operand, Some(item))?
+                .map(Cow::into_owned)
+                .ok_or_else(|| undefined_operand(operand))?;
+            Ok(Evaluated { value, origin })
+        }
+        SetValue::IfNotExists(absolute, fallback) => match ctx.path_value(absolute, Some(item))? {
+            Some(existing) => Ok(Evaluated {
+                value: existing.clone(),
+                origin: Origin::Item,
+            }),
+            None => evaluate_set_value(fallback, item, ctx, path),
         },
         SetValue::ListAppend(first, second) => {
-            let first = evaluate_set_value(first, item, ctx)?;
-            let second = evaluate_set_value(second, item, ctx)?;
-            match (first, second) {
+            let first = evaluate_set_value(first, item, ctx, path)?;
+            let second = evaluate_set_value(second, item, ctx, path)?;
+            let origin = first.origin.both(second.origin);
+            match (first.value, second.value) {
                 (AttributeValue::L(mut left), AttributeValue::L(right)) => {
                     left.extend(right);
-                    Ok(AttributeValue::L(left))
+                    Ok(Evaluated {
+                        value: AttributeValue::L(left),
+                        origin,
+                    })
                 }
                 (left, right) => Err(Error::validation(format!(
                     "Invalid UpdateExpression: Incorrect operand type for operator or function; operator or function: list_append, operand type: {} and {}",
@@ -182,46 +251,50 @@ fn evaluate_set_value(value: &SetValue, item: &Item, ctx: &Ctx<'_>) -> Result<At
             }
         }
         SetValue::Arithmetic { first, rest } => {
-            let mut value = evaluate_set_value(first, item, ctx)?;
+            let mut total = evaluate_set_value(first, item, ctx, path)?;
             for (operator, term) in rest {
-                let right = evaluate_set_value(term, item, ctx)?;
-                value = arithmetic(&value, &right, *operator)?;
+                let right = evaluate_set_value(term, item, ctx, path)?;
+                total = arithmetic(&total, &right, *operator, path)?;
             }
-            Ok(value)
+            Ok(total)
         }
     }
 }
 
 /// Apply one arithmetic step of a `SET` chain to the running total.
 fn arithmetic(
-    left: &AttributeValue,
-    right: &AttributeValue,
+    left: &Evaluated,
+    right: &Evaluated,
     operator: ArithOp,
-) -> Result<AttributeValue> {
+    path: &str,
+) -> Result<Evaluated> {
     let subtract = operator == ArithOp::Sub;
-    let (AttributeValue::N(left), AttributeValue::N(right)) = (left, right) else {
+    let sign = if subtract { "-" } else { "+" };
+    let (AttributeValue::N(left_text), AttributeValue::N(right_text)) = (&left.value, &right.value)
+    else {
         return Err(Error::validation(format!(
-            "Invalid UpdateExpression: Incorrect operand type for operator or function; operator: {}, operand type: {} and {}",
-            if subtract { "-" } else { "+" },
-            type_name(left),
-            type_name(right)
+            "Invalid UpdateExpression: Incorrect operand type for operator or function; operator: {sign}, operand type: {} and {}",
+            type_name(&left.value),
+            type_name(&right.value)
         )));
     };
-    let (Some(left), Some(right)) = (Number::parse(left), Number::parse(right)) else {
-        return Err(Error::validation(
-            "Invalid UpdateExpression: a number operand could not be parsed",
-        ));
-    };
+    let left_number =
+        Number::parse(left_text).ok_or_else(|| unusable_number(left_text, left.origin, path))?;
+    let right_number =
+        Number::parse(right_text).ok_or_else(|| unusable_number(right_text, right.origin, path))?;
     let result = if subtract {
-        left.sub(&right)
+        left_number.sub(&right_number)
     } else {
-        left.add(&right)
+        left_number.add(&right_number)
     }
-    .ok_or_else(|| Error::validation("Invalid UpdateExpression: number out of range"))?;
+    .ok_or_else(|| number_overflow(path, &format!("{left_text} {sign} {right_text}")))?;
     let rendered = result
         .to_plain_string()
-        .ok_or_else(|| Error::validation("Invalid UpdateExpression: number out of range"))?;
-    Ok(AttributeValue::N(rendered))
+        .ok_or_else(|| number_overflow(path, &format!("{left_text} {sign} {right_text}")))?;
+    Ok(Evaluated {
+        value: AttributeValue::N(rendered),
+        origin: left.origin.both(right.origin),
+    })
 }
 
 /// Validate an `ADD` operand and return the value the item stores.
@@ -237,14 +310,16 @@ fn arithmetic(
 /// produces. Set members keep their spelling, as they do on the union path.
 fn validate_add_delta(delta: &AttributeValue, path: &str) -> Result<AttributeValue> {
     match delta {
-        AttributeValue::N(text) => Ok(AttributeValue::N(render_number(text)?)),
+        AttributeValue::N(text) => Ok(AttributeValue::N(render_number(text, path)?)),
         AttributeValue::Ns(members) => {
             refuse_empty_set(members.is_empty(), "number", path)?;
-            members
+            match members
                 .iter()
-                .try_for_each(|member| Number::parse(member).map(|_| ()))
-                .ok_or_else(unparseable_number)?;
-            Ok(delta.clone())
+                .find(|member| Number::parse(member).is_none())
+            {
+                Some(member) => Err(unusable_number(member, Origin::Request, path)),
+                None => Ok(delta.clone()),
+            }
         }
         AttributeValue::Ss(members) => {
             refuse_empty_set(members.is_empty(), "string", path)?;
@@ -258,20 +333,47 @@ fn validate_add_delta(delta: &AttributeValue, path: &str) -> Result<AttributeVal
     }
 }
 
-/// The one place `ADD` and the arithmetic chain reject an unparseable number,
-/// so both sides of a boundary report the same thing.
-fn unparseable_number() -> Error {
-    Error::validation("Invalid UpdateExpression: a number operand could not be parsed")
+/// The error for a number the arithmetic cannot read.
+///
+/// Where the text came from decides the class, because it decides who has to
+/// act. A `:placeholder` the caller sent is a rejected request, worded the way
+/// `PutItem` words the same text. A number read out of the item cannot be
+/// unreadable — `ADD` and `SET` both run their result through the same
+/// validation `PutItem` uses — so the mismatch is a broken invariant of the
+/// store: answering with a `ValidationException` would tell the caller to fix a
+/// request that is fine, and would leave the corrupt value invisible.
+///
+/// Both branches name the attribute and the value, because that is what a
+/// failing test has to point at.
+fn unusable_number(text: &str, origin: Origin, path: &str) -> Error {
+    match origin {
+        Origin::Request => Error::validation(format!(
+            "The parameter cannot be converted to a numeric value: {text} (attribute: {path})"
+        )),
+        Origin::Item => Error::internal(format!(
+            "the item holds `{text}` at `{path}`, which is not a number"
+        )),
+    }
 }
 
-fn number_out_of_range() -> Error {
-    Error::validation("Invalid UpdateExpression: number out of range")
+/// The error for a result outside DynamoDB's number range.
+///
+/// The service words an overflow as a `ValidationException`: both operands were
+/// storable on their own, the sum is not, and the request is what asked for it.
+/// `detail` names the operands so the failure says which sum ran out of range
+/// instead of only that one did.
+fn number_overflow(path: &str, detail: &str) -> Error {
+    Error::validation(format!(
+        "Number overflow. Attempting to store a number with magnitude larger than supported range (attribute: {path}, {detail})"
+    ))
 }
 
 /// Parse a number operand and render it the way the item stores it.
-fn render_number(text: &str) -> Result<String> {
-    let number = Number::parse(text).ok_or_else(unparseable_number)?;
-    number.to_plain_string().ok_or_else(number_out_of_range)
+fn render_number(text: &str, path: &str) -> Result<String> {
+    let number = Number::parse(text).ok_or_else(|| unusable_number(text, Origin::Request, path))?;
+    number
+        .to_plain_string()
+        .ok_or_else(|| number_overflow(path, text))
 }
 
 /// Reject an empty set operand, with the wording `PutItem` uses for one.
@@ -285,17 +387,28 @@ fn refuse_empty_set(is_empty: bool, kind: &str, path: &str) -> Result<()> {
 }
 
 /// `ADD` semantics: numbers add, sets union.
-fn add_values(current: &AttributeValue, delta: &AttributeValue) -> Result<AttributeValue> {
+///
+/// The stored side is read here, so it is the one place a corrupt number in the
+/// item can surface: it is reported as the broken invariant it is rather than as
+/// the caller's mistake. The delta was parsed by [`validate_add_delta`], so its
+/// arm cannot fire; it is spelled out so a future caller cannot lose the class.
+fn add_values(
+    current: &AttributeValue,
+    delta: &AttributeValue,
+    path: &str,
+) -> Result<AttributeValue> {
     match (current, delta) {
         (AttributeValue::N(left), AttributeValue::N(right)) => {
-            let (left, right) = (
-                Number::parse(left).ok_or_else(unparseable_number)?,
-                Number::parse(right).ok_or_else(unparseable_number)?,
-            );
-            let sum = left.add(&right).ok_or_else(number_out_of_range)?;
-            Ok(AttributeValue::N(
-                sum.to_plain_string().ok_or_else(number_out_of_range)?,
-            ))
+            let stored =
+                Number::parse(left).ok_or_else(|| unusable_number(left, Origin::Item, path))?;
+            let addition = Number::parse(right)
+                .ok_or_else(|| unusable_number(right, Origin::Request, path))?;
+            let sum = stored
+                .add(&addition)
+                .ok_or_else(|| number_overflow(path, &format!("{left} + {right}")))?;
+            Ok(AttributeValue::N(sum.to_plain_string().ok_or_else(
+                || number_overflow(path, &format!("{left} + {right}")),
+            )?))
         }
         _ => set_union(current, delta).ok_or_else(|| add_type_error(delta)),
     }
@@ -490,11 +603,15 @@ mod tests {
     fn add_rejects_an_unparseable_number_on_both_sides_of_the_boundary() {
         let values = crate::values([(":bad", n("not-a-number")), (":one", n("1"))]);
 
-        // Present attribute: the arithmetic path parses the operand.
+        // Present attribute: the delta is parsed before it is added, and the
+        // failure names the attribute it was meant for.
         let mut target = item([("pk", s("a")), ("count", n("1"))]);
         let error = apply("ADD count :bad", &mut target, &values).unwrap_err();
+        assert_eq!(error.code(), "ValidationException");
         assert!(
-            error.to_string().contains("could not be parsed"),
+            error.to_string().contains(
+                "The parameter cannot be converted to a numeric value: not-a-number (attribute: count)"
+            ),
             "unexpected error: {error}"
         );
         assert_eq!(target.get("count"), Some(&n("1")));
@@ -503,8 +620,11 @@ mod tests {
         // unparseable number into the item.
         let mut target = item([("pk", s("a"))]);
         let error = apply("ADD absent :bad", &mut target, &values).unwrap_err();
+        assert_eq!(error.code(), "ValidationException");
         assert!(
-            error.to_string().contains("could not be parsed"),
+            error.to_string().contains(
+                "The parameter cannot be converted to a numeric value: not-a-number (attribute: absent)"
+            ),
             "unexpected error: {error}"
         );
         assert!(!target.contains_key("absent"));
@@ -527,11 +647,110 @@ mod tests {
         // being stored in a spelling no read could use.
         let mut target = item([("pk", s("a"))]);
         let error = apply("ADD absent :far", &mut target, &values).unwrap_err();
+        assert_eq!(error.code(), "ValidationException");
         assert!(
-            error.to_string().contains("out of range"),
+            error.to_string().contains(
+                "Number overflow. Attempting to store a number with magnitude larger than supported range (attribute: absent, 1e500)"
+            ),
             "unexpected error: {error}"
         );
         assert!(!target.contains_key("absent"));
+    }
+
+    #[test]
+    fn set_arithmetic_names_the_attribute_and_the_operands() {
+        let values = crate::values([
+            (":bad", n("not-a-number")),
+            (":one", n("1")),
+            (":huge", n("1e500")),
+            (":zero", n("0")),
+        ]);
+
+        // A number the request carried that does not parse: the caller's
+        // mistake, still a rejected request, but now named with the attribute
+        // the assignment would have written.
+        let mut target = item([("pk", s("a")), ("count", n("1"))]);
+        let error = apply("SET count = count + :bad", &mut target, &values).unwrap_err();
+        assert_eq!(error.code(), "ValidationException");
+        assert!(
+            error
+                .to_string()
+                .contains("not-a-number (attribute: count)"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(target.get("count"), Some(&n("1")));
+
+        // Just inside: the same expression with a readable operand lands.
+        apply("SET count = count + :one", &mut target, &values).unwrap();
+        assert_eq!(target.get("count"), Some(&n("2")));
+
+        // An operand too far from the stored one to align: the sum leaves the
+        // range DynamoDB can store, and the failure names the sum.
+        let mut target = item([("pk", s("a")), ("total", n("1"))]);
+        let error = apply("SET total = total + :huge", &mut target, &values).unwrap_err();
+        assert_eq!(error.code(), "ValidationException");
+        assert!(
+            error.to_string().contains(
+                "Number overflow. Attempting to store a number with magnitude larger than supported range (attribute: total, 1 + 1e500)"
+            ),
+            "unexpected error: {error}"
+        );
+        assert_eq!(target.get("total"), Some(&n("1")));
+
+        // Just inside the same boundary: an operand that aligns still sums.
+        apply("SET total = total + :zero", &mut target, &values).unwrap();
+        assert_eq!(target.get("total"), Some(&n("1")));
+    }
+
+    #[test]
+    fn a_number_read_out_of_the_item_is_not_reported_as_the_callers_mistake() {
+        // No write can leave an unreadable number behind, so this is a broken
+        // invariant of the store, not a request to reject: it names the
+        // attribute and the value and carries the internal class.
+        let error = add_values(&n("not a number"), &n("1"), "count").unwrap_err();
+        assert_eq!(error.code(), "InternalServerError");
+        assert!(
+            error
+                .to_string()
+                .contains("the item holds `not a number` at `count`, which is not a number"),
+            "unexpected error: {error}"
+        );
+
+        // The same failure on the arithmetic path keeps the origin of the side
+        // that carried it.
+        let stored = Evaluated {
+            value: n("not a number"),
+            origin: Origin::Item,
+        };
+        let request = Evaluated {
+            value: n("1"),
+            origin: Origin::Request,
+        };
+        let error = arithmetic(&stored, &request, ArithOp::Add, "count").unwrap_err();
+        assert_eq!(error.code(), "InternalServerError");
+        assert!(
+            error.to_string().contains("at `count`"),
+            "unexpected error: {error}"
+        );
+
+        // Just outside: the identical text on the request side is the caller's
+        // mistake and stays a `ValidationException`.
+        let managed = Evaluated {
+            value: n("1"),
+            origin: Origin::Item,
+        };
+        let carried = Evaluated {
+            value: n("not a number"),
+            origin: Origin::Request,
+        };
+        let error = arithmetic(&managed, &carried, ArithOp::Add, "count").unwrap_err();
+        assert_eq!(error.code(), "ValidationException");
+        assert!(
+            error
+                .to_string()
+                .contains("not a number (attribute: count)"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -596,11 +815,14 @@ mod tests {
             Some(&AttributeValue::Ss(vec!["a".into()]))
         );
 
-        // A number-set member has to parse, too.
+        // A number-set member has to parse, too, and the failure names it.
         let mut target = item([("pk", s("a"))]);
         let error = apply("ADD absent :bad_n", &mut target, &values).unwrap_err();
+        assert_eq!(error.code(), "ValidationException");
         assert!(
-            error.to_string().contains("could not be parsed"),
+            error.to_string().contains(
+                "The parameter cannot be converted to a numeric value: nope (attribute: absent)"
+            ),
             "unexpected error: {error}"
         );
 
