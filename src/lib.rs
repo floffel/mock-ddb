@@ -84,6 +84,13 @@
 //!   but there is no provisioned throughput, no throttling, no
 //!   `ProvisionedThroughputExceededException` and no 10 GB collection limit.
 //! - A `Query` without a key condition returns every item instead of failing.
+//! - An idempotency token is remembered for ten minutes on the injected clock,
+//!   as on the service, and a resubmitted token with different actions is
+//!   refused with `IdempotentParameterMismatchException`. A replay returns an
+//!   empty response rather than the original `ConsumedCapacity` and
+//!   `ItemCollectionMetrics`, and only a transaction that applied spends its
+//!   token: a cancelled one records nothing, so a retry re-evaluates its
+//!   conditions instead of replaying the cancellation.
 //! - Streams have a single open shard and unlimited retention: shard iterators
 //!   never expire, never split and never trim, where the service keeps 24 hours
 //!   and closes a shard after four hours of inactivity. The Streams API

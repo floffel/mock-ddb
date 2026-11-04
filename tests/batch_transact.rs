@@ -3,11 +3,15 @@
 
 mod common;
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use common::{order, order_key, orders, user, user_key, users};
 use mock_ddb::{
     item, n, s, values, BatchGetItemRequest, BatchWriteItemRequest, Error, GetItemRequest,
-    KeysAndAttributes, MockDdb, TransactGet, TransactGetItemsRequest, TransactWriteItem,
-    TransactWriteItemsRequest, UpdateItemRequest, WriteRequest,
+    KeysAndAttributes, MockClock, MockDdb, ReturnConsumedCapacity, TransactGet,
+    TransactGetItemsRequest, TransactWriteItem, TransactWriteItemsRequest, UpdateItemRequest,
+    WriteRequest,
 };
 
 #[tokio::test]
@@ -386,6 +390,36 @@ async fn transaction_token_makes_a_retry_a_no_op() {
     let mock = orders();
     let token = "retry-token-1";
 
+    let first = TransactWriteItemsRequest::new(vec![TransactWriteItem::put(
+        "orders",
+        order("c1", 1, "10"),
+    )])
+    .with_client_request_token(token);
+
+    mock.transact_write_items(first.clone()).await.unwrap();
+
+    // Same token, same payload: the retry writes nothing.
+    mock.transact_write_items(first.clone()).await.unwrap();
+    assert_eq!(mock.count("orders"), 1);
+
+    // The payload is compared once the token and the response-shaping flags are
+    // cleared, so a retry may ask for a different capacity report and still be
+    // the same request.
+    mock.transact_write_items(
+        first
+            .clone()
+            .with_return_consumed_capacity(ReturnConsumedCapacity::Total),
+    )
+    .await
+    .unwrap();
+    assert_eq!(mock.count("orders"), 1);
+}
+
+#[tokio::test]
+async fn transaction_token_with_a_different_payload_is_refused() {
+    let mock = orders();
+    let token = "constant-token";
+
     mock.transact_write_items(
         TransactWriteItemsRequest::new(vec![TransactWriteItem::put(
             "orders",
@@ -396,17 +430,35 @@ async fn transaction_token_makes_a_retry_a_no_op() {
     .await
     .unwrap();
 
-    // Same token, different payload: the service replays the earlier result and
-    // applies nothing.
-    mock.transact_write_items(
-        TransactWriteItemsRequest::new(vec![TransactWriteItem::put(
-            "orders",
-            order("c1", 2, "20"),
-        )])
-        .with_client_request_token(token),
-    )
-    .await
-    .unwrap();
+    // Same token, different item: the service refuses instead of discarding the
+    // second write, so a lost write cannot pass as a retry.
+    let error = mock
+        .transact_write_items(
+            TransactWriteItemsRequest::new(vec![TransactWriteItem::put(
+                "orders",
+                order("c1", 2, "20"),
+            )])
+            .with_client_request_token(token),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "IdempotentParameterMismatchException");
+    assert!(!error.is_retryable());
+
+    // Same token and same item, but with a different condition: a different
+    // request as well.
+    let updated = mock
+        .transact_write_items(
+            TransactWriteItemsRequest::new(vec![TransactWriteItem::put(
+                "orders",
+                order("c1", 1, "10"),
+            )
+            .with_condition("attribute_exists(pk)")])
+            .with_client_request_token(token),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(updated.code(), "IdempotentParameterMismatchException");
 
     assert_eq!(mock.count("orders"), 1);
     assert!(mock
@@ -415,6 +467,41 @@ async fn transaction_token_makes_a_retry_a_no_op() {
         .unwrap()
         .item
         .is_none());
+}
+
+#[tokio::test]
+async fn transaction_token_is_forgotten_after_ten_minutes() {
+    let clock = Arc::new(MockClock::at_epoch_seconds(1_700_000_000));
+    let mock = orders();
+    mock.set_clock(clock.clone());
+    let token = "expiring-token";
+    let request = |total: &str| {
+        TransactWriteItemsRequest::new(vec![TransactWriteItem::put(
+            "orders",
+            order("c1", 1, total),
+        )])
+        .with_client_request_token(token)
+    };
+
+    mock.transact_write_items(request("10")).await.unwrap();
+
+    // Inside the window: still a replay, even with a different payload, which the
+    // service refuses rather than replays.
+    clock.advance(Duration::from_secs(599));
+    let inside = mock.transact_write_items(request("20")).await.unwrap_err();
+    assert_eq!(inside.code(), "IdempotentParameterMismatchException");
+    assert_eq!(mock.count("orders"), 1);
+
+    // Outside the window — ten minutes after the token was spent — the token is
+    // forgotten, so the request is a new one and applies.
+    clock.advance(Duration::from_secs(1));
+    mock.transact_write_items(request("30")).await.unwrap();
+    assert_eq!(mock.count("orders"), 1);
+    let stored = mock
+        .get_item(GetItemRequest::new("orders", order_key("c1", 1)))
+        .await
+        .unwrap();
+    assert_eq!(stored.item.unwrap()["total"], n("30"));
 }
 
 #[tokio::test]
