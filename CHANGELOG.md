@@ -8,6 +8,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- PartiQL: `MockDdb::execute_statement` and `MockDdb::batch_execute_statement`
+  accept `SELECT`, `INSERT`, `UPDATE` and `DELETE` (`BatchExecuteStatement` takes
+  1–25 statements, all reads or all writes), with positional `?` parameters,
+  document paths, `WHERE` clauses carrying the same comparisons, functions and
+  connectives as a `ConditionExpression`, `Limit`/`NextToken` paging and
+  `ReturnConsumedCapacity`. Statements are parsed into typed nodes and lowered
+  onto the native requests, so capacity, TTL, streams, index maintenance and
+  every validation stay in one place; `PartiqlStatement::parse` exposes the same
+  work to a test that wants to assert a statement's shape (`kind`,
+  `table_name`, `parameters`) without running it. The service's limits are
+  enforced before the wire: 1–8192 characters per statement
+  (`MAX_STATEMENT_LENGTH`), 1–25 statements per batch (`MAX_BATCH_STATEMENTS`),
+  a parameter count that has to match the `?` placeholders, and a batch whose
+  members are all reads or all writes. An `INSERT` on an existing primary key
+  is a `DuplicateItemException` (`Error::DuplicateItem`), as on the service.
+  PartiQL is no longer listed as unmodelled; the README records where the mock
+  is more permissive than the service (a `SELECT` without a partition-key
+  condition scans instead of raising) and which PartiQL constructs DynamoDB's
+  dialect does not have either.
 - `ConsumedCapacity` and `ItemCollectionMetrics` on every data-plane response.
   `PutItemRequest`, `GetItemRequest`, `DeleteItemRequest`, `UpdateItemRequest`,
   `QueryRequest`, `ScanRequest`, `BatchWriteItemRequest`, `BatchGetItemRequest`,

@@ -1,5 +1,5 @@
 //! An in-process DynamoDB for tests — tables, expressions, queries, batches,
-//! transactions, TTL and streams, with no network and no AWS account.
+//! transactions, TTL, streams and PartiQL, with no network and no AWS account.
 //!
 //! `aws_sdk_dynamodb::Client` speaks to the service; this crate speaks to a
 //! `HashMap` in the test's address space and implements the same request and
@@ -66,6 +66,7 @@
 //! | TTL | `update_time_to_live`, `describe_time_to_live`, lazy expiry, `purge_expired` |
 //! | Streams | one ordered log per table, `get_records`, `list_streams` (feature `streams`) |
 //! | Streams API | `ListStreams`, `DescribeStream`, `GetShardIterator` and `GetRecords` with their wire shapes, limits and iterators, through [`MockDdb::streams`] |
+//! | PartiQL | `execute_statement` (`SELECT`/`INSERT`/`UPDATE`/`DELETE`) and `batch_execute_statement`, lowered onto the native calls |
 //!
 //! # Deliberate differences from the service
 //!
@@ -110,6 +111,7 @@ mod error;
 mod expr;
 mod mock;
 mod number;
+mod partiql;
 mod request;
 mod schema;
 #[cfg(feature = "streams")]
@@ -131,6 +133,12 @@ pub use clock::{Clock, MockClock, SystemClock};
 pub use error::{n, s, CancellationReason, CancellationReasonCode, Error, Result};
 pub use expr::{ConditionExpression, ProjectionExpression, UpdateExpression};
 pub use mock::MockDdb;
+pub use partiql::{
+    BatchExecuteStatementOutput, BatchExecuteStatementRequest, BatchStatementError,
+    BatchStatementErrorCode, BatchStatementRequest, BatchStatementResponse, ExecuteStatementOutput,
+    ExecuteStatementRequest, PartiqlStatement, ReturnValuesOnConditionCheckFailure, StatementKind,
+    MAX_BATCH_STATEMENTS, MAX_STATEMENT_LENGTH,
+};
 pub use request::{
     item, names, values, BatchGetItemOutput, BatchGetItemRequest, BatchWriteItemOutput,
     BatchWriteItemRequest, DeleteItemOutput, DeleteItemRequest, DescribeTableOutput, GetItemOutput,

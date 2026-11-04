@@ -1,0 +1,1 @@
+INSERT INTO "users" VALUE {'pk': ?, 'name': 'Ada'}

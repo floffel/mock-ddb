@@ -129,6 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | TTL | `update_time_to_live`, `describe_time_to_live`, lazy expiry on every read path, `purge_expired` |
 | Streams | one ordered log per table, `get_records`, `list_streams`, `NEW_IMAGE` / `OLD_IMAGE` / `NEW_AND_OLD_IMAGES` / `KEYS_ONLY` (feature `streams`, on by default) |
 | Streams API | `MockDdb::streams()` returns the wire API: `list_streams` (with `ExclusiveStartStreamArn` and limit), `describe_stream` (label, view type, shard, sequence range), `get_shard_iterator` (`TRIM_HORIZON`, `LATEST`, `AT_SEQUENCE_NUMBER`, `AFTER_SEQUENCE_NUMBER`) and `get_records` (limit 1–1000, `NextShardIterator`), with records in the Kinesis adapter's shape |
+| PartiQL | `execute_statement` (`SELECT`, `INSERT`, `UPDATE`, `DELETE`) and `batch_execute_statement` (1–25 statements, all reads or all writes), lowered onto the native calls so capacity, TTL, streams and index maintenance stay in one place. `PartiqlStatement` types a statement (`kind`, `table_name`, `parameters`) before the wire sees it |
 | Test helpers | `seed`, `dump`, `count`, `clear`, `set_clock`, `purge_expired`, `item_to_value` / `item_from_value` for embedding an item as `AttributeValue::M` |
 
 ### Expressions
@@ -248,10 +249,25 @@ that changes what a caller must do is called out.
 15. **Table names are validated** against the documented pattern and length
     (3–255 characters, `[a-zA-Z0-9_.-]+`), so a test cannot pass with a name the
     service would reject.
+16. **A `SELECT` whose `WHERE` does not pin the partition key scans.** The
+    service raises `ValidationException` for such a statement; the mock reads
+    the table with a `Scan` instead, which is what a test that wants to inspect
+    a whole table actually means. A `WHERE` that does pin it becomes a `Query`,
+    so ordering, `Limit` and `NextToken` behave like the native call.
+17. **PartiQL covers DynamoDB's dialect, not full PartiQL.** `RETURNING`,
+    `ORDER BY`, aggregates, joins and multi-statement strings are absent from
+    the service's dialect too and are rejected with the service's
+    `ValidationException`. An `INSERT` on an existing primary key is a
+    `DuplicateItemException` (the service's class: `INSERT` never overwrites),
+    and every write has to name the whole primary key: a `WHERE` that matches no
+    row changes nothing and reports `ConditionalCheckFailedException`, and an
+    `UPDATE` without a `WHERE` is a `ValidationException` rather than an
+    implicit insert. `IS NULL` asks whether the attribute holds DynamoDB's NULL
+    value and `IS MISSING` whether it is absent — an absent attribute is neither
+    `NULL` nor `NOT NULL`.
 
 ## Not modelled at all
 
-- PartiQL / `ExecuteStatement`.
 - DAX, global tables, backups, point-in-time recovery, tags, resource policies.
 - `ConditionExpression` on `BatchWriteItem` (the service does not have one
   either) and `ReturnValues` on `BatchGetItem`.
