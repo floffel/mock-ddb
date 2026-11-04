@@ -11,7 +11,16 @@
 //! all of them have succeeded: a write can still fail on its own — a nested
 //! path whose parent does not exist, a list index past the end — and the
 //! service writes nothing at all when it rejects an update. A caller that gets
-//! an error therefore keeps exactly the item it passed in.
+//! an error therefore keeps exactly the item it passed in. The copy is taken
+//! after the right-hand sides are evaluated, so a rejected expression never
+//! allocates one.
+//!
+//! Nothing here may grow a value without a bound. `list_append(a, a)` doubles a
+//! list, and a nested one doubles again per level, so the concatenation is
+//! measured *before* it is built and refused once it would pass the item limit;
+//! the finished item is measured again before it replaces the caller's. An
+//! expression can therefore never allocate an item the service would refuse to
+//! store.
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -23,7 +32,10 @@ use super::parse::{reject_overlapping, ArithOp, Operand, Path, SetValue, Update,
 use super::path::{get_path, invalid_nested_path, remove_path, render, root, set_path};
 use crate::number::Number;
 use crate::schema::KeySchema;
-use crate::value::{is_set, set_difference, set_union, type_name};
+use crate::value::{
+    is_set, item_size, item_too_large, list_size, set_difference, set_union, type_name,
+    MAX_ITEM_SIZE,
+};
 use crate::{Error, Item, Result};
 
 /// A single write, resolved against the pre-update snapshot.
@@ -64,7 +76,6 @@ pub(crate) fn apply(
     key_schema: &KeySchema,
 ) -> Result<BTreeSet<String>> {
     reject_overlapping_targets(update, ctx)?;
-    let mut work = item.clone();
     let mut mutations: Vec<Mutation> = Vec::new();
     let mut touched: BTreeSet<String> = BTreeSet::new();
 
@@ -77,7 +88,7 @@ pub(crate) fn apply(
                         .ok_or_else(|| invalid_nested_path(&resolved))?
                         .to_string();
                     reject_key_attribute(&name, key_schema)?;
-                    let value = evaluate_set_value(value, &work, ctx, &render(&resolved))?.value;
+                    let value = evaluate_set_value(value, item, ctx, &render(&resolved))?.value;
                     touched.insert(name);
                     mutations.push(Mutation::Set(resolved, value));
                 }
@@ -101,12 +112,12 @@ pub(crate) fn apply(
                         .to_string();
                     reject_key_attribute(&name, key_schema)?;
                     let delta = ctx
-                        .operand_value(operand, Some(&work))?
+                        .operand_value(operand, Some(item))?
                         .map(Cow::into_owned)
                         .ok_or_else(|| undefined_operand(operand))?;
                     let rendered = render(&resolved);
                     let delta = validate_add_delta(&delta, &rendered)?;
-                    let current = get_path(&work, &resolved).cloned();
+                    let current = get_path(item, &resolved).cloned();
                     let updated = match current {
                         None => delta,
                         Some(current) => add_values(&current, &delta, &rendered)?,
@@ -123,10 +134,10 @@ pub(crate) fn apply(
                         .to_string();
                     reject_key_attribute(&name, key_schema)?;
                     let delta = ctx
-                        .operand_value(operand, Some(&work))?
+                        .operand_value(operand, Some(item))?
                         .map(Cow::into_owned)
                         .ok_or_else(|| undefined_operand(operand))?;
-                    let Some(current) = get_path(&work, &resolved).cloned() else {
+                    let Some(current) = get_path(item, &resolved).cloned() else {
                         continue;
                     };
                     let remaining = set_difference(&current, &delta).ok_or_else(|| {
@@ -146,11 +157,18 @@ pub(crate) fn apply(
         }
     }
 
+    let mut work = item.clone();
     for mutation in mutations {
         match mutation {
             Mutation::Set(path, value) => set_path(&mut work, &path, value)?,
             Mutation::Remove(path) => remove_path(&mut work, &path),
         }
+    }
+    // The service refuses an item past the limit, so the caller gets the
+    // refusal instead of an item it could never have stored itself.
+    let size = item_size(&work);
+    if size > MAX_ITEM_SIZE {
+        return Err(item_too_large(size));
     }
     *item = work;
     Ok(touched)
@@ -237,6 +255,15 @@ fn evaluate_set_value(
             let origin = first.origin.both(second.origin);
             match (first.value, second.value) {
                 (AttributeValue::L(mut left), AttributeValue::L(right)) => {
+                    // Measure before joining: `list_append(a, a)` on an item
+                    // near the limit would otherwise allocate a value the
+                    // service can never store, and each nesting level would
+                    // double again. The sum is the exact size of the result,
+                    // so the boundary falls where the item limit does.
+                    let grown = list_size(&left) + list_size(&right);
+                    if grown > MAX_ITEM_SIZE {
+                        return Err(item_too_large(grown));
+                    }
                     left.extend(right);
                     Ok(Evaluated {
                         value: AttributeValue::L(left),
@@ -552,6 +579,71 @@ mod tests {
                 ("mm".to_string(), s("y")),
             ])))
         );
+    }
+
+    #[test]
+    fn a_set_is_refused_once_the_item_passes_the_limit() {
+        // pk: name 2 + value 1 = 3 bytes, so a payload of MAX - 7 fills the
+        // item exactly.
+        let fitting = "x".repeat(MAX_ITEM_SIZE - 7);
+        let mut target = item([("pk", s("a")), ("blob", s("x"))]);
+        let values = crate::values([(":v", s(&fitting))]);
+        apply("SET blob = :v", &mut target, &values).unwrap();
+        assert_eq!(item_size(&target), MAX_ITEM_SIZE);
+
+        // One byte more is past the limit, and the item keeps the value it had.
+        let too_large = "x".repeat(MAX_ITEM_SIZE - 6);
+        let mut target = item([("pk", s("a")), ("blob", s("kept"))]);
+        let values = crate::values([(":v", s(&too_large))]);
+        let error = apply("SET blob = :v", &mut target, &values).unwrap_err();
+        assert_eq!(error.code(), "ValidationException");
+        assert!(
+            error.to_string().contains("maximum allowed size"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(target.get("blob"), Some(&s("kept")));
+    }
+
+    #[test]
+    fn list_append_refuses_to_double_a_list_past_the_limit() {
+        // Two elements of MAX/2 - 16 bytes each: the list itself is inside the
+        // limit, the concatenation with itself is not.
+        let element = "x".repeat(MAX_ITEM_SIZE / 2 - 16);
+        let list = AttributeValue::L(vec![s(&element), s(&element)]);
+        let mut target = item([("pk", s("a")), ("l", list.clone())]);
+        let error = apply("SET l = list_append(l, l)", &mut target, &ValueMap::new()).unwrap_err();
+        assert_eq!(error.code(), "ValidationException");
+        assert!(
+            error.to_string().contains("maximum allowed size"),
+            "unexpected error: {error}"
+        );
+        // The refusal happens before the copy: the caller's list is untouched.
+        assert_eq!(target.get("l"), Some(&list));
+    }
+
+    #[test]
+    fn nested_list_appends_are_refused_where_they_would_cross_the_limit() {
+        // Base 163 KiB: the doubling fits, the quadrupling does not.
+        let element = "x".repeat(80 * 1024);
+        let list = AttributeValue::L(vec![s(&element), s(&element)]);
+
+        let mut doubling = item([("pk", s("a")), ("l", list.clone())]);
+        apply("SET l = list_append(l, l)", &mut doubling, &ValueMap::new()).unwrap();
+        assert!(
+            item_size(&doubling) < MAX_ITEM_SIZE,
+            "the doubling itself has to fit for this test to say anything"
+        );
+
+        let mut quad = item([("pk", s("a")), ("l", list)]);
+        let before = quad.get("l").cloned();
+        let error = apply(
+            "SET l = list_append(list_append(l, l), list_append(l, l))",
+            &mut quad,
+            &ValueMap::new(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "ValidationException");
+        assert_eq!(quad.get("l").cloned(), before);
     }
 
     #[test]

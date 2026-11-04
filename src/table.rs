@@ -14,7 +14,7 @@ use crate::schema::{
 };
 #[cfg(feature = "streams")]
 use crate::stream::{StreamEventName, StreamState};
-use crate::value::{item_size, type_name, validate_value, Scalar, MAX_ITEM_SIZE};
+use crate::value::{item_size, item_too_large, type_name, validate_value, Scalar, MAX_ITEM_SIZE};
 use crate::{Error, Item, Result};
 
 /// A primary key: partition scalar plus optional sort scalar.
@@ -236,9 +236,7 @@ impl Table {
         }
         let size = item_size(item);
         if size > MAX_ITEM_SIZE {
-            return Err(Error::validation(format!(
-                "Item size has exceeded the maximum allowed size ({size} bytes > {MAX_ITEM_SIZE})"
-            )));
+            return Err(item_too_large(size));
         }
         Ok(())
     }

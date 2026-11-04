@@ -14,6 +14,17 @@ use crate::{Error, Item, Result};
 /// The documented maximum size of an item, in bytes.
 pub(crate) const MAX_ITEM_SIZE: usize = 400 * 1024;
 
+/// The error a write gets when the item it would store is too large.
+///
+/// Shared so the `put` path and the update evaluator reject the same limit
+/// with the same message: a caller must not be able to tell which code path
+/// noticed.
+pub(crate) fn item_too_large(size: usize) -> Error {
+    Error::validation(format!(
+        "Item size has exceeded the maximum allowed size ({size} bytes > {MAX_ITEM_SIZE})"
+    ))
+}
+
 /// A value usable as part of a key.
 ///
 /// DynamoDB orders key attributes by raw value: strings byte-wise (which for
@@ -232,9 +243,7 @@ pub(crate) fn value_size(value: &AttributeValue) -> usize {
                 .sum::<usize>()
                 + 3 * members.len()
         }
-        AttributeValue::L(elements) => {
-            elements.iter().map(value_size).sum::<usize>() + 3 * elements.len()
-        }
+        AttributeValue::L(elements) => list_size(elements),
         AttributeValue::M(entries) => {
             entries
                 .iter()
@@ -251,6 +260,15 @@ pub(crate) fn item_size(item: &Item) -> usize {
     item.iter()
         .map(|(name, value)| name.len() + value_size(value))
         .sum()
+}
+
+/// Storage size of a list's elements, as `list_append` would concatenate them.
+///
+/// Separate from [`value_size`] so the update evaluator can measure the two
+/// halves of a `list_append` before it joins them and therefore before it
+/// allocates the result.
+pub(crate) fn list_size(elements: &[AttributeValue]) -> usize {
+    elements.iter().map(value_size).sum::<usize>() + 3 * elements.len()
 }
 
 /// Validate one value: numbers must parse within DynamoDB's limits and sets

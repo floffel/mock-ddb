@@ -299,12 +299,16 @@ impl UpdateExpression {
     /// refers to a missing attribute, a nested path's parent does not exist, a
     /// list index is out of range, an operand has the wrong type for the
     /// operator, an `ADD` operand is a value the item could not hold — an
-    /// unparseable number, an empty set — or the target paths overlap once
-    /// `#alias` placeholders are resolved.
+    /// unparseable number, an empty set — the target paths overlap once
+    /// `#alias` placeholders are resolved, or the result would be larger than
+    /// the service's 400 KiB item limit.
     ///
     /// An error leaves `item` exactly as the caller passed it: the writes are
     /// staged on a copy and committed only once every clause has succeeded, so
-    /// an item kept after an error is never half-updated.
+    /// an item kept after an error is never half-updated. Nothing is allocated
+    /// past the item limit on the way to that error either, so an expression
+    /// such as `SET a = list_append(a, a)` is refused instead of doubling the
+    /// item in memory first.
     ///
     /// ```
     /// use std::collections::HashMap;
