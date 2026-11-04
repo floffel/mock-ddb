@@ -1483,9 +1483,13 @@ mod tests {
         }
 
         /// A set that gains members and loses them again is the set it was:
-        /// the delta is exactly what the `DELETE` takes back.
+        /// the delta is exactly what the `DELETE` takes back. The pair has to
+        /// be disjoint for that to hold — over a member both sets carry, `ADD`
+        /// changes nothing and `DELETE` then removes it, which
+        /// [`delete_after_add_over_an_overlap_loses_the_member`] pins down.
         #[test]
         fn delete_after_add_restores_the_set((stored, delta) in same_type_sets()) {
+            let delta = set_difference(&delta, &stored).unwrap();
             let united = add_values(&stored, &delta, "members").unwrap();
             let remaining = set_difference(&united, &delta).unwrap();
             prop_assert_eq!(remaining, stored);
@@ -1584,5 +1588,24 @@ mod tests {
                 prop_assert_eq!(target, original);
             }
         }
+    }
+
+    /// The overlap the property above cannot assert on: `ADD` of a member the
+    /// set already holds leaves the set unchanged, and the following `DELETE`
+    /// removes that member, so the attribute loses it. Just outside, a member
+    /// only the stored set carries survives.
+    #[test]
+    fn delete_after_add_over_an_overlap_loses_the_member() {
+        let shared = AttributeValue::Ns(vec!["831".to_string()]);
+        let united = add_values(&shared, &shared, "members").unwrap();
+        assert_eq!(united, shared);
+        let remaining = set_difference(&united, &shared).unwrap();
+        assert_eq!(empty_set(&remaining), Some(true));
+
+        let stored = AttributeValue::Ns(vec!["831".to_string()]);
+        let delta = AttributeValue::Ns(vec!["832".to_string()]);
+        let united = add_values(&stored, &delta, "members").unwrap();
+        let remaining = set_difference(&united, &delta).unwrap();
+        assert_eq!(remaining, stored);
     }
 }

@@ -130,7 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | Streams | one ordered log per table, `get_records`, `list_streams`, `NEW_IMAGE` / `OLD_IMAGE` / `NEW_AND_OLD_IMAGES` / `KEYS_ONLY` (feature `streams`, on by default) |
 | Streams API | `MockDdb::streams()` returns the wire API: `list_streams` (with `ExclusiveStartStreamArn` and limit), `describe_stream` (label, view type, shard, sequence range), `get_shard_iterator` (`TRIM_HORIZON`, `LATEST`, `AT_SEQUENCE_NUMBER`, `AFTER_SEQUENCE_NUMBER`) and `get_records` (limit 1–1000, `NextShardIterator`), with records in the Kinesis adapter's shape |
 | PartiQL | `execute_statement` (`SELECT`, `INSERT`, `UPDATE`, `DELETE`) and `batch_execute_statement` (1–25 statements, all reads or all writes), lowered onto the native calls so capacity, TTL, streams and index maintenance stay in one place. `PartiqlStatement` types a statement (`kind`, `table_name`, `parameters`) before the wire sees it |
-| Test helpers | `seed`, `dump`, `count`, `clear`, `set_clock`, `purge_expired`, `item_to_value` / `item_from_value` for embedding an item as `AttributeValue::M` |
+| Test helpers | `seed`, `dump`, `count`, `clear`, `set_clock`, `purge_expired`, `item_to_value` for embedding an item as `AttributeValue::M`, and `item_ref_from_value` (borrowing), `into_item` (consuming) or `item_from_value` (cloning) to read it back |
 
 ### Expressions
 
