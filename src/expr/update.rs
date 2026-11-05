@@ -410,12 +410,13 @@ fn validate_delete_delta(delta: &AttributeValue, path: &str) -> Result<()> {
 /// Both branches name the attribute and the value, because that is what a
 /// failing test has to point at.
 fn unusable_number(text: &str, origin: Origin, path: &str) -> Error {
+    let shown = crate::number::excerpt(text);
     match origin {
         Origin::Request => Error::validation(format!(
-            "The parameter cannot be converted to a numeric value: {text} (attribute: {path})"
+            "The parameter cannot be converted to a numeric value: {shown} (attribute: {path})"
         )),
         Origin::Item => Error::internal(format!(
-            "the item holds `{text}` at `{path}`, which is not a number"
+            "the item holds `{shown}` at `{path}`, which is not a number"
         )),
     }
 }

@@ -14,6 +14,7 @@
 //! value — and, through the same check, on the result of `add` and `sub`, so
 //! arithmetic cannot hand back a number the write path would reject.
 
+use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 
@@ -57,6 +58,24 @@ const MAX_ORDER: i64 = 126;
 /// `1e2147483647` would otherwise ask for gigabytes.
 const MAX_PADDING: usize = 130;
 
+/// Longest literal [`Number::parse`] will look at, in bytes.
+///
+/// The longest number DynamoDB stores is 38 digits plus a sign, a decimal point
+/// and an exponent — under 50 bytes, even counting leading zeros the grammar
+/// allows. A cap of 1 KiB therefore refuses no storable value while keeping a
+/// caller-supplied megabyte string away from the decimal parser, the
+/// normalisation pass and every error message that quotes the literal. It also
+/// bounds the mantissa [`Number::to_plain_string`] has to render: the padding
+/// guard below limits the zeros, not `digits.len()`.
+const MAX_LITERAL_BYTES: usize = 1024;
+
+/// Longest run of a caller-supplied literal that an error message quotes.
+///
+/// Number errors repeat the offending value so that a failing test names it,
+/// and nothing bounds that value before the length check, so quoting it whole
+/// would copy a hostile request's bytes into the error string.
+const MAX_QUOTED_BYTES: usize = 64;
+
 /// Why a value cannot be stored, or that it can.
 ///
 /// One verdict, consulted from both ends of the module: [`validate`] turns it
@@ -85,8 +104,14 @@ impl Number {
     /// Parse a DynamoDB number string. `None` means the string is not a number.
     ///
     /// The grammar check is DynamoDB's, not the decimal crate's: see the
-    /// module documentation for why it cannot be delegated.
+    /// module documentation for why it cannot be delegated. A literal longer
+    /// than [`MAX_LITERAL_BYTES`] is refused as its first statement: no
+    /// storable number comes near that, and parsing it first would let a
+    /// caller's megabyte string allocate a mantissa and a normalised copy.
     pub(crate) fn parse(text: &str) -> Option<Self> {
+        if text.len() > MAX_LITERAL_BYTES {
+            return None;
+        }
         let text = text.trim();
         if text.is_empty() {
             return None;
@@ -326,6 +351,23 @@ impl Hash for Number {
     }
 }
 
+/// A bounded excerpt of a caller-supplied number literal, for error messages.
+///
+/// Short literals are borrowed unchanged; a longer one is cut at
+/// [`MAX_QUOTED_BYTES`] (on a character boundary, so no slicing panic) and
+/// marked with `…` — the message stays distinguishable from one that quotes a
+/// shorter number.
+pub(crate) fn excerpt(text: &str) -> Cow<'_, str> {
+    if text.len() <= MAX_QUOTED_BYTES {
+        return Cow::Borrowed(text);
+    }
+    let mut end = MAX_QUOTED_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Cow::Owned(format!("{}…", &text[..end]))
+}
+
 /// Validate a number string against DynamoDB's documented limits.
 ///
 /// The service rejects numbers with more than 38 significant digits and
@@ -337,19 +379,28 @@ impl Hash for Number {
 /// back. The exponent check is also what keeps `1e2147483647` from reaching
 /// [`Number::to_plain_string`] with a padding request that no machine can
 /// satisfy.
+///
+/// A literal longer than [`MAX_LITERAL_BYTES`] is not a number here — not
+/// because its digits are illegal, but because nothing the service stores is
+/// that long, and inspecting it would cost a copy per megabyte. The offending
+/// literal is quoted through [`excerpt`] in every message, so a hostile value
+/// cannot decide the size of the error it produces.
 pub(crate) fn validate(text: &str) -> crate::Result<()> {
     let Some(number) = Number::parse(text) else {
         return Err(crate::Error::validation(format!(
-            "The parameter cannot be converted to a numeric value: {text}"
+            "The parameter cannot be converted to a numeric value: {}",
+            excerpt(text)
         )));
     };
     match number.storability() {
         Storability::Storable => Ok(()),
         Storability::TooManyDigits => Err(crate::Error::validation(format!(
-            "Attempting to store more than {MAX_SIGNIFICANT_DIGITS} significant digits in a Number: {text}"
+            "Attempting to store more than {MAX_SIGNIFICANT_DIGITS} significant digits in a Number: {}",
+            excerpt(text)
         ))),
         Storability::OutOfRange => Err(crate::Error::validation(format!(
-            "Attempting to store a Number outside the supported exponent range (1E-130 to 9.99E+125): {text}"
+            "Attempting to store a Number outside the supported exponent range (1E-130 to 9.99E+125): {}",
+            excerpt(text)
         ))),
     }
 }
@@ -486,6 +537,68 @@ mod tests {
         assert!(validate("1.2.3").is_err());
         assert!(validate(&"9".repeat(39)).is_err());
         assert!(validate(&"9".repeat(38)).is_ok());
+    }
+
+    #[test]
+    fn parse_refuses_literals_past_the_length_cap() {
+        // Leading zeros are grammar, so `0…01` is a storable `1`; at exactly
+        // the cap it still parses.
+        let at_limit = format!("{}1", "0".repeat(MAX_LITERAL_BYTES - 1));
+        assert_eq!(at_limit.len(), MAX_LITERAL_BYTES);
+        assert_eq!(
+            Number::parse(&at_limit)
+                .expect("a literal at the cap parses")
+                .to_plain_string()
+                .as_deref(),
+            Some("1")
+        );
+        assert!(validate(&at_limit).is_ok());
+
+        // One byte further is refused before the parser, the normaliser or an
+        // error message sees it.
+        let past_limit = format!("{}1", "0".repeat(MAX_LITERAL_BYTES));
+        assert!(Number::parse(&past_limit).is_none());
+        assert!(validate(&past_limit).is_err());
+
+        // Surrounding whitespace counts against the cap, so a long string is
+        // not trimmed down to size first.
+        let padded = format!("{}1", " ".repeat(MAX_LITERAL_BYTES));
+        assert!(Number::parse(&padded).is_none());
+    }
+
+    #[test]
+    fn number_errors_quote_only_an_excerpt() {
+        // The audit's case (issue #61): the request supplies a literal of
+        // several megabytes. It is refused, and the error stays small instead
+        // of repeating the value.
+        let hostile = "9".repeat(4 * MAX_LITERAL_BYTES);
+        let error = validate(&hostile).unwrap_err().to_string();
+        assert!(
+            error.starts_with("The parameter cannot be converted to a numeric value:"),
+            "{error}"
+        );
+        assert!(
+            error.len() < MAX_QUOTED_BYTES + 100,
+            "{} bytes",
+            error.len()
+        );
+        assert!(error.ends_with('…'), "{error}");
+
+        // Boundary pair: a literal at the quoting limit is copied whole, one
+        // byte past it is cut.
+        let quoted = "9".repeat(MAX_QUOTED_BYTES);
+        assert_eq!(excerpt(&quoted).as_ref(), quoted.as_str());
+        let longer = "9".repeat(MAX_QUOTED_BYTES + 1);
+        let cut = excerpt(&longer);
+        assert_eq!(cut.chars().filter(|c| *c == '9').count(), MAX_QUOTED_BYTES);
+        assert!(cut.ends_with('…'));
+
+        // The cut lands on a character boundary, so multi-byte text does not
+        // panic on a byte index that splits a code point.
+        let multi_byte = "€".repeat(MAX_QUOTED_BYTES);
+        let unicode = excerpt(&multi_byte);
+        assert!(unicode.ends_with('…'), "{unicode}");
+        assert!(unicode.len() <= MAX_QUOTED_BYTES + '…'.len_utf8());
     }
 
     #[test]
