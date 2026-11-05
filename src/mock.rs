@@ -249,6 +249,9 @@ impl MockDdb {
     ///
     /// This is the shortcut a test uses instead of a loop of `put_item` calls:
     /// the items are validated and indexed exactly as a real write would be.
+    /// Validation happens for every item before the first one is stored — the
+    /// same all-or-nothing order [`batch_write_item`](Self::batch_write_item)
+    /// uses — so a bad fixture leaves the table exactly as it was.
     ///
     /// ```
     /// use mock_ddb::{item, s, KeySchema, KeyType, MockDdb};
@@ -269,13 +272,23 @@ impl MockDdb {
             .tables
             .get_mut(table_name)
             .ok_or_else(|| Error::table_not_found(table_name))?;
-        for item in items {
-            table.validate_item(&item)?;
-            let key = table.item_key(&item)?;
+        // Validate-then-apply, like `batch_write_item_inner`: a fixture whose
+        // last item is invalid must not leave the earlier ones behind.
+        let mut keys = Vec::with_capacity(items.len());
+        for item in &items {
+            table.validate_item(item)?;
+            keys.push(table.item_key(item)?);
+        }
+        for (key, item) in keys.into_iter().zip(items) {
             let previous = table.items.get(&key).cloned();
+            // An expired row is logically absent: the stream sees an INSERT,
+            // exactly what the same write through `put_item` produces.
+            let previous_live = previous
+                .clone()
+                .filter(|existing| !table.is_expired(existing, now));
             table.store(key, item.clone(), previous.as_ref());
             if !table.is_expired(&item, now) {
-                table.on_put(previous.as_ref(), &item);
+                table.on_put(previous_live.as_ref(), &item);
             }
         }
         Ok(())
