@@ -16,6 +16,13 @@ use parking_lot::Mutex;
 
 /// A source of "now".
 ///
+/// The mock calls this **outside** the lock that guards its store, so an
+/// implementation may block (read a file, wait on a channel) without stalling
+/// other tasks, and may call back into a [`MockDdb`](crate::MockDdb) it shares
+/// an `Arc` with without deadlocking. It is consulted once per operation, so a
+/// clock that moves on its own between calls makes TTL decisions follow the
+/// call order, not the operation's.
+///
 /// ```
 /// use std::time::{Duration, SystemTime};
 /// use mock_ddb::{Clock, MockClock};

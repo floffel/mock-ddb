@@ -318,8 +318,10 @@ fn main() {
 
 Writes hold a single lock for their duration, which is what makes transactions
 atomic and batch writes all-or-nothing. Reads take a shared lock, so many tasks
-can read concurrently while a write waits. There is no `unsafe`, no ambient
-state, and no lock is ever held across an `.await`.
+can read concurrently while a write waits. The injected `Clock` is read *before*
+that lock is taken, so a clock that blocks on I/O — or that calls back into the
+mock — never stretches a critical section or deadlocks another task. There is no
+`unsafe`, no ambient state, and no lock is ever held across an `.await`.
 
 Attribute order is not stable, and no assertion needs it to be: `Item` is the
 SDK's `HashMap`, so the `Debug` form of an item follows the map's per-process
