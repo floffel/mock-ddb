@@ -422,6 +422,48 @@ async fn transaction_rejects_duplicate_items_and_bad_requests() {
 }
 
 #[tokio::test]
+async fn transaction_token_limit_counts_characters_not_bytes() {
+    let mock = orders();
+    let write = |token: &str| {
+        TransactWriteItemsRequest::new(vec![TransactWriteItem::put("orders", order("c1", 1, "1"))])
+            .with_client_request_token(token)
+    };
+
+    // Just inside: 36 four-byte characters are 144 bytes and still valid, so a
+    // byte-based check would reject a token the service accepts.
+    let at_limit = "🎉".repeat(36);
+    assert_eq!(at_limit.chars().count(), 36);
+    assert_eq!(at_limit.len(), 144);
+    mock.transact_write_items(write(&at_limit))
+        .await
+        .expect("36 characters are inside the constraint");
+
+    // Just outside: one more character is rejected, whatever its width.
+    let error = mock
+        .transact_write_items(write(&"🎉".repeat(37)))
+        .await
+        .expect_err("37 characters are outside the constraint");
+    assert_eq!(error.code(), "ValidationException");
+    let text = error.to_string();
+    assert!(
+        text.contains("clientRequestToken"),
+        "message names the member: {text}"
+    );
+
+    // A narrow token of the same length is refused as well.
+    assert!(mock
+        .transact_write_items(write(&"x".repeat(37)))
+        .await
+        .is_err());
+
+    // An empty token is refused too.
+    assert!(mock.transact_write_items(write("")).await.is_err());
+
+    // Only the first call wrote; the rejections changed nothing.
+    assert_eq!(mock.count("orders"), 1);
+}
+
+#[tokio::test]
 async fn transaction_token_makes_a_retry_a_no_op() {
     let mock = orders();
     let token = "retry-token-1";
