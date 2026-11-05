@@ -100,6 +100,12 @@ enum Storability {
 /// exponent range keeps real values well inside this.
 const MAX_ALIGNMENT_SHIFT: u64 = 400;
 
+/// Decimal digits an [`i128`] can hold (`i128::MAX` is 1.7e38).
+///
+/// [`Number::as_i64`] sums the magnitude in an `i128`, so a wider digit count
+/// cannot become an `i64` and is refused before the loop runs.
+const I128_DECIMAL_DIGITS: usize = 39;
+
 impl Number {
     /// Parse a DynamoDB number string. `None` means the string is not a number.
     ///
@@ -252,23 +258,38 @@ impl Number {
     }
 
     /// The number as an `i64`, if it is integral and fits.
+    ///
+    /// The magnitude accumulates in an `i128` and is narrowed only once, at
+    /// the end. `i64::MIN` is a valid `i64` whose magnitude (2^63) is one past
+    /// [`i64::MAX`], so a magnitude summed in an `i64` would refuse it; and
+    /// negating such a sum would overflow. Both boundaries are therefore
+    /// checked from the same side, against the same wider accumulator.
     pub(crate) fn as_i64(&self) -> Option<i64> {
         if self.is_zero() {
             return Some(0);
         }
         let (negative, digits) = self.mantissa()?;
-        if self.exponent < 0 || digits.len() > 19 {
+        // An `i128` holds [`I128_DECIMAL_DIGITS`] digits; a wider magnitude
+        // cannot fit an `i64`, and the bound also keeps the scaling loop below
+        // from running for an exponent far outside the storable range.
+        if self.exponent < 0 || digits.len() > I128_DECIMAL_DIGITS {
             return None;
         }
-        let mut value: i64 = 0;
+        let mut magnitude: i128 = 0;
         for digit in digits.bytes() {
-            value = value.checked_mul(10)?;
-            value = value.checked_add(i64::from(digit - b'0'))?;
+            magnitude = magnitude.checked_mul(10)?;
+            magnitude = magnitude.checked_add(i128::from(digit - b'0'))?;
         }
         for _ in 0..self.exponent {
-            value = value.checked_mul(10)?;
+            magnitude = magnitude.checked_mul(10)?;
         }
-        Some(if negative { -value } else { value })
+        if negative {
+            // Negating in `i128` first is what makes `i64::MIN` reachable:
+            // 2^63 alone does not fit an `i64`, -2^63 does.
+            i64::try_from(magnitude.checked_neg()?).ok()
+        } else {
+            i64::try_from(magnitude).ok()
+        }
     }
 
     /// Whether aligning the two exponents would materialise an absurd run of
@@ -529,6 +550,36 @@ mod tests {
             Some(i64::MAX)
         );
         assert_eq!(Number::parse("9223372036854775808").unwrap().as_i64(), None);
+    }
+
+    #[test]
+    fn as_i64_covers_the_negative_boundary() {
+        // `i64::MIN` has a magnitude one past `i64::MAX`: the guard must let
+        // that magnitude through and negate it without overflowing.
+        assert_eq!(
+            Number::parse("-9223372036854775808").unwrap().as_i64(),
+            Some(i64::MIN)
+        );
+        assert_eq!(
+            Number::parse("-9223372036854775807").unwrap().as_i64(),
+            Some(i64::MIN + 1)
+        );
+        // Just outside, on the negative side.
+        assert_eq!(
+            Number::parse("-9223372036854775809").unwrap().as_i64(),
+            None
+        );
+        // The same magnitude, scaled past the boundary: refused, not wrapped.
+        assert_eq!(
+            Number::parse("-9223372036854775808e1").unwrap().as_i64(),
+            None
+        );
+        assert_eq!(
+            Number::parse("9223372036854775808e1").unwrap().as_i64(),
+            None
+        );
+        // A magnitude wider than an `i128` is refused rather than wrapped.
+        assert_eq!(Number::parse(&"9".repeat(40)).unwrap().as_i64(), None);
     }
 
     #[test]
