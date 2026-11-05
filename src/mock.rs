@@ -1798,11 +1798,16 @@ impl MockDdb {
     /// # }
     /// ```
     ///
+    /// A token is between 1 and 36 **characters** long, counted the way the
+    /// service counts them: 36 four-byte characters are 144 bytes and still
+    /// accepted.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Validation`] for an empty transaction, more than 100
-    /// actions, two actions on the same item, an oversized token or a malformed
-    /// expression; [`Error::ResourceNotFound`] for an unknown table;
+    /// actions, two actions on the same item, a token that is empty or longer
+    /// than 36 characters, or a malformed expression; [`Error::ResourceNotFound`]
+    /// for an unknown table;
     /// [`Error::IdempotentParameterMismatch`] when the token was already spent
     /// on a different transaction; and [`Error::TransactionCanceled`] when any
     /// condition fails. A cancelled transaction writes nothing.
@@ -1826,7 +1831,9 @@ impl MockDdb {
             )));
         }
         if let Some(token) = &request.client_request_token {
-            if token.is_empty() || token.len() > 36 {
+            // The constraint counts characters, not UTF-8 bytes: a token of 36
+            // four-byte characters is 144 bytes and still valid upstream.
+            if token.is_empty() || token.chars().count() > 36 {
                 return Err(Error::validation(
                     "1 validation error detected: Value at 'clientRequestToken' failed to satisfy constraint: Member must have length between 1 and 36",
                 ));
