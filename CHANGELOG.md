@@ -92,6 +92,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `Number::add` and `Number::sub` refuse a result the write path would reject.
+  The 38-significant-digit limit and the `1E-130` … `9.99…E+125` exponent range
+  were checked only in `number::validate`, so `9e125 + 9e125` came back as
+  `1.8e126`, which `to_plain_string` rendered happily and `UpdateItem` stored —
+  while `validate` rejected the identical string. A mock could therefore accept
+  an expression DynamoDB answers with a `ValidationException`, and the
+  expression test passed here and failed against the service. Both limits now
+  live in one `Storability` verdict that `validate` turns into the service's
+  message and arithmetic consults for its result, so an out-of-limit sum or
+  difference fails with the `Number overflow` error instead of being handed
+  out. Nothing is rounded: a sum with more than 38 significant digits (e.g.
+  `5e18 + 1e-20`) is refused rather than silently truncated.
 - The injected `Clock` is consulted before the store lock is taken, not inside
   it. Every write path called `Clock::now` while holding the exclusive lock, and
   `Clock` is implemented by test code, so a clock that blocked (I/O, a channel, a
