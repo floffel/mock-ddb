@@ -926,6 +926,17 @@ mod tests {
         )
     }
 
+    /// Hash a number the way the key maps do, so two spellings of one value can
+    /// be shown to land in the same bucket.
+    fn hash(number: &Number) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        number.hash(&mut hasher);
+        hasher.finish()
+    }
+
     proptest! {
         /// Equality is equality *of value*: any spelling of a number is the
         /// same number, and the canonical form re-parses to it.
@@ -1010,6 +1021,82 @@ mod tests {
                 let rendered = result.to_plain_string().expect("a storable value renders");
                 prop_assert!(validate(&rendered).is_ok(), "{}", rendered.as_str());
             }
+        }
+
+        /// The store's own round trip: the literal a writer is handed has to
+        /// parse back to the value the reader gets. The canonical form above is
+        /// the key map's identity; `to_plain_string` is the form the wire
+        /// carries, and re-parsing it is what a write followed by a read does —
+        /// a difference there changes the attribute's spelling and, for a key,
+        /// its bucket.
+        #[test]
+        fn plain_form_reparses_to_the_same_value(literal in decimal_literal()) {
+            let number = Number::parse(&literal).expect("generated literals are valid");
+            let plain = number.to_plain_string().expect("a storable value renders");
+            let again = Number::parse(&plain).expect("the plain form is a literal");
+            prop_assert_eq!(&again, &number, "{} -> {}", literal.as_str(), plain.as_str());
+            prop_assert_eq!(again.canonical(), number.canonical());
+        }
+
+        /// Ordering and arithmetic are one relation: `a < b` exactly when
+        /// `a - b` is negative, `a - b` is the negation of `b - a`, and
+        /// addition commutes. A comparison that disagreed with `sub` would let
+        /// a filter select a different set than the same test written with
+        /// `ADD`, and a mock whose two paths disagree hides the bug in tests.
+        #[test]
+        fn ordering_agrees_with_arithmetic(
+            left in decimal_literal(),
+            right in decimal_literal(),
+        ) {
+            let zero = Number::parse("0").expect("zero is a literal");
+            let left = Number::parse(&left).expect("generated literals are valid");
+            let right = Number::parse(&right).expect("generated literals are valid");
+            if let Some(difference) = left.sub(&right) {
+                prop_assert_eq!(
+                    difference.cmp(&zero),
+                    left.cmp(&right),
+                    "{} - {}",
+                    left.canonical(),
+                    right.canonical()
+                );
+            }
+            if let (Some(forwards), Some(backwards)) = (left.sub(&right), right.sub(&left)) {
+                prop_assert_eq!(forwards.add(&backwards), Some(zero.clone()));
+            }
+            prop_assert_eq!(left.add(&right), right.add(&left));
+        }
+
+        /// `Eq`, `Hash` and `Ord` are the same relation. If they were not, a
+        /// map keyed by a number would hold `1` and `1.0` as two entries while
+        /// `cmp` called them one value — the canonical form decides all three.
+        #[test]
+        fn equality_hash_and_order_agree(
+            left in decimal_literal(),
+            right in decimal_literal(),
+        ) {
+            let left = Number::parse(&left).expect("generated literals are valid");
+            let right = Number::parse(&right).expect("generated literals are valid");
+            let same_canonical = left.canonical() == right.canonical();
+            prop_assert_eq!(left.cmp(&right) == Ordering::Equal, same_canonical);
+            prop_assert_eq!(left == right, same_canonical);
+            if same_canonical {
+                prop_assert_eq!(hash(&left), hash(&right));
+            }
+        }
+
+        /// The alignment guard is a threshold, not a heuristic: every gap past
+        /// [`MAX_ALIGNMENT_SHIFT`] is refused in both directions, so no pair of
+        /// hostile exponents can be walked past it a decade at a time.
+        #[test]
+        fn exponent_gaps_past_the_guard_are_refused(
+            exponent in -200_i64..200,
+            gap in 401_i64..800,
+        ) {
+            let left = Number::parse(&format!("1e{exponent}")).expect("a literal");
+            let right = Number::parse(&format!("1e{}", exponent + gap)).expect("a literal");
+            prop_assert!(left.add(&right).is_none(), "{} + {}", left.canonical(), right.canonical());
+            prop_assert!(left.sub(&right).is_none());
+            prop_assert!(right.sub(&left).is_none());
         }
     }
 }

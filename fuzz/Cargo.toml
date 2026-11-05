@@ -49,5 +49,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "number_literal"
+path = "fuzz_targets/number_literal.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]
