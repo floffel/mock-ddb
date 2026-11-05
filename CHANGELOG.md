@@ -71,6 +71,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `PartialEq`) and compares the rendered cause alongside the message, so
   `Error` keeps the structural equality callers already relied on.
 
+- `ordered_item` renders an item's attributes in name order as a
+  `BTreeMap<&str, &AttributeValue>`, borrowing the values instead of copying
+  them — one map of references, not a second document. `Item` stays the SDK's
+  `HashMap`, so its iteration order follows the map's per-process seed and the
+  `Debug` rendering of an item differs between runs; the alias now says so
+  explicitly, points equality at `==` (which compares entries, not order) and a
+  golden or log assertion at `ordered_item`.
+
 ### Fixed
 
 - `MockClock::epoch_seconds` reports the real negative second before the Unix
