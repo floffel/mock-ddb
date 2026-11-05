@@ -195,6 +195,20 @@ async fn number_precision_and_ordering() {
         .unwrap_err();
     assert!(error.to_string().contains("significant digits"));
 
+    // A literal far past the parser's length cap is refused without being
+    // copied into the message (issue #61).
+    let hostile = "9".repeat(1 << 20);
+    let error = mock
+        .put_item(PutItemRequest::new(
+            "numbers",
+            item([("pk", s("p")), ("sk", n("1")), ("big", n(&hostile))]),
+        ))
+        .await
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(message.len() < 200, "{} bytes", message.len());
+    assert!(message.ends_with('…'), "{message}");
+
     let malformed = mock
         .put_item(PutItemRequest::new(
             "numbers",
