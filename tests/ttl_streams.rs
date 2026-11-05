@@ -456,6 +456,62 @@ mod streams {
     }
 
     #[tokio::test]
+    async fn seeding_over_an_expired_row_emits_an_insert() {
+        let (mock, _clock) = clocked();
+        let created = mock
+            .create_table(
+                CreateTableRequest::new("sessions", KeySchema::hash("pk", KeyType::String))
+                    .with_stream(StreamViewType::NewAndOldImages),
+            )
+            .await
+            .unwrap();
+        let arn = created.latest_stream_arn.expect("a stream ARN");
+        mock.update_time_to_live(UpdateTimeToLiveRequest::new("sessions", "expires_at", true))
+            .await
+            .unwrap();
+
+        // Expired on arrival, at the clock's 1_000_000: logically absent, so
+        // the seed records nothing.
+        mock.seed(
+            "sessions",
+            vec![item([("pk", s("u#1")), ("expires_at", n("999999"))])],
+        )
+        .unwrap();
+        assert!(mock.get_records(&arn).await.unwrap().is_empty());
+
+        // Seeding over that expired row creates the item, exactly as the same
+        // write through `put_item` would.
+        mock.seed(
+            "sessions",
+            vec![item([("pk", s("u#1")), ("expires_at", n("2000000"))])],
+        )
+        .unwrap();
+        let records = mock.get_records(&arn).await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].event_name, StreamEventName::Insert);
+        assert!(records[0].old_image.is_none());
+        assert!(records[0].new_image.is_some());
+
+        // The other side of the boundary: a *live* previous row still yields a
+        // MODIFY that carries its OldImage.
+        mock.seed(
+            "sessions",
+            vec![item([("pk", s("u#1")), ("expires_at", n("2000001"))])],
+        )
+        .unwrap();
+        let records = mock.get_records(&arn).await.unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].event_name, StreamEventName::Modify);
+        assert_eq!(
+            records[1]
+                .old_image
+                .as_ref()
+                .and_then(|old| old.get("expires_at")),
+            Some(&n("2000000"))
+        );
+    }
+
+    #[tokio::test]
     async fn view_types_filter_the_images() {
         let (mock, keys_only) = streamed(StreamViewType::KeysOnly).await;
         mock.put_item(PutItemRequest::new(

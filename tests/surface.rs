@@ -611,6 +611,41 @@ async fn seed_dump_and_clear() {
 }
 
 #[tokio::test]
+async fn seed_is_all_or_nothing_on_validation_errors() {
+    let mock = users();
+    mock.seed("users", vec![user("u#1", "a@example.com")])
+        .unwrap();
+
+    // The invalid item sits last: the valid ones before it must not land.
+    let refused = mock.seed(
+        "users",
+        vec![
+            user("u#2", "b@example.com"),
+            user("u#3", "c@example.com"),
+            Item::new(),
+        ],
+    );
+    assert!(matches!(refused, Err(Error::Validation { .. })));
+    assert_eq!(mock.count("users"), 1);
+    assert_eq!(mock.dump("users"), vec![user("u#1", "a@example.com")]);
+
+    // Same fixture with the invalid item first: still nothing changes.
+    let refused_first = mock.seed("users", vec![Item::new(), user("u#2", "b@example.com")]);
+    assert!(matches!(refused_first, Err(Error::Validation { .. })));
+    assert_eq!(mock.count("users"), 1);
+    assert_eq!(mock.dump("users"), vec![user("u#1", "a@example.com")]);
+
+    // The inside of the boundary: without the invalid item the same fixture
+    // applies in full.
+    mock.seed(
+        "users",
+        vec![user("u#2", "b@example.com"), user("u#3", "c@example.com")],
+    )
+    .unwrap();
+    assert_eq!(mock.count("users"), 3);
+}
+
+#[tokio::test]
 async fn batch_get_respects_projection_and_limits() {
     let mock = users();
     mock.seed(
