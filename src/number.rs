@@ -11,7 +11,8 @@
 //! groups separated by underscores — so the literal is validated here before it
 //! reaches the parser, and the DynamoDB range limits
 //! (`1E-130` … `9.99…E+125`, 38 significant digits) are checked on the parsed
-//! value.
+//! value — and, through the same check, on the result of `add` and `sub`, so
+//! arithmetic cannot hand back a number the write path would reject.
 
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
@@ -55,6 +56,24 @@ const MAX_ORDER: i64 = 126;
 /// formatter returns `None` instead of allocating it — a 5-byte input such as
 /// `1e2147483647` would otherwise ask for gigabytes.
 const MAX_PADDING: usize = 130;
+
+/// Why a value cannot be stored, or that it can.
+///
+/// One verdict, consulted from both ends of the module: [`validate`] turns it
+/// into the service's error for a request, and [`Number::add`] / [`Number::sub`]
+/// refuse a result that the write path would reject. Keeping the two limits in
+/// a single function is the point — a boundary enforced only on the way in lets
+/// arithmetic manufacture a number the service would never store, so a mock
+/// expression test passes here and the same expression fails against DynamoDB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Storability {
+    /// Within DynamoDB's documented limits.
+    Storable,
+    /// More than [`MAX_SIGNIFICANT_DIGITS`] significant digits.
+    TooManyDigits,
+    /// Magnitude outside `1E-130` … `9.99…E+125`.
+    OutOfRange,
+}
 
 /// Furthest apart two exponents may be before [`Number::add`] gives up.
 ///
@@ -164,6 +183,35 @@ impl Number {
         self.is_zero() || (MIN_ORDER..=MAX_ORDER).contains(&self.order())
     }
 
+    /// Whether the value is within both documented limits: at most
+    /// [`MAX_SIGNIFICANT_DIGITS`] significant digits and a magnitude inside
+    /// [`MIN_ORDER`] … [`MAX_ORDER`].
+    ///
+    /// The digit count is checked first because it is the limit arithmetic can
+    /// cross while staying inside the exponent range; the two are otherwise
+    /// independent, and the order only decides which wording a request that
+    /// breaks both gets.
+    fn storability(&self) -> Storability {
+        if self.significant_digits() > MAX_SIGNIFICANT_DIGITS {
+            Storability::TooManyDigits
+        } else if self.in_documented_range() {
+            Storability::Storable
+        } else {
+            Storability::OutOfRange
+        }
+    }
+
+    /// Wrap an exact value only when DynamoDB would store it.
+    ///
+    /// This is [`Self::from_decimal`] plus [`Self::storability`], and it is what
+    /// [`Self::add`] and [`Self::sub`] return through: a result the service
+    /// rejects is not a number the mock hands out. Parsing does *not* go through
+    /// here — [`Self::parse`] has to represent an out-of-limit literal so that
+    /// [`validate`] can name the limit it broke.
+    fn from_storable_decimal(value: &BigDecimal) -> Option<Self> {
+        Self::from_decimal(value).filter(|number| number.storability() == Storability::Storable)
+    }
+
     /// A canonical string identifying the value: `43`, `-15E-1`, `0`.
     ///
     /// Two numbers are equal exactly when their canonical forms match, which is
@@ -207,26 +255,33 @@ impl Number {
 
     /// Add two numbers exactly.
     ///
-    /// `None` when the exponents are so far apart that aligning them would
-    /// materialise an absurd run of digits — DynamoDB's own range makes that
-    /// unreachable for stored values, and returning `None` keeps a hostile
-    /// expression from exhausting memory. The addition itself is
-    /// `BigDecimal`'s.
+    /// `None` in two cases, both of which mean "the service has no answer":
+    /// when the exponents are so far apart that aligning them would materialise
+    /// an absurd run of digits — returning `None` keeps a hostile expression
+    /// from exhausting memory — and when the exact sum is not storable, because
+    /// the service rejects it too rather than handing back a number the writer
+    /// would refuse. `9e125 + 9e125` is the second case: the sum is `1.8e126`,
+    /// whose magnitude is one decade past the documented ceiling. The addition
+    /// itself is `BigDecimal`'s, and so is the exactness — nothing is rounded,
+    /// so a sum with more than 38 significant digits is refused instead of
+    /// silently truncated.
     pub(crate) fn add(&self, other: &Self) -> Option<Self> {
         if !self.alignment_fits(other) {
             return None;
         }
         let sum = &self.value + &other.value;
-        Self::from_decimal(&sum)
+        Self::from_storable_decimal(&sum)
     }
 
     /// Subtract `other` from `self`.
+    ///
+    /// Refused under the same two conditions as [`Self::add`].
     pub(crate) fn sub(&self, other: &Self) -> Option<Self> {
         if !self.alignment_fits(other) {
             return None;
         }
         let difference = &self.value - &other.value;
-        Self::from_decimal(&difference)
+        Self::from_storable_decimal(&difference)
     }
 
     /// Format the number the way DynamoDB stores it (no exponent notation).
@@ -276,26 +331,27 @@ impl Hash for Number {
 /// The service rejects numbers with more than 38 significant digits and
 /// numbers outside `1E-130` … `9.99…E+125`, so the mock does too: a test
 /// written against an out-of-range number should fail here rather than pass
-/// and fail in production. The exponent check is also what keeps
-/// `1e2147483647` from reaching [`Number::to_plain_string`] with a padding
-/// request that no machine can satisfy.
+/// and fail in production. The limits themselves live in
+/// [`Number::storability`], which [`Number::add`] and [`Number::sub`] consult
+/// for their results as well — the same boundary on the way in and on the way
+/// back. The exponent check is also what keeps `1e2147483647` from reaching
+/// [`Number::to_plain_string`] with a padding request that no machine can
+/// satisfy.
 pub(crate) fn validate(text: &str) -> crate::Result<()> {
     let Some(number) = Number::parse(text) else {
         return Err(crate::Error::validation(format!(
             "The parameter cannot be converted to a numeric value: {text}"
         )));
     };
-    if number.significant_digits() > MAX_SIGNIFICANT_DIGITS {
-        return Err(crate::Error::validation(format!(
+    match number.storability() {
+        Storability::Storable => Ok(()),
+        Storability::TooManyDigits => Err(crate::Error::validation(format!(
             "Attempting to store more than {MAX_SIGNIFICANT_DIGITS} significant digits in a Number: {text}"
-        )));
-    }
-    if !number.in_documented_range() {
-        return Err(crate::Error::validation(format!(
+        ))),
+        Storability::OutOfRange => Err(crate::Error::validation(format!(
             "Attempting to store a Number outside the supported exponent range (1E-130 to 9.99E+125): {text}"
-        )));
+        ))),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -537,17 +593,22 @@ mod tests {
         assert!(min.add(&max).is_none());
         assert!(max.sub(&min).is_none());
         assert!(min.sub(&max).is_none());
-        // Same exponent on both sides needs no alignment at all, so it is not
-        // the guard's business — it must simply not panic.
-        assert!(max.add(&max).is_some());
-        assert!(min.add(&min).is_some());
+        // Same exponent on both sides needs no alignment at all, so it must
+        // simply not panic — and the sum is far outside the storable range, so
+        // it is refused for that reason instead (issue #60).
+        assert!(max.add(&max).is_none());
+        assert!(min.add(&min).is_none());
 
         // Boundary pair for the alignment guard itself: a gap of 400 is still
-        // aligned, 401 is not.
+        // aligned, 401 is not. `add` cannot show this any more — either sum is
+        // outside the storable range and is refused there — so the guard is
+        // checked directly.
         let unit = Number::parse("1").unwrap();
         let at_limit = Number::parse("1e400").unwrap();
-        assert!(unit.add(&at_limit).is_some());
+        assert!(unit.alignment_fits(&at_limit));
+        assert!(unit.add(&at_limit).is_none());
         let past_limit = Number::parse("1e401").unwrap();
+        assert!(!unit.alignment_fits(&past_limit));
         assert!(unit.add(&past_limit).is_none());
     }
 
@@ -588,6 +649,62 @@ mod tests {
         let huge = Number::parse("1e400").unwrap();
         let tiny = Number::parse("1e-400").unwrap();
         assert!(huge.add(&tiny).is_none());
+    }
+
+    #[test]
+    fn arithmetic_refuses_results_the_write_path_would_reject() {
+        let number = |text: &str| Number::parse(text).expect("a literal");
+
+        // The audit's case (issue #60): both operands are storable, the sum is
+        // one decade past the ceiling. It used to come back as `1.8e126`, which
+        // `to_plain_string` rendered happily while `validate` rejected the same
+        // value.
+        assert!(number("9e125").add(&number("9e125")).is_none());
+        assert!(number("-9e125").sub(&number("9e125")).is_none());
+        assert!(number("9e125").sub(&number("-9e125")).is_none());
+        // The boundary pair around it: one step lower the sum is storable …
+        assert_eq!(
+            number("8e125")
+                .add(&number("1e125"))
+                .map(|sum| sum.canonical()),
+            Some("9E125".to_string())
+        );
+        // … and exactly at the ceiling too, since `9.99…E+125` is storable.
+        assert_eq!(
+            number("9e125")
+                .sub(&number("1e124"))
+                .map(|difference| difference.canonical()),
+            Some("89E124".to_string())
+        );
+
+        // The other limit arithmetic can cross: 38 significant digits are
+        // storable, 39 are not, even though the magnitude is unremarkable.
+        let at_limit = number("5e18")
+            .add(&number("1e-19"))
+            .expect("38 significant digits are storable");
+        assert_eq!(at_limit.significant_digits(), 38);
+        assert!(number("5e18").add(&number("1e-20")).is_none());
+
+        // Whatever `add` and `sub` do return is a value the write path accepts:
+        // that agreement is the point of the shared check.
+        for (left, right) in [
+            ("1", "2"),
+            ("8e125", "1e125"),
+            ("5e18", "1e-19"),
+            ("-1e-129", "1e-129"),
+            ("0", "0"),
+        ] {
+            for sum in [
+                number(left).add(&number(right)),
+                number(left).sub(&number(right)),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let rendered = sum.to_plain_string().expect("a storable value renders");
+                assert!(validate(&rendered).is_ok(), "{left} / {right}: {rendered}");
+            }
+        }
     }
 
     #[test]
@@ -710,6 +827,24 @@ mod tests {
                 let canonical = number.canonical();
                 let reparsed = Number::parse(&canonical);
                 prop_assert_eq!(reparsed.as_ref(), Some(&number));
+            }
+        }
+
+        /// An arithmetic result is either refused or storable: whatever `add`
+        /// and `sub` return passes the same `validate` the write path runs, so
+        /// no expression can build a number the service would reject
+        /// (issue #60).
+        #[test]
+        fn arithmetic_results_are_storable_or_refused(
+            left in decimal_literal(),
+            right in decimal_literal(),
+        ) {
+            let left = Number::parse(&left).expect("generated literals are valid");
+            let right = Number::parse(&right).expect("generated literals are valid");
+            for result in [left.add(&right), left.sub(&right)].into_iter().flatten() {
+                prop_assert_eq!(result.storability(), Storability::Storable);
+                let rendered = result.to_plain_string().expect("a storable value renders");
+                prop_assert!(validate(&rendered).is_ok(), "{}", rendered.as_str());
             }
         }
     }
