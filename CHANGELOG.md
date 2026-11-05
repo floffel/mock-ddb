@@ -213,6 +213,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   returns. Named indices are kept in ascending order and without duplicates; an
   index the list does not have contributes nothing.
 
+- `Number::as_i64` (the TTL conversion) accepts `i64::MIN`. The magnitude was
+  summed in an `i64` behind a `digits.len() > 19` guard, so
+  `-9223372036854775808` — 19 digits, magnitude 2^63 — overflowed the
+  accumulation and read as "not an integer", so an in-range TTL timestamp was
+  treated as invalid and the item it belonged to never expired; the closing
+  negation would have panicked on the same value had that guard been relaxed.
+  The magnitude now accumulates in an
+  `i128` and is narrowed once at the end, so both `i64` boundaries are checked
+  against the same accumulator: `i64::MAX` and `i64::MIN` convert, one step
+  outside either does not.
+
 ### Changed
 
 - Number values are backed by `bigdecimal::BigDecimal` instead of a local
