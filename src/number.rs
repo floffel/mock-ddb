@@ -112,6 +112,12 @@ impl Number {
     /// (`i64::MIN`). No DynamoDB value comes near it, and such a number could
     /// not be rendered, compared or stored, so it is refused rather than
     /// carried around.
+    ///
+    /// This is the only place the exponent is produced: it comes from
+    /// `checked_neg` on the crate's scale, and every later use is checked or
+    /// saturating ([`Self::order`], [`Self::alignment_fits`],
+    /// [`Self::to_plain_string`]). An exponent therefore never reaches a raw
+    /// `i64` operation, however the literal was spelled.
     fn from_decimal(value: &BigDecimal) -> Option<Self> {
         let value = value.normalized();
         let (_, scale) = value.as_bigint_and_exponent();
@@ -439,11 +445,13 @@ mod tests {
         assert!(validate("1e126").is_err());
         assert!(validate(&format!("{}e89", "9".repeat(38))).is_err());
 
-        // The hostile value from the audit: accepted before, and then the
+        // The hostile values from the audit: accepted before, and then the
         // formatter asked for 2^31 zeros.
         let error = validate("1e2147483647").unwrap_err();
         assert!(error.to_string().contains("exponent range"), "{error}");
         assert!(validate("-1e2147483647").is_err());
+        assert!(validate("0.5e-9223372036854775808").is_err());
+        assert!(validate("10e9223372036854775807").is_err());
     }
 
     #[test]
@@ -462,6 +470,18 @@ mod tests {
         assert!(Number::parse("1e9223372036854775808").is_none());
         assert!(Number::parse("1e-9223372036854775807").is_some());
         assert!(Number::parse("1e-9223372036854775808").is_none());
+
+        // The audit's two hostile shapes (issue #58): a fraction length that
+        // has to be subtracted from an exponent already at `i64::MIN`, and a
+        // mantissa whose normalisation carries `i64::MAX` one step further.
+        // Both were raw `i64` additions in the old local parser, so both
+        // aborted a debug build instead of returning `None`.
+        assert!(Number::parse("0.5e-9223372036854775808").is_none());
+        assert!(Number::parse("10e9223372036854775807").is_none());
+        // One digit further inside is still a number, so the pair brackets the
+        // boundary rather than the whole neighbourhood.
+        assert!(Number::parse("0.5e-9223372036854775806").is_some());
+        assert!(Number::parse("0.5e-9223372036854775807").is_none());
 
         // Neither extreme renders, and ordering still holds without touching
         // the padding path.
@@ -663,6 +683,34 @@ mod tests {
                 .partial_cmp(&f64::from(right))
                 .expect("both are finite");
             prop_assert_eq!(ordering, expected);
+        }
+
+        /// Every exponent the wire can carry, with and without a fraction, is
+        /// decided without overflow: `parse` either refuses the literal or
+        /// returns a value that round-trips through its canonical form, and
+        /// `validate` accepts exactly the documented range. The parser this
+        /// replaced did the normalisation in raw `i64` arithmetic, so literals
+        /// like `0.5e-9223372036854775808` aborted a debug build instead of
+        /// being refused (issue #58).
+        #[test]
+        fn hostile_exponents_are_decided_without_overflow(
+            mantissa in 1_u64..1_000_000_000,
+            zeros in 0_usize..40,
+            exponent in any::<i64>(),
+        ) {
+            let literal = if zeros == 0 {
+                format!("{mantissa}e{exponent}")
+            } else {
+                format!("{mantissa}.{}e{exponent}", "0".repeat(zeros))
+            };
+            let parsed = Number::parse(&literal);
+            let in_range = parsed.as_ref().is_some_and(Number::in_documented_range);
+            prop_assert_eq!(validate(&literal).is_ok(), in_range, "{}", literal.as_str());
+            if let Some(number) = parsed {
+                let canonical = number.canonical();
+                let reparsed = Number::parse(&canonical);
+                prop_assert_eq!(reparsed.as_ref(), Some(&number));
+            }
         }
     }
 }
