@@ -2772,7 +2772,13 @@ enum ActionKind {
 struct PreparedAction {
     table_name: String,
     key: ItemKey,
+    /// The logical previous item: `None` when the key is free or the row has
+    /// expired. Conditions, old-value reporting and capacity use this one.
     previous: Option<Item>,
+    /// The raw row the store holds for `key`, expired or not. Only index
+    /// maintenance needs it: an expired row is logically absent but still
+    /// occupies index entries that a rewrite has to remove.
+    stored: Option<Item>,
     condition: Option<ConditionExpression>,
     names: NameMap,
     values: ValueMap,
@@ -2780,18 +2786,24 @@ struct PreparedAction {
     wants_old_image: bool,
 }
 
+/// The table a transaction action targets.
+fn action_table<'a>(inner: &'a Inner, table_name: &str) -> Result<&'a Table> {
+    inner
+        .tables
+        .get(table_name)
+        .ok_or_else(|| Error::table_not_found(table_name))
+}
+
 fn prepare_action(inner: &Inner, action: &TransactWriteItem, now: i64) -> Result<PreparedAction> {
     match action {
         TransactWriteItem::Put(put) => {
-            let table = inner
-                .tables
-                .get(&put.table_name)
-                .ok_or_else(|| Error::table_not_found(&put.table_name))?;
+            let table = action_table(inner, &put.table_name)?;
             table.validate_item(&put.item)?;
             let key = table.item_key(&put.item)?;
             Ok(PreparedAction {
                 table_name: put.table_name.clone(),
                 previous: live_item(table, &key, now),
+                stored: stored_item(table, &key),
                 key,
                 condition: parse_optional_condition(put.condition_expression.as_deref())?,
                 names: put.expression_attribute_names.clone().unwrap_or_default(),
@@ -2801,12 +2813,10 @@ fn prepare_action(inner: &Inner, action: &TransactWriteItem, now: i64) -> Result
             })
         }
         TransactWriteItem::Update(update) => {
-            let table = inner
-                .tables
-                .get(&update.table_name)
-                .ok_or_else(|| Error::table_not_found(&update.table_name))?;
+            let table = action_table(inner, &update.table_name)?;
             let key = table.lookup_key(&update.key)?;
             let previous = live_item(table, &key, now);
+            let stored = stored_item(table, &key);
             let names = update
                 .expression_attribute_names
                 .clone()
@@ -2826,6 +2836,7 @@ fn prepare_action(inner: &Inner, action: &TransactWriteItem, now: i64) -> Result
                 table_name: update.table_name.clone(),
                 key,
                 previous,
+                stored,
                 condition: parse_optional_condition(update.condition_expression.as_deref())?,
                 names,
                 values,
@@ -2834,14 +2845,12 @@ fn prepare_action(inner: &Inner, action: &TransactWriteItem, now: i64) -> Result
             })
         }
         TransactWriteItem::Delete(delete) => {
-            let table = inner
-                .tables
-                .get(&delete.table_name)
-                .ok_or_else(|| Error::table_not_found(&delete.table_name))?;
+            let table = action_table(inner, &delete.table_name)?;
             let key = table.lookup_key(&delete.key)?;
             Ok(PreparedAction {
                 table_name: delete.table_name.clone(),
                 previous: live_item(table, &key, now),
+                stored: stored_item(table, &key),
                 key,
                 condition: parse_optional_condition(delete.condition_expression.as_deref())?,
                 names: delete
@@ -2857,14 +2866,12 @@ fn prepare_action(inner: &Inner, action: &TransactWriteItem, now: i64) -> Result
             })
         }
         TransactWriteItem::ConditionCheck(check) => {
-            let table = inner
-                .tables
-                .get(&check.table_name)
-                .ok_or_else(|| Error::table_not_found(&check.table_name))?;
+            let table = action_table(inner, &check.table_name)?;
             let key = table.lookup_key(&check.key)?;
             Ok(PreparedAction {
                 table_name: check.table_name.clone(),
                 previous: live_item(table, &key, now),
+                stored: stored_item(table, &key),
                 key,
                 condition: Some(ConditionExpression::parse(&check.condition_expression)?),
                 names: check.expression_attribute_names.clone().unwrap_or_default(),
@@ -2886,13 +2893,19 @@ fn parse_optional_condition(expression: Option<&str>) -> Result<Option<Condition
     }
 }
 
+/// Read the raw row the store holds at a key, expired or not.
+///
+/// An expired row is logically absent, so conditions, old-value reporting and
+/// capacity work from [`live_item`]. Its secondary-index entries are still
+/// there, though, so rewriting the key must unindex this value: that is what
+/// [`Table::store`] takes as its `previous` argument.
+fn stored_item(table: &Table, key: &ItemKey) -> Option<Item> {
+    table.items.get(key).cloned()
+}
+
 /// Read the live (non-expired) item at a key.
 fn live_item(table: &Table, key: &ItemKey, now: i64) -> Option<Item> {
-    table
-        .items
-        .get(key)
-        .filter(|item| !table.is_expired(item, now))
-        .cloned()
+    stored_item(table, key).filter(|item| !table.is_expired(item, now))
 }
 
 /// Build an item from just the key attributes, which is what an update against
@@ -2934,7 +2947,7 @@ fn apply_transaction(
                     &mut breakdown,
                     [action.previous.as_ref(), Some(&item)],
                 );
-                table.store(action.key, item.clone(), action.previous.as_ref());
+                table.store(action.key, item.clone(), action.stored.as_ref());
                 table.on_put(action.previous.as_ref(), &item);
                 note_collection(
                     table,
@@ -2951,7 +2964,7 @@ fn apply_transaction(
                     &mut breakdown,
                     [action.previous.as_ref(), Some(&item)],
                 );
-                table.store(action.key, item.clone(), action.previous.as_ref());
+                table.store(action.key, item.clone(), action.stored.as_ref());
                 table.on_update(action.previous.as_ref(), &item);
                 note_collection(
                     table,

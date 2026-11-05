@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use mock_ddb::{
     item, n, s, values, CreateTableRequest, GetItemRequest, KeySchema, KeyType, MockClock, MockDdb,
-    PutItemRequest, QueryRequest, ScanRequest, TimeToLiveStatus, UpdateItemRequest,
-    UpdateTimeToLiveRequest,
+    PutItemRequest, QueryRequest, ScanRequest, SecondaryIndex, TimeToLiveStatus, TransactWriteItem,
+    TransactWriteItemsRequest, UpdateItemRequest, UpdateTimeToLiveRequest,
 };
 
 /// A mock with a controllable clock, pinned to 2026-01-01T00:00:00Z.
@@ -256,6 +256,115 @@ async fn ttl_applies_to_updates_and_queries_on_an_index() {
         .await
         .unwrap();
     assert!(updated.attributes.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Indexed TTL rewrites inside a transaction
+// ---------------------------------------------------------------------------
+
+/// A table with a TTL attribute and a global secondary index on `state`.
+async fn ttl_indexed() -> (MockDdb, Arc<MockClock>) {
+    let (mock, clock) = clocked();
+    mock.create_table(
+        CreateTableRequest::new("sessions", KeySchema::hash("pk", KeyType::String))
+            .with_global_index(SecondaryIndex::new(
+                "by-state",
+                KeySchema::hash("state", KeyType::String),
+            )),
+    )
+    .await
+    .unwrap();
+    mock.update_time_to_live(UpdateTimeToLiveRequest::new("sessions", "expires_at", true))
+        .await
+        .unwrap();
+    (mock, clock)
+}
+
+/// How many items a query on the `by-state` index reports for `state`.
+async fn indexed_count(mock: &MockDdb, state: &str) -> usize {
+    let page = mock
+        .query(
+            QueryRequest::new("sessions", "state = :state")
+                .with_index("by-state")
+                .with_values(values([(":state", s(state))])),
+        )
+        .await
+        .unwrap();
+    page.items.len()
+}
+
+#[tokio::test]
+async fn a_transacted_put_unindexes_an_expired_row() {
+    let (mock, _clock) = ttl_indexed().await;
+    mock.put_item(PutItemRequest::new(
+        "sessions",
+        item([
+            ("pk", s("u#1")),
+            ("state", s("stale")),
+            ("expires_at", n("999999")),
+        ]),
+    ))
+    .await
+    .unwrap();
+
+    // The row is expired, so the write may replace it. Its index entry still
+    // exists in the store, though, and has to go with it: otherwise a query on
+    // the old state would resolve the stale entry to the new item.
+    mock.transact_write_items(TransactWriteItemsRequest::new(vec![
+        TransactWriteItem::put(
+            "sessions",
+            item([
+                ("pk", s("u#1")),
+                ("state", s("fresh")),
+                ("expires_at", n("2000000")),
+            ]),
+        ),
+    ]))
+    .await
+    .unwrap();
+
+    assert_eq!(
+        indexed_count(&mock, "stale").await,
+        0,
+        "an expired row's index entry must not survive the rewrite"
+    );
+    assert_eq!(indexed_count(&mock, "fresh").await, 1);
+}
+
+#[tokio::test]
+async fn a_transacted_update_unindexes_the_previous_row() {
+    // A deadline equal to the clock second counts as expired, one second later
+    // is still live: the pair pins the boundary of the rewrite path.
+    for (deadline, expired) in [(1_000_000, true), (1_000_001, false)] {
+        let (mock, _clock) = ttl_indexed().await;
+        mock.put_item(PutItemRequest::new(
+            "sessions",
+            item([
+                ("pk", s("u#1")),
+                ("state", s("stale")),
+                ("expires_at", n(deadline.to_string())),
+            ]),
+        ))
+        .await
+        .unwrap();
+        mock.transact_write_items(TransactWriteItemsRequest::new(vec![
+            TransactWriteItem::update("sessions", item([("pk", s("u#1"))]), "SET #state = :state")
+                .with_names(std::collections::HashMap::from([(
+                    "#state".to_string(),
+                    "state".to_string(),
+                )]))
+                .with_values(values([(":state", s("fresh"))])),
+        ]))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            indexed_count(&mock, "stale").await,
+            0,
+            "the previous row must be unindexed (expired: {expired})"
+        );
+        assert_eq!(indexed_count(&mock, "fresh").await, 1);
+    }
 }
 
 // ---------------------------------------------------------------------------
