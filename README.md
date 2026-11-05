@@ -97,7 +97,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 - **Values are the SDK's.** `mock_ddb::Item` is
   `HashMap<String, aws_sdk_dynamodb::types::AttributeValue>`, re-exported along
-  with `Blob`. Nothing is converted at the boundary.
+  with `Blob`. Nothing is converted at the boundary, which also means attribute
+  order is the map's: an item's `Debug` rendering differs per process, so a
+  snapshot assertion uses `ordered_item` (see [Time, determinism and
+  concurrency](#time-determinism-and-concurrency)).
 - **Requests mirror the SDK's fields**, down to the names
   (`condition_expression`, `expression_attribute_values`, `scan_index_forward`,
   `return_values_on_condition_check_failure`, …), so an assertion written
@@ -305,6 +308,23 @@ atomic and batch writes all-or-nothing. Reads take a shared lock, so many tasks
 can read concurrently while a write waits. There is no `unsafe`, no ambient
 state, and no lock is ever held across an `.await`.
 
+Attribute order is not stable, and no assertion needs it to be: `Item` is the
+SDK's `HashMap`, so the `Debug` form of an item follows the map's per-process
+seed, and DynamoDB does not define an order either. `assert_eq!` on two items is
+unaffected — map equality compares entries, not order. A test that *renders* an
+item, into a golden file or a log line, uses `ordered_item`, which lists the
+attributes by name and borrows the values:
+
+```rust
+use mock_ddb::{item, n, ordered_item, s};
+
+let read = item([("age", n("42")), ("pk", s("u#1"))]);
+assert_eq!(
+    ordered_item(&read).keys().copied().collect::<Vec<_>>(),
+    ["age", "pk"]
+);
+```
+
 Seconds are signed: an instant before the Unix epoch reports its real negative
 second (`-3_600` an hour early), and a fraction of a second on either side of
 the epoch reports `0`, so a TTL deadline is never parked on a value that only
@@ -322,7 +342,7 @@ cargo +nightly fuzz run parse_expression -- -max_total_time=60
 cargo +nightly fuzz run random_items -- -max_total_time=60
 ```
 
-- 425 tests (314 test functions plus 111 doctests): unit tests per module, an integration suite per area
+- 573 tests (428 test functions plus 145 doctests): unit tests per module, an integration suite per area
   (`surface`, `expressions`, `query_scan`, `batch_transact`, `ttl_streams`,
   `streams_api`, `edge_cases`, `concurrency`, `coverage`), property tests with
   `proptest`, and a doctest on every public type, every operation and every

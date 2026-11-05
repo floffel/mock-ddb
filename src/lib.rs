@@ -126,7 +126,7 @@ mod stream;
 mod table;
 mod value;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub use aws_sdk_dynamodb::primitives::Blob;
 pub use aws_sdk_dynamodb::types::AttributeValue;
@@ -175,7 +175,49 @@ pub use stream::{
 ///
 /// The alias is the SDK's own map type, so items flow between production code
 /// and the mock without conversion.
+///
+/// # Attribute order
+///
+/// `Item` is a `HashMap` with `RandomState`, so its iteration order — and with
+/// it the `Debug` form of an item, or any serialization a caller builds on top
+/// of it — varies from one process to the next. DynamoDB does not define an
+/// attribute order either, and equality needs none: `HashMap`'s `PartialEq`
+/// compares entries rather than order, so `assert_eq!` on two items holds
+/// however each of them was built. An assertion that *renders* an item — a
+/// golden file, a logged response — wants [`ordered_item`], which lists the
+/// attributes by name and therefore prints the same bytes on every run.
 pub type Item = HashMap<String, AttributeValue>;
+
+/// An item's attributes in name order, borrowing the values instead of copying
+/// them.
+///
+/// The result is a `BTreeMap`, so its `Debug` output is the same on every run,
+/// which is what a golden or log-based assertion needs from an [`Item`]. The
+/// values are borrowed: sorting a 400 KiB document allocates one map of
+/// references, not a second document. Equality does not need this form —
+/// comparing items with `==` is already order-insensitive.
+///
+/// ```
+/// use mock_ddb::{item, n, ordered_item, s};
+///
+/// let written = item([("pk", s("u#1")), ("age", n("42"))]);
+/// let read = item([("age", n("42")), ("pk", s("u#1"))]);
+/// assert_eq!(written, read);
+/// assert_eq!(
+///     format!("{:#?}", ordered_item(&written)),
+///     format!("{:#?}", ordered_item(&read))
+/// );
+/// assert_eq!(
+///     ordered_item(&written).keys().copied().collect::<Vec<_>>(),
+///     ["age", "pk"]
+/// );
+/// ```
+#[must_use]
+pub fn ordered_item(item: &Item) -> BTreeMap<&str, &AttributeValue> {
+    item.iter()
+        .map(|(name, value)| (name.as_str(), value))
+        .collect()
+}
 
 /// Wrap an item as an `AttributeValue::M`, the shape DynamoDB uses when an item
 /// (or part of one) is embedded in a document attribute.
@@ -333,5 +375,46 @@ mod tests {
             assert_eq!(into_item(value.clone()), None, "{value:?}");
             assert_eq!(item_from_value(value), None, "{value:?}");
         }
+    }
+
+    #[test]
+    fn ordered_item_sorts_names_and_borrows_the_values() {
+        let record = request::item([
+            ("z", s("last")),
+            ("ä", s("umlaut")),
+            ("a", s("first")),
+            (
+                "nested",
+                item_to_value(request::item([("inner", s("deep"))])),
+            ),
+        ]);
+        let ordered = ordered_item(&record);
+        // Byte order, which for UTF-8 is code-point order: `ä` sorts after `z`.
+        assert_eq!(
+            ordered.keys().copied().collect::<Vec<_>>(),
+            ["a", "nested", "z", "ä"]
+        );
+        for (name, value) in &ordered {
+            let stored = record.get(*name).expect("the attribute it was built from");
+            assert_eq!(stored, *value, "{name}");
+            // The view borrows the stored values; a clone would move the pointer.
+            assert!(std::ptr::eq(*value, stored), "{name}");
+        }
+    }
+
+    #[test]
+    fn ordered_item_pins_the_empty_and_single_attribute_edges() {
+        let nothing = Item::new();
+        let empty = ordered_item(&nothing);
+        assert!(empty.is_empty());
+        assert_eq!(empty.keys().next(), None);
+        // An absent name is not an attribute, not an empty one.
+        assert_eq!(empty.get(""), None);
+
+        let single = request::item([("pk", s("u#1"))]);
+        let ordered = ordered_item(&single);
+        assert_eq!(ordered.len(), 1);
+        assert_eq!(ordered.get("pk").copied(), Some(&s("u#1")));
+        assert_eq!(ordered.get("sk"), None);
     }
 }

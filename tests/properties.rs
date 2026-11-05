@@ -3,9 +3,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use mock_ddb::{
-    item, n, s, values, AttributeValue, Blob, CancellationReason, CancellationReasonCode,
-    ConditionExpression, Error, GetItemRequest, Item, KeySchema, KeyType, MockDdb, PutItemRequest,
-    QueryRequest, ReturnValues, UpdateExpression, UpdateItemRequest,
+    item, n, ordered_item, s, values, AttributeValue, Blob, CancellationReason,
+    CancellationReasonCode, ConditionExpression, Error, GetItemRequest, Item, KeySchema, KeyType,
+    MockDdb, PutItemRequest, QueryRequest, ReturnValues, UpdateExpression, UpdateItemRequest,
 };
 use proptest::prelude::*;
 
@@ -590,6 +590,24 @@ proptest! {
                     error
                 );
             }
+        }
+    }
+
+    /// The ordered rendering is a sorted view of the same item: no attribute is
+    /// lost, none is invented, and the names come out in ascending order
+    /// whatever order the map happened to iterate in.
+    #[test]
+    fn ordered_item_is_a_sorted_view(entries in payload()) {
+        let ordered = ordered_item(&entries);
+        prop_assert_eq!(ordered.len(), entries.len());
+
+        let names: Vec<&str> = ordered.keys().copied().collect();
+        let mut ascending = names.clone();
+        ascending.sort_unstable();
+        prop_assert_eq!(&names, &ascending);
+
+        for (name, value) in &ordered {
+            prop_assert_eq!(entries.get(*name), Some(*value));
         }
     }
 }
