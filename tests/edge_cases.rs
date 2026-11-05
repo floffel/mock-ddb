@@ -243,6 +243,20 @@ async fn exponents_outside_the_documented_range_are_rejected() {
         .await
         .expect_err("out of range");
     assert!(error.to_string().contains("exponent range"), "{error}");
+
+    // Issue #58: an `N` attribute whose exponent sits at the `i64` boundary and
+    // whose fraction length pushes it past it. The old parser added the two in
+    // raw `i64` arithmetic, so a debug build aborted the whole test process
+    // instead of rejecting the write.
+    for (key, value) in [
+        ("7", "0.5e-9223372036854775808"),
+        ("8", "10e9223372036854775807"),
+    ] {
+        let error = put(key, value.to_string())
+            .await
+            .expect_err("an exponent past i64 is not a number");
+        assert!(error.to_string().contains("numeric value"), "{error}");
+    }
 }
 
 #[tokio::test]
