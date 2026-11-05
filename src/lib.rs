@@ -257,17 +257,12 @@ pub fn item_to_value(item: Item) -> AttributeValue {
 /// depth.
 ///
 /// ```
-/// use mock_ddb::{s, item_ref_from_value, AttributeValue};
+/// use mock_ddb::{item, item_ref_from_value, item_to_value, s};
 ///
-/// let document = AttributeValue::M(std::collections::HashMap::from([(
-///     "pk".to_string(),
-///     s("u#1"),
-/// )]));
-/// assert_eq!(
-///     item_ref_from_value(&document).and_then(|item| item.get("pk")),
-///     Some(&s("u#1"))
-/// );
-/// assert!(item_ref_from_value(&AttributeValue::Null(true)).is_none());
+/// let written = item([("pk", s("u#1"))]);
+/// let document = item_to_value(written.clone());
+/// assert_eq!(item_ref_from_value(&document), Some(&written));
+/// assert!(item_ref_from_value(&s("scalar")).is_none());
 /// ```
 #[must_use]
 pub fn item_ref_from_value(value: &AttributeValue) -> Option<&Item> {
@@ -287,10 +282,10 @@ pub fn item_ref_from_value(value: &AttributeValue) -> Option<&Item> {
 /// this function nor [`item_ref_from_value`] validates them.
 ///
 /// ```
-/// use mock_ddb::{item_to_value, into_item, item, s};
+/// use mock_ddb::{into_item, item, item_to_value, n, s};
 ///
-/// let wrapped = item_to_value(item([("pk", s("u#1"))]));
-/// assert_eq!(into_item(wrapped).map(|item| item.len()), Some(1));
+/// let written = item([("pk", s("u#1")), ("age", n("42"))]);
+/// assert_eq!(into_item(item_to_value(written.clone())), Some(written));
 /// assert!(into_item(s("scalar")).is_none());
 /// ```
 #[must_use]
@@ -312,13 +307,11 @@ pub fn into_item(value: AttributeValue) -> Option<Item> {
 /// document.
 ///
 /// ```
-/// use mock_ddb::{s, item_from_value, AttributeValue};
+/// use mock_ddb::{item, item_from_value, item_to_value, n, s};
 ///
-/// let document = AttributeValue::M(std::collections::HashMap::from([(
-///     "pk".to_string(),
-///     s("u#1"),
-/// )]));
-/// assert_eq!(item_from_value(&document).map(|item| item.len()), Some(1));
+/// let written = item([("pk", s("u#1")), ("age", n("42"))]);
+/// let document = item_to_value(written.clone());
+/// assert_eq!(item_from_value(&document), Some(written));
 /// assert!(item_from_value(&s("scalar")).is_none());
 /// ```
 #[must_use]
