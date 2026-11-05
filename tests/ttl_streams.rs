@@ -477,7 +477,10 @@ mod streams {
             vec![item([("pk", s("u#1")), ("expires_at", n("999999"))])],
         )
         .unwrap();
-        assert!(mock.get_records(&arn).await.unwrap().is_empty());
+        assert_eq!(
+            mock.get_records(&arn).await.unwrap(),
+            Vec::<StreamRecord>::new()
+        );
 
         // Seeding over that expired row creates the item, exactly as the same
         // write through `put_item` would.

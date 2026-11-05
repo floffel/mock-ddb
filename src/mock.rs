@@ -5,6 +5,12 @@
 //! operation sees a consistent snapshot. Write operations hold the write lock
 //! for their whole duration, which is what makes transactions atomic and batch
 //! writes all-or-nothing on validation errors.
+//!
+//! The injected [`Clock`] sits in its own slot, outside that lock. Every path
+//! reads the current instant *before* taking the store lock, so a clock written
+//! by test code — one that blocks on I/O or a channel, or that calls back into
+//! the mock — cannot stretch the critical section or deadlock a task sharing a
+//! clone, and the write lock only ever covers the state transition itself.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -51,7 +57,6 @@ use crate::stream::{
 /// The mutable state behind the client.
 struct Inner {
     tables: BTreeMap<String, Table>,
-    clock: Arc<dyn Clock>,
     /// Counter that seeds stream sequence numbers, so records from two tables
     /// never compare equal.
     sequence: u64,
@@ -132,6 +137,15 @@ fn transaction_payload(request: &TransactWriteItemsRequest) -> TransactWriteItem
 #[derive(Clone)]
 pub struct MockDdb {
     inner: Arc<RwLock<Inner>>,
+    /// The injected clock, in its own slot rather than inside [`Inner`].
+    ///
+    /// [`Clock`] is implemented by test code, so `Clock::now` may block on I/O,
+    /// wait on a channel, or call back into this mock. Keeping the clock out of
+    /// the store means no such call can run while the store lock is held: a
+    /// write path clones the `Arc` out of this slot under a short read guard,
+    /// releases it, and only then asks the clock for the time — so a slow clock
+    /// cannot stall other tasks, and a re-entrant one cannot deadlock.
+    clock: Arc<RwLock<Arc<dyn Clock>>>,
 }
 
 impl Default for MockDdb {
@@ -142,10 +156,18 @@ impl Default for MockDdb {
 
 impl std::fmt::Debug for MockDdb {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.inner.read();
+        // Copy the names out and drop the guard before formatting: the caller
+        // that reaches `Debug` may be holding nothing we know about, and a
+        // formatting call is no place to keep the store lock.
+        let tables: Vec<String> = {
+            let inner = self.inner.read();
+            inner.tables.keys().cloned().collect()
+        };
+        let clock = self.clock.read().clone();
         formatter
             .debug_struct("MockDdb")
-            .field("tables", &inner.tables.keys().collect::<Vec<_>>())
+            .field("tables", &tables)
+            .field("clock", &clock)
             .finish()
     }
 }
@@ -187,12 +209,12 @@ impl MockDdb {
         Self {
             inner: Arc::new(RwLock::new(Inner {
                 tables: BTreeMap::new(),
-                clock,
                 sequence: 1,
                 applied_tokens: BTreeMap::new(),
                 next_tokens: VecDeque::new(),
                 token_sequence: 0,
             })),
+            clock: Arc::new(RwLock::new(clock)),
         }
     }
 
@@ -213,7 +235,7 @@ impl MockDdb {
         let mock = Self::new();
         let request = CreateTableRequest::new(table_name, key_schema);
         let definition = TableDefinition::from_request(&request)?;
-        let now = mock.inner.read().clock.now();
+        let now = mock.clock_now();
         mock.insert_table(definition, now)?;
         Ok(mock)
     }
@@ -229,7 +251,27 @@ impl MockDdb {
     /// ```
     /// Replace the clock, e.g. to pin time in the middle of a test.
     pub fn set_clock(&self, clock: Arc<dyn Clock>) {
-        self.inner.write().clock = clock;
+        *self.clock.write() = clock;
+    }
+
+    /// The injected clock, with the guard already released.
+    ///
+    /// Nothing in this module calls `Clock::now` from inside a lock: a test's
+    /// clock may block on I/O or a channel, or call back into the mock through
+    /// [`now_seconds`](Self::now_seconds) or [`count`](Self::count), and
+    /// `parking_lot::RwLock` is not reentrant.
+    fn clock_now(&self) -> std::time::SystemTime {
+        let clock = self.clock.read().clone();
+        clock.now()
+    }
+
+    /// The clock's current instant in whole epoch seconds.
+    ///
+    /// Every write path calls this before taking the store lock, so the
+    /// critical section holds the state transition and nothing that could
+    /// block on user code.
+    fn epoch_now(&self) -> i64 {
+        epoch_seconds(self.clock_now())
     }
 
     /// The clock's current instant, in whole seconds since the Unix epoch.
@@ -242,7 +284,7 @@ impl MockDdb {
     /// assert!(mock.now_seconds() > 0);
     /// ```
     pub fn now_seconds(&self) -> i64 {
-        epoch_seconds(self.inner.read().clock.now())
+        self.epoch_now()
     }
 
     /// Seed items into an existing table without conditions.
@@ -266,8 +308,8 @@ impl MockDdb {
     /// Returns [`Error::ResourceNotFound`] for an unknown table and
     /// [`Error::Validation`] for an item that does not match the schema.
     pub fn seed(&self, table_name: &str, items: Vec<Item>) -> Result<()> {
+        let now = self.epoch_now();
         let mut inner = self.inner.write();
-        let now = epoch_seconds(inner.clock.now());
         let table = inner
             .tables
             .get_mut(table_name)
@@ -309,8 +351,8 @@ impl MockDdb {
     /// assert_eq!(mock.count("users"), 1);
     /// ```
     pub fn count(&self, table_name: &str) -> usize {
+        let now = self.epoch_now();
         let inner = self.inner.read();
-        let now = epoch_seconds(inner.clock.now());
         inner.tables.get(table_name).map_or(0, |table| {
             usize::try_from(table.live_count(now)).unwrap_or(usize::MAX)
         })
@@ -329,8 +371,8 @@ impl MockDdb {
     /// ```
     #[must_use]
     pub fn dump(&self, table_name: &str) -> Vec<Item> {
+        let now = self.epoch_now();
         let inner = self.inner.read();
-        let now = epoch_seconds(inner.clock.now());
         inner.tables.get(table_name).map_or_else(Vec::new, |table| {
             table
                 .items
@@ -382,7 +424,7 @@ impl MockDdb {
     /// [`Error::Validation`] for an invalid definition.
     pub async fn create_table(&self, request: CreateTableRequest) -> Result<TableDescription> {
         let definition = TableDefinition::from_request(&request)?;
-        let now = self.inner.read().clock.now();
+        let now = self.clock_now();
         self.insert_table(definition, now)
     }
 
@@ -422,8 +464,8 @@ impl MockDdb {
     ///
     /// Returns [`Error::ResourceNotFound`] when the table does not exist.
     pub async fn delete_table(&self, table_name: &str) -> Result<TableDescription> {
+        let now = self.epoch_now();
         let mut inner = self.inner.write();
-        let now = epoch_seconds(inner.clock.now());
         let table = inner
             .tables
             .remove(table_name)
@@ -447,8 +489,8 @@ impl MockDdb {
     ///
     /// Returns [`Error::ResourceNotFound`] when the table does not exist.
     pub async fn describe_table(&self, table_name: &str) -> Result<TableDescription> {
+        let now = self.epoch_now();
         let inner = self.inner.read();
-        let now = epoch_seconds(inner.clock.now());
         let table = inner
             .tables
             .get(table_name)
@@ -539,8 +581,8 @@ impl MockDdb {
     }
 
     pub(crate) fn put_item_inner(&self, request: &PutItemRequest) -> Result<PutItemOutput> {
+        let now = self.epoch_now();
         let mut inner = self.inner.write();
-        let now = epoch_seconds(inner.clock.now());
         let table = inner
             .tables
             .get_mut(&request.table_name)
@@ -632,8 +674,8 @@ impl MockDdb {
     }
 
     fn get_item_inner(&self, request: &GetItemRequest) -> Result<GetItemOutput> {
+        let now = self.epoch_now();
         let inner = self.inner.read();
-        let now = epoch_seconds(inner.clock.now());
         let table = inner
             .tables
             .get(&request.table_name)
@@ -717,8 +759,8 @@ impl MockDdb {
         &self,
         request: &DeleteItemRequest,
     ) -> Result<DeleteItemOutput> {
+        let now = self.epoch_now();
         let mut inner = self.inner.write();
-        let now = epoch_seconds(inner.clock.now());
         let table = inner
             .tables
             .get_mut(&request.table_name)
@@ -805,8 +847,8 @@ impl MockDdb {
         &self,
         request: &UpdateItemRequest,
     ) -> Result<UpdateItemOutput> {
+        let now = self.epoch_now();
         let mut inner = self.inner.write();
-        let now = epoch_seconds(inner.clock.now());
         let table = inner
             .tables
             .get_mut(&request.table_name)
@@ -929,8 +971,8 @@ impl MockDdb {
 
     pub(crate) fn query_inner(&self, request: &QueryRequest) -> Result<QueryOutput> {
         validate_limit(request.limit)?;
+        let now = self.epoch_now();
         let inner = self.inner.read();
-        let now = epoch_seconds(inner.clock.now());
         let table = inner
             .tables
             .get(&request.table_name)
@@ -1051,8 +1093,8 @@ impl MockDdb {
             }
         };
 
+        let now = self.epoch_now();
         let inner = self.inner.read();
-        let now = epoch_seconds(inner.clock.now());
         let table = inner
             .tables
             .get(&request.table_name)
@@ -1140,8 +1182,8 @@ impl MockDdb {
         &self,
         request: BatchWriteItemRequest,
     ) -> Result<BatchWriteItemOutput> {
+        let now = self.epoch_now();
         let mut inner = self.inner.write();
-        let now = epoch_seconds(inner.clock.now());
         let total: usize = request.request_items.values().map(Vec::len).sum();
         if total == 0 || total > 25 {
             return Err(Error::validation(format!(
@@ -1270,8 +1312,8 @@ impl MockDdb {
     }
 
     fn batch_get_item_inner(&self, request: &BatchGetItemRequest) -> Result<BatchGetItemOutput> {
+        let now = self.epoch_now();
         let inner = self.inner.read();
-        let now = epoch_seconds(inner.clock.now());
         let total: usize = request
             .request_items
             .values()
@@ -1539,8 +1581,8 @@ impl MockDdb {
         &self,
         request: &TransactWriteItemsRequest,
     ) -> Result<TransactWriteItemsOutput> {
+        let now = self.epoch_now();
         let mut inner = self.inner.write();
-        let now = epoch_seconds(inner.clock.now());
         if request.transact_items.is_empty() || request.transact_items.len() > 100 {
             return Err(Error::validation(format!(
                 "1 validation error detected: Value at 'transactItems' failed to satisfy constraint: Member must have length between 1 and 100, got {}",
@@ -1682,8 +1724,8 @@ impl MockDdb {
         &self,
         request: &TransactGetItemsRequest,
     ) -> Result<TransactGetItemsOutput> {
+        let now = self.epoch_now();
         let inner = self.inner.read();
-        let now = epoch_seconds(inner.clock.now());
         if request.transact_items.is_empty() || request.transact_items.len() > 100 {
             return Err(Error::validation(format!(
                 "1 validation error detected: Value at 'transactItems' failed to satisfy constraint: Member must have length between 1 and 100, got {}",
@@ -1852,8 +1894,8 @@ impl MockDdb {
     ///
     /// Returns [`Error::ResourceNotFound`] for an unknown table.
     pub fn purge_expired(&self, table_name: &str) -> Result<usize> {
+        let now = self.epoch_now();
         let mut inner = self.inner.write();
-        let now = epoch_seconds(inner.clock.now());
         let table = inner
             .tables
             .get_mut(table_name)

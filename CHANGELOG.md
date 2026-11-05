@@ -81,6 +81,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The injected `Clock` is consulted before the store lock is taken, not inside
+  it. Every write path called `Clock::now` while holding the exclusive lock, and
+  `Clock` is implemented by test code, so a clock that blocked (I/O, a channel, a
+  condvar) held the store for its whole duration, and a clock that read back the
+  mock — `now_seconds`, `count`, `dump` — deadlocked every task sharing a clone,
+  because `parking_lot::RwLock` is not reentrant. The clock now lives in its own
+  slot next to the store: a path clones the handle under a short read guard,
+  releases it, and only then asks for the time, so the write lock covers the
+  state transition and nothing that can run user code. `Debug for MockDdb`
+  likewise copies the table names out before formatting instead of formatting
+  under the guard.
 - `MockClock::epoch_seconds` reports the real negative second before the Unix
   epoch instead of the fixed sentinel `-1`, so a clock set an hour early no
   longer claims to be one second early. `-1` is itself a legal timestamp
