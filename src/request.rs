@@ -825,7 +825,8 @@ impl BatchWriteItemRequest {
 /// `BatchWriteItem` output.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BatchWriteItemOutput {
-    /// Writes the service did not process. Always empty in the mock.
+    /// Writes the call did not process. Empty unless the mock was throttled
+    /// with [`MockDdb::throttle_next_batch_write`](crate::MockDdb::throttle_next_batch_write).
     pub unprocessed_items: BTreeMap<String, Vec<WriteRequest>>,
     /// One entry per table the batch wrote to, when requested.
     pub consumed_capacity: Vec<ConsumedCapacity>,
@@ -900,7 +901,8 @@ impl BatchGetItemRequest {
 pub struct BatchGetItemOutput {
     /// Table name → found items, in request order. Missing keys are omitted.
     pub responses: BTreeMap<String, Vec<Item>>,
-    /// Keys the service did not process. Always empty in the mock.
+    /// Keys the call did not process. Empty unless the mock was throttled with
+    /// [`MockDdb::throttle_next_batch_get`](crate::MockDdb::throttle_next_batch_get).
     pub unprocessed_keys: BTreeMap<String, KeysAndAttributes>,
     /// One entry per table the batch read from, when requested.
     pub consumed_capacity: Vec<ConsumedCapacity>,

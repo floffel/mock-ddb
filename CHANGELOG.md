@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `MockDdb::throttle_next_batch_write` and `MockDdb::throttle_next_batch_get`:
+  one-shot knobs that make the next `BatchWriteItem` / `BatchGetItem` report a
+  prefix of its writes or keys as `UnprocessedItems` / `UnprocessedKeys`, with
+  the rest applied (or read) and only that part charged, while every later call
+  is unthrottled again. The output types modelled those fields, but the mock
+  could never produce them, so a caller's partial-batch retry — drop the
+  remainder, retry it twice, loop forever — was the one delivery path a handler
+  could get wrong without a test noticing. The deferred prefix is validated like
+  the rest of the batch (a malformed projection is rejected even when its keys
+  are all deferred) and comes back with the projection and alias map it was sent
+  with, so the retry can be built from the response alone.
 - `item_ref_from_value` borrows the map behind an `AttributeValue::M` and
   `into_item` takes ownership of it, so reading a document attribute no longer
   has to clone it: `item_from_value` copies the whole subtree, nested documents

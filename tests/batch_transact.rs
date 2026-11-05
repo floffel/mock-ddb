@@ -114,6 +114,42 @@ async fn batch_write_validates_every_item_before_writing_any() {
 }
 
 #[tokio::test]
+async fn a_partial_batch_write_is_drained_by_retrying_the_remainder() {
+    // The delivery path the knob exists for: a handler that retries
+    // `UnprocessedItems` until the service reports none, instead of dropping
+    // them on the floor or looping forever on them.
+    let mock = orders();
+    let mut pending: Vec<WriteRequest> = (1..=4)
+        .map(|sk| WriteRequest::Put {
+            item: order("c#retry", sk, "1"),
+        })
+        .collect();
+
+    let mut rounds = 0;
+    while !pending.is_empty() {
+        rounds += 1;
+        assert!(rounds <= 8, "the retry loop has to terminate");
+        // Each round leaves part of the batch behind, so the handler loops.
+        if pending.len() > 1 {
+            mock.throttle_next_batch_write(pending.len() / 2);
+        }
+        let mut request = BatchWriteItemRequest::new();
+        for write in std::mem::take(&mut pending) {
+            request = request.add("orders", write);
+        }
+        let output = mock.batch_write_item(request).await.unwrap();
+        pending = output
+            .unprocessed_items
+            .get("orders")
+            .cloned()
+            .unwrap_or_default();
+    }
+
+    assert_eq!(rounds, 3);
+    assert_eq!(mock.count("orders"), 4);
+}
+
+#[tokio::test]
 async fn batch_write_deletes_and_maintains_indexes() {
     let mock = MockDdb::new();
     mock.create_table(

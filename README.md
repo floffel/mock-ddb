@@ -126,7 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | Return values | `NONE`, `ALL_OLD`, `UPDATED_OLD`, `ALL_NEW`, `UPDATED_NEW`, plus `ReturnValuesOnConditionCheckFailure` |
 | Reads | `query` and `scan` with `FilterExpression`, `ProjectionExpression`, `Limit`, `ExclusiveStartKey`, `ScanIndexForward`, `Select` (`ALL_ATTRIBUTES`, `COUNT`, `SPECIFIC_ATTRIBUTES`), index reads |
 | Parallel scan | `Segment` / `TotalSegments`, disjoint and complete |
-| Batches | `batch_write_item` (25 writes, duplicate-key detection), `batch_get_item` (100 keys, per-table projection) |
+| Batches | `batch_write_item` (25 writes, duplicate-key detection), `batch_get_item` (100 keys, per-table projection); `throttle_next_batch_write` / `throttle_next_batch_get` arm one partial response so a caller's `UnprocessedItems`/`UnprocessedKeys` retry can be tested |
 | Capacity | `ReturnConsumedCapacity` (`NONE`/`TOTAL`/`INDEXES`) and `ReturnItemCollectionMetrics` (`SIZE`) on every data-plane operation, with the units computed from the stored items and split per table and per index |
 | Transactions | `transact_write_items` (100 actions: `Put`, `Update`, `Delete`, `ConditionCheck`; atomic; per-member cancellation reasons; `ClientRequestToken` idempotency), `transact_get_items` |
 | TTL | `update_time_to_live`, `describe_time_to_live`, lazy expiry on every read path, `purge_expired` |
@@ -236,9 +236,14 @@ that changes what a caller must do is called out.
    `ConsumedCapacity`/`ItemCollectionMetrics`, and only a transaction that
    applied spends its token, so a retry of a cancelled one re-evaluates the
    conditions.
-10. **Batch writes are never partial.** Up to 25 writes are validated first and
-    then applied; `UnprocessedItems` and `UnprocessedKeys` are always empty. The
-    service can return unprocessed work under load.
+10. **Batch writes are all-or-nothing unless a test asks otherwise.** Up to 25
+    writes are validated first and then applied; `UnprocessedItems` and
+    `UnprocessedKeys` are empty by default, where the service can return
+    unprocessed work under load. A test that has to exercise the caller's
+    partial-batch retry arms one partial response with
+    `throttle_next_batch_write` / `throttle_next_batch_get`: the next batch call
+    leaves a prefix of the writes or keys unprocessed (no capacity charged, the
+    rest applied or read) and every later call runs unthrottled again.
 11. **Update expressions read the pre-update image.** All right-hand sides are
     evaluated against the item as it was before the first clause, so
     `SET a = b, b = a` swaps. This matches the service's single atomic update

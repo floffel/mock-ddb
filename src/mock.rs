@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::capacity::{
     read_units, size_estimate_range, write_units, Breakdown, ItemCollectionMetrics,
@@ -33,9 +33,9 @@ use crate::partiql::{
 };
 use crate::request::{
     BatchGetItemOutput, BatchGetItemRequest, BatchWriteItemOutput, BatchWriteItemRequest,
-    DeleteItemOutput, DeleteItemRequest, GetItemOutput, GetItemRequest, ListTablesOutput,
-    ListTablesRequest, PutItemOutput, PutItemRequest, QueryOutput, QueryRequest, ReturnValues,
-    ScanOutput, ScanRequest, Select, TimeToLiveDescription, TimeToLiveStatus,
+    DeleteItemOutput, DeleteItemRequest, GetItemOutput, GetItemRequest, KeysAndAttributes,
+    ListTablesOutput, ListTablesRequest, PutItemOutput, PutItemRequest, QueryOutput, QueryRequest,
+    ReturnValues, ScanOutput, ScanRequest, Select, TimeToLiveDescription, TimeToLiveStatus,
     TransactGetItemsOutput, TransactGetItemsRequest, TransactWriteItem, TransactWriteItemsOutput,
     TransactWriteItemsRequest, UpdateItemOutput, UpdateItemRequest, UpdateTimeToLiveRequest,
     WriteRequest,
@@ -53,6 +53,72 @@ use crate::stream::{
     MAX_RECORDS_PER_GET, MAX_SHARDS_PER_DESCRIBE, MAX_STREAMS_PER_LIST,
     STREAM_CREATION_EPOCH_SECONDS,
 };
+
+/// Batch calls a test has throttled, waiting for their next call to spend it.
+///
+/// Kept outside [`Inner`] for the same reason as the clock: a `BatchGetItem`
+/// runs under the store's read lock and must still be able to clear its own
+/// one-shot throttle, which a read guard cannot do — and no batch call has to
+/// hold the store lock in order to arm or spend a throttle.
+#[derive(Debug, Default)]
+struct BatchThrottle {
+    /// Writes the next `BatchWriteItem` leaves unprocessed.
+    writes: Option<usize>,
+    /// Keys the next `BatchGetItem` leaves unprocessed.
+    keys: Option<usize>,
+}
+
+/// One table of a batch read, validated before any key is answered.
+///
+/// Built in a first pass over the request, so a table that does not exist, a
+/// malformed key or a malformed projection is refused before the call reads
+/// anything, charges any capacity or spends an armed throttle.
+struct BatchReadStep<'a> {
+    table: &'a Table,
+    table_name: &'a str,
+    attributes: &'a KeysAndAttributes,
+    /// The request's keys, normalised to the table's key attributes.
+    keys: Vec<ItemKey>,
+    /// The projection, parsed and its `#alias`es resolved once for the table.
+    projection: Option<ResolvedProjection>,
+}
+
+/// Validate every write in a batch and return its keys in request order.
+///
+/// Nothing is applied here: the caller validates the whole batch first, so a
+/// batch that fails is rejected without a partial write, and only then decides
+/// which of the validated keys a throttled response leaves behind.
+fn validated_batch_keys(
+    inner: &Inner,
+    request: &BatchWriteItemRequest,
+) -> Result<Vec<(String, ItemKey)>> {
+    let total: usize = request.request_items.values().map(Vec::len).sum();
+    let mut seen: BTreeSet<(String, ItemKey)> = BTreeSet::new();
+    let mut ordered: Vec<(String, ItemKey)> = Vec::with_capacity(total);
+    for (table_name, writes) in &request.request_items {
+        let table = inner
+            .tables
+            .get(table_name)
+            .ok_or_else(|| Error::table_not_found(table_name))?;
+        for write in writes {
+            let key = match write {
+                WriteRequest::Put { item } => {
+                    table.validate_item(item)?;
+                    table.item_key(item)?
+                }
+                WriteRequest::Delete { key } => table.lookup_key(key)?,
+            };
+            let slot = (table_name.clone(), key);
+            if !seen.insert(slot.clone()) {
+                return Err(Error::validation(
+                    "Provided list of item keys contains duplicates",
+                ));
+            }
+            ordered.push(slot);
+        }
+    }
+    Ok(ordered)
+}
 
 /// The mutable state behind the client.
 struct Inner {
@@ -146,6 +212,10 @@ pub struct MockDdb {
     /// releases it, and only then asks the clock for the time — so a slow clock
     /// cannot stall other tasks, and a re-entrant one cannot deadlock.
     clock: Arc<RwLock<Arc<dyn Clock>>>,
+    /// One-shot batch throttles, in a slot of their own for the same reason as
+    /// the clock: a batch read holds the store's read guard while it runs and
+    /// could not clear its own throttle from inside it.
+    batch_throttle: Arc<Mutex<BatchThrottle>>,
 }
 
 impl Default for MockDdb {
@@ -168,6 +238,7 @@ impl std::fmt::Debug for MockDdb {
             .debug_struct("MockDdb")
             .field("tables", &tables)
             .field("clock", &clock)
+            .field("batch_throttle", &*self.batch_throttle.lock())
             .finish()
     }
 }
@@ -215,6 +286,7 @@ impl MockDdb {
                 token_sequence: 0,
             })),
             clock: Arc::new(RwLock::new(clock)),
+            batch_throttle: Arc::new(Mutex::new(BatchThrottle::default())),
         }
     }
 
@@ -1149,6 +1221,110 @@ impl MockDdb {
         })
     }
 
+    /// Arm the next [`batch_write_item`](Self::batch_write_item) to report up
+    /// to `unprocessed` writes as unprocessed.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, BatchWriteItemRequest, KeySchema, KeyType, MockDdb, WriteRequest};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mock = MockDdb::with_table("users", KeySchema::hash("pk", KeyType::String)).unwrap();
+    /// mock.throttle_next_batch_write(1);
+    ///
+    /// let batch = BatchWriteItemRequest::new()
+    ///     .add("users", WriteRequest::Put { item: item([("pk", s("u#1"))]) })
+    ///     .add("users", WriteRequest::Put { item: item([("pk", s("u#2"))]) });
+    /// let first = mock.batch_write_item(batch).await.unwrap();
+    /// assert_eq!(first.unprocessed_items["users"].len(), 1);
+    /// assert_eq!(mock.count("users"), 1);
+    ///
+    /// // A real caller retries the remainder; the knob is already spent.
+    /// let retry = BatchWriteItemRequest {
+    ///     request_items: first.unprocessed_items,
+    ///     ..BatchWriteItemRequest::default()
+    /// };
+    /// assert!(mock.batch_write_item(retry).await.unwrap().unprocessed_items.is_empty());
+    /// assert_eq!(mock.count("users"), 2);
+    /// # }
+    /// ```
+    ///
+    /// The next batch write applies every write it does not report: the request
+    /// is validated as a whole first, then the first `unprocessed` writes in
+    /// request order (by table name, then position in that table's list) are
+    /// handed back in [`BatchWriteItemOutput::unprocessed_items`] untouched and
+    /// charged no write capacity. The knob is **one-shot** — the call that
+    /// spends it clears it, so the caller's retry runs unthrottled and a test
+    /// can assert the remainder lands. A `count` above that batch's size leaves
+    /// the whole batch unprocessed, and `0` leaves nothing unprocessed; arming
+    /// again before the next call replaces the pending count. A batch the mock
+    /// rejects outright — empty, over 25 writes, unknown table, an item that
+    /// does not match it, a repeated key — leaves the count armed, so a test's
+    /// setup is not eaten by a request that never ran.
+    ///
+    /// Without an armed knob the default holds: a batch write is all-or-nothing
+    /// and `unprocessed_items` is empty.
+    pub fn throttle_next_batch_write(&self, unprocessed: usize) {
+        self.batch_throttle.lock().writes = Some(unprocessed);
+    }
+
+    /// Arm the next [`batch_get_item`](Self::batch_get_item) to report up to
+    /// `unprocessed` keys as unprocessed.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, BatchGetItemRequest, KeySchema, KeyType, KeysAndAttributes, MockDdb};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mock = MockDdb::with_table("users", KeySchema::hash("pk", KeyType::String)).unwrap();
+    /// mock.seed("users", vec![item([("pk", s("u#1"))]), item([("pk", s("u#2"))])]).unwrap();
+    /// mock.throttle_next_batch_get(1);
+    ///
+    /// let batch = BatchGetItemRequest::new().add(
+    ///     "users",
+    ///     KeysAndAttributes::new(vec![item([("pk", s("u#1"))]), item([("pk", s("u#2"))])]),
+    /// );
+    /// let first = mock.batch_get_item(batch).await.unwrap();
+    /// assert_eq!(first.responses["users"].len(), 1);
+    /// assert_eq!(first.unprocessed_keys["users"].keys.len(), 1);
+    ///
+    /// let retry = BatchGetItemRequest::new().add("users", first.unprocessed_keys["users"].clone());
+    /// let second = mock.batch_get_item(retry).await.unwrap();
+    /// assert_eq!(second.responses["users"].len(), 1);
+    /// assert!(second.unprocessed_keys.is_empty());
+    /// # }
+    /// ```
+    ///
+    /// The next batch read answers every key it does not report: the request is
+    /// validated as a whole first, then the first `unprocessed` keys in request
+    /// order (by table name, then position in that table's key list) are handed
+    /// back in [`BatchGetItemOutput::unprocessed_keys`] with the projection and
+    /// alias map they came with, and cost no read capacity. The knob is
+    /// **one-shot** — the call that spends it clears it, so the caller's retry
+    /// runs unthrottled. A `count` above that batch's size leaves the whole
+    /// batch unprocessed, and `0` leaves nothing unprocessed; arming again
+    /// before the next call replaces the pending count. A batch the mock rejects
+    /// outright — empty, over 100 keys, unknown table, a malformed key or
+    /// projection — leaves the count armed, so a test's setup is not eaten by a
+    /// request that never ran.
+    ///
+    /// Without an armed knob the default holds: `unprocessed_keys` is empty.
+    pub fn throttle_next_batch_get(&self, unprocessed: usize) {
+        self.batch_throttle.lock().keys = Some(unprocessed);
+    }
+
+    /// Spend the armed write throttle, clamped to the batch that is running.
+    fn take_throttled_writes(&self, batch: usize) -> usize {
+        let mut throttle = self.batch_throttle.lock();
+        throttle.writes.take().map_or(0, |count| count.min(batch))
+    }
+
+    /// Spend the armed key throttle, clamped to the batch that is running.
+    fn take_throttled_keys(&self, batch: usize) -> usize {
+        let mut throttle = self.batch_throttle.lock();
+        throttle.keys.take().map_or(0, |count| count.min(batch))
+    }
+
     ///
     /// ```
     /// use mock_ddb::{item, s, BatchWriteItemRequest, KeySchema, KeyType, MockDdb, WriteRequest};
@@ -1171,6 +1347,9 @@ impl MockDdb {
     /// writes, repeats a key, or contains an item that does not match its
     /// table, and [`Error::ResourceNotFound`] for an unknown table. Nothing is
     /// written when any write fails validation.
+    ///
+    /// `unprocessed_items` is empty unless the call was throttled with
+    /// [`throttle_next_batch_write`](Self::throttle_next_batch_write).
     pub async fn batch_write_item(
         &self,
         request: BatchWriteItemRequest,
@@ -1183,36 +1362,26 @@ impl MockDdb {
         request: BatchWriteItemRequest,
     ) -> Result<BatchWriteItemOutput> {
         let now = self.epoch_now();
-        let mut inner = self.inner.write();
         let total: usize = request.request_items.values().map(Vec::len).sum();
         if total == 0 || total > 25 {
             return Err(Error::validation(format!(
                 "1 validation error detected: Value at 'requestItems' failed to satisfy constraint: Member must have length between 1 and 25, got {total}"
             )));
         }
+        let mut inner = self.inner.write();
+        let ordered = validated_batch_keys(&inner, &request)?;
+        // Spend the throttle only now: a batch rejected above (size, unknown
+        // table, item that does not match, duplicate key) leaves the armed count
+        // for the next call instead of eating a test's setup. This is the one
+        // place that takes the throttle lock while the store lock is held; the
+        // order is fixed (store, then throttle) and the throttle lock is never
+        // held while calling out, so the pair cannot deadlock.
+        let leave = self.take_throttled_writes(total);
+        // The deferred writes are a prefix of `ordered`, so the caller's retry
+        // covers exactly what the response left out, and nothing else.
+        let mut deferred: BTreeSet<(String, ItemKey)> = ordered.into_iter().take(leave).collect();
 
-        let mut seen: BTreeSet<(String, ItemKey)> = BTreeSet::new();
-        for (table_name, writes) in &request.request_items {
-            let table = inner
-                .tables
-                .get(table_name)
-                .ok_or_else(|| Error::table_not_found(table_name))?;
-            for write in writes {
-                let key = match write {
-                    WriteRequest::Put { item } => {
-                        table.validate_item(item)?;
-                        table.item_key(item)?
-                    }
-                    WriteRequest::Delete { key } => table.lookup_key(key)?,
-                };
-                if !seen.insert((table_name.clone(), key)) {
-                    return Err(Error::validation(
-                        "Provided list of item keys contains duplicates",
-                    ));
-                }
-            }
-        }
-
+        let mut unprocessed_items: BTreeMap<String, Vec<WriteRequest>> = BTreeMap::new();
         let mut breakdowns: BTreeMap<String, Breakdown> = BTreeMap::new();
         let mut collections: BTreeMap<String, ItemCollectionMetrics> = BTreeMap::new();
         for (table_name, writes) in request.request_items {
@@ -1221,6 +1390,23 @@ impl MockDdb {
                 .get_mut(&table_name)
                 .ok_or_else(|| Error::table_not_found(&table_name))?;
             for write in writes {
+                let unprocessed = match &write {
+                    WriteRequest::Put { item } => {
+                        deferred.remove(&(table_name.clone(), table.item_key(item)?))
+                    }
+                    WriteRequest::Delete { key } => {
+                        deferred.remove(&(table_name.clone(), table.lookup_key(key)?))
+                    }
+                };
+                if unprocessed {
+                    // Neither applied nor charged: the service reports the work
+                    // it did not do, and a retry has to pay for it.
+                    unprocessed_items
+                        .entry(table_name.clone())
+                        .or_default()
+                        .push(write);
+                    continue;
+                }
                 let mut breakdown = Breakdown::new();
                 match write {
                     WriteRequest::Put { item } => {
@@ -1276,7 +1462,7 @@ impl MockDdb {
             })
             .collect();
         Ok(BatchWriteItemOutput {
-            unprocessed_items: BTreeMap::new(),
+            unprocessed_items,
             consumed_capacity,
             item_collection_metrics: collections,
         })
@@ -1307,13 +1493,15 @@ impl MockDdb {
     /// Returns [`Error::Validation`] when the batch is empty, asks for more than
     /// 100 keys, or carries a malformed key or projection, and
     /// [`Error::ResourceNotFound`] for an unknown table.
+    ///
+    /// `unprocessed_keys` is empty unless the call was throttled with
+    /// [`throttle_next_batch_get`](Self::throttle_next_batch_get).
     pub async fn batch_get_item(&self, request: BatchGetItemRequest) -> Result<BatchGetItemOutput> {
         self.batch_get_item_inner(&request)
     }
 
     fn batch_get_item_inner(&self, request: &BatchGetItemRequest) -> Result<BatchGetItemOutput> {
         let now = self.epoch_now();
-        let inner = self.inner.read();
         let total: usize = request
             .request_items
             .values()
@@ -1324,9 +1512,13 @@ impl MockDdb {
                 "1 validation error detected: Value at 'requestItems' failed to satisfy constraint: Member must have length between 1 and 100, got {total}"
             )));
         }
+        let inner = self.inner.read();
 
-        let mut responses: BTreeMap<String, Vec<Item>> = BTreeMap::new();
-        let mut breakdowns: BTreeMap<String, Breakdown> = BTreeMap::new();
+        // Validate the whole request — tables, keys, projections — before a
+        // single key is answered: a malformed projection is refused even when
+        // the table holds none of the keys it names, and a rejected batch never
+        // eats a test's armed partial response.
+        let mut steps: Vec<BatchReadStep<'_>> = Vec::with_capacity(request.request_items.len());
         for (table_name, attributes) in &request.request_items {
             let table = inner
                 .tables
@@ -1336,31 +1528,75 @@ impl MockDdb {
                 .expression_attribute_names
                 .clone()
                 .unwrap_or_default();
-            let mut found = Vec::new();
-            let mut breakdown = Breakdown::new();
+            let projection = match &attributes.projection_expression {
+                None => None,
+                Some(expression) => {
+                    let parsed = ProjectionExpression::parse(expression)?;
+                    Some(ResolvedProjection::new(&parsed, &names)?)
+                }
+            };
+            let mut keys = Vec::with_capacity(attributes.keys.len());
             for key in &attributes.keys {
-                let key = table.lookup_key(key)?;
-                let stored = table
+                keys.push(table.lookup_key(key)?);
+            }
+            steps.push(BatchReadStep {
+                table,
+                table_name,
+                attributes,
+                keys,
+                projection,
+            });
+        }
+
+        // Only now spend what the request was armed with, so that a batch
+        // rejected above leaves the pending count for the next call. The count of
+        // deferred keys runs across tables, in request order.
+        let mut deferred = self.take_throttled_keys(total);
+
+        let mut responses: BTreeMap<String, Vec<Item>> = BTreeMap::new();
+        let mut unprocessed_keys: BTreeMap<String, KeysAndAttributes> = BTreeMap::new();
+        let mut breakdowns: BTreeMap<String, Breakdown> = BTreeMap::new();
+        for step in &steps {
+            let mut found = Vec::new();
+            let mut leftover: Vec<Item> = Vec::new();
+            let mut breakdown = Breakdown::new();
+            for (position, key) in step.keys.iter().enumerate() {
+                if deferred > 0 {
+                    deferred -= 1;
+                    // Handed back as the request carried it, and not charged: the
+                    // service reports the work it did not do, and a retry pays.
+                    leftover.push(step.attributes.keys[position].clone());
+                    continue;
+                }
+                let stored = step
+                    .table
                     .items
-                    .get(&key)
-                    .filter(|item| !table.is_expired(item, now));
+                    .get(key)
+                    .filter(|item| !step.table.is_expired(item, now));
                 // A key the table does not hold still costs a read unit.
                 breakdown.charge_table(Units::read(read_units(stored.map_or(0, item_size))));
                 let Some(item) = stored else {
                     continue;
                 };
-                let item = match &attributes.projection_expression {
+                let item = match &step.projection {
                     None => item.clone(),
-                    Some(expression) => {
-                        ProjectionExpression::parse(expression)?.project(item, &names)?
-                    }
+                    Some(projection) => projection.project(item),
                 };
                 found.push(item);
             }
-            if !found.is_empty() {
-                responses.insert(table_name.clone(), found);
+            if !leftover.is_empty() {
+                unprocessed_keys.insert(
+                    step.table_name.to_string(),
+                    KeysAndAttributes {
+                        keys: leftover,
+                        ..step.attributes.clone()
+                    },
+                );
             }
-            breakdowns.insert(table_name.clone(), breakdown);
+            if !found.is_empty() {
+                responses.insert(step.table_name.to_string(), found);
+            }
+            breakdowns.insert(step.table_name.to_string(), breakdown);
         }
         let consumed_capacity = breakdowns
             .iter()
@@ -1370,7 +1606,7 @@ impl MockDdb {
             .collect();
         Ok(BatchGetItemOutput {
             responses,
-            unprocessed_keys: BTreeMap::new(),
+            unprocessed_keys,
             consumed_capacity,
         })
     }
@@ -3235,5 +3471,239 @@ mod tests {
         let rendered = format!("{mock:?}");
         assert!(rendered.contains("events"));
         assert!(!rendered.contains("secret-value"));
+    }
+
+    /// Two writes, `pk` over `keys`, `sk` fixed: the batch tests only vary the
+    /// partition key, which keeps the expected order easy to read.
+    fn two_writes(keys: [&str; 2]) -> BatchWriteItemRequest {
+        let mut request = BatchWriteItemRequest::new();
+        for key in keys {
+            request = request.add(
+                "events",
+                WriteRequest::Put {
+                    item: item([("pk", s(key)), ("sk", n("1"))]),
+                },
+            );
+        }
+        request
+    }
+
+    /// Two keys, in request order.
+    fn two_keys(keys: [&str; 2]) -> KeysAndAttributes {
+        KeysAndAttributes::new(
+            keys.into_iter()
+                .map(|key| item([("pk", s(key)), ("sk", n("1"))]))
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn throttled_batch_write_defers_a_prefix_and_the_retry_lands_it() {
+        let mock = mock();
+        let mut request = BatchWriteItemRequest::new()
+            .with_return_consumed_capacity(ReturnConsumedCapacity::Total);
+        for key in ["a", "b", "c"] {
+            request = request.add(
+                "events",
+                WriteRequest::Put {
+                    item: item([("pk", s(key)), ("sk", n("1"))]),
+                },
+            );
+        }
+
+        mock.throttle_next_batch_write(2);
+        let first = mock.batch_write_item(request).await.unwrap();
+        // Applied: exactly the writes that were not reported, and only those are
+        // charged.
+        assert_eq!(mock.count("events"), 1);
+        assert_eq!(first.consumed_capacity[0].capacity_units, Some(1.0));
+        // Deferred: the first two of the batch, in request order.
+        assert_eq!(
+            first.unprocessed_items["events"],
+            vec![
+                WriteRequest::Put {
+                    item: item([("pk", s("a")), ("sk", n("1"))])
+                },
+                WriteRequest::Put {
+                    item: item([("pk", s("b")), ("sk", n("1"))])
+                },
+            ]
+        );
+
+        let retry = BatchWriteItemRequest {
+            request_items: first.unprocessed_items,
+            return_consumed_capacity: ReturnConsumedCapacity::Total,
+            ..BatchWriteItemRequest::default()
+        };
+        let second = mock.batch_write_item(retry).await.unwrap();
+        assert!(second.unprocessed_items.is_empty());
+        assert_eq!(mock.count("events"), 3);
+    }
+
+    #[tokio::test]
+    async fn write_throttle_is_clamped_and_spent_once() {
+        let mock = mock();
+
+        // Just inside: every write of a batch of two is left unprocessed.
+        mock.throttle_next_batch_write(2);
+        let all = mock.batch_write_item(two_writes(["a", "b"])).await.unwrap();
+        assert_eq!(all.unprocessed_items["events"].len(), 2);
+        assert_eq!(mock.count("events"), 0);
+
+        // Just outside: asking for more than the batch can carry clamps to it.
+        mock.throttle_next_batch_write(3);
+        let over = mock.batch_write_item(two_writes(["c", "d"])).await.unwrap();
+        assert_eq!(over.unprocessed_items["events"].len(), 2);
+        assert_eq!(mock.count("events"), 0);
+
+        // Zero, and no arm at all: nothing is left unprocessed.
+        mock.throttle_next_batch_write(0);
+        let none = mock.batch_write_item(two_writes(["e", "f"])).await.unwrap();
+        assert!(none.unprocessed_items.is_empty());
+        let plain = mock.batch_write_item(two_writes(["g", "h"])).await.unwrap();
+        assert!(plain.unprocessed_items.is_empty());
+        assert_eq!(mock.count("events"), 4);
+    }
+
+    #[tokio::test]
+    async fn throttled_batch_get_defers_keys_and_the_retry_reads_them() {
+        let mock = mock();
+        mock.seed(
+            "events",
+            vec![
+                item([("pk", s("a")), ("sk", n("1"))]),
+                item([("pk", s("b")), ("sk", n("1"))]),
+            ],
+        )
+        .unwrap();
+        let request = BatchGetItemRequest::new()
+            .add("events", two_keys(["a", "b"]))
+            .with_return_consumed_capacity(ReturnConsumedCapacity::Total);
+
+        mock.throttle_next_batch_get(1);
+        let first = mock.batch_get_item(request).await.unwrap();
+        // Only the answered key is charged, and the deferred one is the first.
+        assert_eq!(first.consumed_capacity[0].capacity_units, Some(1.0));
+        assert_eq!(
+            first.unprocessed_keys["events"].keys,
+            vec![item([("pk", s("a")), ("sk", n("1"))])]
+        );
+        assert_eq!(
+            first.responses["events"],
+            vec![item([("pk", s("b")), ("sk", n("1"))])]
+        );
+
+        let retry =
+            BatchGetItemRequest::new().add("events", first.unprocessed_keys["events"].clone());
+        let second = mock.batch_get_item(retry).await.unwrap();
+        assert!(second.unprocessed_keys.is_empty());
+        assert_eq!(second.responses["events"].len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_deferred_key_carries_the_projection_and_aliases_it_came_with() {
+        use std::collections::HashMap;
+
+        let mock = mock();
+        mock.seed(
+            "events",
+            vec![item([("pk", s("a")), ("sk", n("1")), ("note", s("x"))])],
+        )
+        .unwrap();
+        let mut names = HashMap::new();
+        names.insert("#n".to_string(), "note".to_string());
+        let attributes = KeysAndAttributes {
+            keys: vec![item([("pk", s("a")), ("sk", n("1"))])],
+            projection_expression: Some("#n".to_string()),
+            expression_attribute_names: Some(names),
+            consistent_read: true,
+        };
+
+        mock.throttle_next_batch_get(1);
+        let first = mock
+            .batch_get_item(BatchGetItemRequest::new().add("events", attributes.clone()))
+            .await
+            .unwrap();
+        assert!(first.responses.is_empty());
+        assert_eq!(first.unprocessed_keys["events"], attributes);
+
+        let retry = mock
+            .batch_get_item(
+                BatchGetItemRequest::new().add("events", first.unprocessed_keys["events"].clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry.responses["events"], vec![item([("note", s("x"))])]);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_batch_keeps_the_armed_throttle() {
+        let mock = mock();
+        mock.throttle_next_batch_write(1);
+
+        // Unknown table and duplicate key are refused before anything is
+        // deferred, so the knob still applies to the next well-formed batch.
+        let unknown = BatchWriteItemRequest::new().add(
+            "nope",
+            WriteRequest::Put {
+                item: item([("pk", s("a")), ("sk", n("1"))]),
+            },
+        );
+        assert!(mock.batch_write_item(unknown).await.is_err());
+
+        let duplicate = two_writes(["a", "a"]);
+        assert!(mock.batch_write_item(duplicate).await.is_err());
+        assert_eq!(mock.count("events"), 0);
+
+        let throttled = mock.batch_write_item(two_writes(["a", "b"])).await.unwrap();
+        assert_eq!(throttled.unprocessed_items["events"].len(), 1);
+        assert_eq!(mock.count("events"), 1);
+
+        // A malformed projection is refused even when every key is deferred.
+        mock.throttle_next_batch_get(1);
+        let mut attributes = two_keys(["a", "b"]);
+        attributes.projection_expression = Some("pk, #missing".to_string());
+        assert!(mock
+            .batch_get_item(BatchGetItemRequest::new().add("events", attributes))
+            .await
+            .is_err());
+        let still_armed = mock
+            .batch_get_item(BatchGetItemRequest::new().add("events", two_keys(["a", "b"])))
+            .await
+            .unwrap();
+        assert_eq!(still_armed.unprocessed_keys["events"].keys.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_two_throttles_are_independent() {
+        let mock = mock();
+        mock.seed("events", vec![item([("pk", s("a")), ("sk", n("1"))])])
+            .unwrap();
+        mock.throttle_next_batch_write(1);
+        mock.throttle_next_batch_get(1);
+
+        // A read spends the read knob only, so the write knob still applies.
+        let read = mock
+            .batch_get_item(BatchGetItemRequest::new().add("events", two_keys(["a", "b"])))
+            .await
+            .unwrap();
+        assert_eq!(read.unprocessed_keys["events"].keys.len(), 1);
+
+        let write = mock.batch_write_item(two_writes(["c", "d"])).await.unwrap();
+        assert_eq!(write.unprocessed_items["events"].len(), 1);
+
+        // Both knobs are spent: these calls are whole again.
+        assert!(mock
+            .batch_get_item(BatchGetItemRequest::new().add("events", two_keys(["a", "b"])))
+            .await
+            .unwrap()
+            .unprocessed_keys
+            .is_empty());
+        assert!(mock
+            .batch_write_item(two_writes(["e", "f"]))
+            .await
+            .unwrap()
+            .unprocessed_items
+            .is_empty());
     }
 }
