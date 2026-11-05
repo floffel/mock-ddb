@@ -3,9 +3,10 @@
 use std::collections::{BTreeMap, HashMap};
 
 use mock_ddb::{
-    item, n, ordered_item, s, values, AttributeValue, Blob, CancellationReason,
-    CancellationReasonCode, ConditionExpression, Error, GetItemRequest, Item, KeySchema, KeyType,
-    MockDdb, PutItemRequest, QueryRequest, ReturnValues, UpdateExpression, UpdateItemRequest,
+    into_item, item, item_from_value, item_ref_from_value, item_to_value, n, ordered_item, s,
+    values, AttributeValue, Blob, CancellationReason, CancellationReasonCode, ConditionExpression,
+    Error, GetItemRequest, Item, KeySchema, KeyType, MockDdb, PutItemRequest, QueryRequest,
+    ReturnValues, UpdateExpression, UpdateItemRequest,
 };
 use proptest::prelude::*;
 
@@ -725,5 +726,82 @@ mod stream_paging {
                 );
             });
         }
+    }
+}
+
+/// Every value shape that is not a document, one per `AttributeValue` variant
+/// the SDK offers — the empty list and the empty sets included, because those
+/// are exactly the shapes a `len()`-based check cannot tell from a document.
+fn non_document() -> impl Strategy<Value = AttributeValue> {
+    prop_oneof![
+        "[a-zA-Z0-9 \\u{fc}\\u{f6}\\u{e4}]{0,8}".prop_map(AttributeValue::S),
+        (-1_000_i64..1_000).prop_map(|number| AttributeValue::N(number.to_string())),
+        prop::collection::vec(any::<u8>(), 0..8)
+            .prop_map(|bytes| AttributeValue::B(Blob::new(bytes))),
+        prop::collection::vec(
+            prop::collection::vec(any::<u8>(), 0..4).prop_map(Blob::new),
+            0..3
+        )
+        .prop_map(AttributeValue::Bs),
+        any::<bool>().prop_map(AttributeValue::Bool),
+        prop_oneof![
+            Just(AttributeValue::Null(true)),
+            Just(AttributeValue::Null(false))
+        ],
+        prop::collection::vec(payload(), 0..3).prop_map(|documents| {
+            AttributeValue::L(documents.into_iter().map(AttributeValue::M).collect())
+        }),
+        prop::collection::vec("[a-z]{0,4}", 0..3).prop_map(AttributeValue::Ss),
+        prop::collection::vec(0_i64..1_000, 0..3)
+            .prop_map(|members| AttributeValue::Ns(members.iter().map(i64::to_string).collect())),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// The document wrapper is transparent: an item that goes through
+    /// `item_to_value` comes back unchanged, whatever nesting it holds, and all
+    /// three accessors agree on the document they are handed.
+    #[test]
+    fn item_to_value_round_trips_any_item(entries in payload()) {
+        let wrapped = item_to_value(entries.clone());
+        assert!(
+            matches!(&wrapped, AttributeValue::M(_)),
+            "a wrapped item is a document"
+        );
+        assert_eq!(item_ref_from_value(&wrapped), Some(&entries));
+        assert_eq!(item_from_value(&wrapped), Some(entries.clone()));
+        assert_eq!(into_item(wrapped), Some(entries));
+    }
+
+    /// Nesting is preserved level by level instead of being flattened:
+    /// unwrapping a document `depth` times reaches the item that was wrapped
+    /// `depth` times.
+    #[test]
+    fn nested_documents_survive_the_round_trip(entries in payload(), depth in 1_usize..6) {
+        let mut wrapped = item_to_value(entries.clone());
+        for _ in 1..depth {
+            wrapped = item_to_value(item([("doc", wrapped)]));
+        }
+
+        let mut current = &wrapped;
+        for _ in 1..depth {
+            current = &item_ref_from_value(current).expect("a document at every level")["doc"];
+        }
+        assert_eq!(item_from_value(current), Some(entries));
+    }
+
+    /// No scalar is ever mistaken for a document, whichever variant it is —
+    /// and the empty list and the empty sets are scalars here too.
+    #[test]
+    fn every_non_document_variant_is_rejected(value in non_document()) {
+        assert!(
+            !matches!(&value, AttributeValue::M(_)),
+            "the strategy builds no document"
+        );
+        assert_eq!(item_ref_from_value(&value), None, "{value:?}");
+        assert_eq!(item_from_value(&value), None, "{value:?}");
+        assert_eq!(into_item(value.clone()), None, "{value:?}");
     }
 }
