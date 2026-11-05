@@ -3038,19 +3038,66 @@ fn collect_page(
     })
 }
 
-/// FNV-1a over the key's bytes, used to assign items to parallel scan segments.
-fn segment_of(key: &ItemKey, total_segments: u32) -> u32 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for scalar in [Some(&key.0), key.1.as_ref()].into_iter().flatten() {
-        let bytes: &[u8] = match scalar {
-            Scalar::S(text) | Scalar::N(text) => text.as_bytes(),
-            Scalar::B(bytes) => bytes,
-        };
+/// The 64-bit FNV-1a offset basis, from the FNV specification.
+///
+/// See <http://www.isthe.com/chongo/tech/comp/fnv/index.html>.
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// The 64-bit FNV-1a prime, from the FNV specification.
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Plain 64-bit FNV-1a over the concatenation of `chunks`, hashed as one
+/// stream: no separator and no length prefix between the chunks.
+///
+/// Concatenating is what makes [`segment_of`] independent of whether a key has
+/// a sort scalar at all — the partition bytes alone hash the way they would as
+/// the prefix of a longer key — and it is pinned to the published vectors by
+/// `fnv1a_matches_the_specification_vectors`.
+fn fnv1a_64<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> u64 {
+    let mut hash = FNV_OFFSET_BASIS;
+    for bytes in chunks {
         for byte in bytes {
             hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            hash = hash.wrapping_mul(FNV_PRIME);
         }
     }
+    hash
+}
+
+/// FNV-1a over the key's bytes, used to assign items to parallel scan segments.
+///
+/// The partition scalar's bytes are hashed, then the sort scalar's bytes, as a
+/// single stream (see [`fnv1a_64`]). An item therefore lands in the same
+/// segment on every call and in every release of this crate: the digest is
+/// fixed by the FNV specification, and `fnv1a_matches_the_specification_vectors`
+/// holds it to the published test vectors.
+///
+/// The loop is local on purpose, and the reason is the dependency, not the
+/// algorithm. `hashkit` 0.1.5 (`fnv::fnv1a_64`) and `fnv` 1.0.7 both compute
+/// exactly this digest, so either would be a drop-in; but `hashkit` is a beta
+/// 0.1 release that unconditionally pulls `blake3`, `sha2`, `base64` and
+/// `constant_time_eq` — and with them a C build step — into the dependency
+/// tree of a test double, and `fnv` is a dormant 2020 crate pulled in for ten
+/// lines that a golden test already covers. A test-only mock that is dropped
+/// into someone else's test build should not widen that build's tree for a
+/// non-cryptographic bucket index.
+///
+/// The spread of the buckets is a separate question and is currently poor for
+/// keys whose last attribute value ends in a decimal digit: the reduction below
+/// reads the low bits of the digest, which FNV-1a does not mix well. That is
+/// tracked in issue #148 and does not change the choice of digest.
+fn segment_of(key: &ItemKey, total_segments: u32) -> u32 {
+    let hash = fnv1a_64(
+        [Some(&key.0), key.1.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|scalar| match scalar {
+                Scalar::S(text) | Scalar::N(text) => text.as_bytes(),
+                Scalar::B(bytes) => bytes.as_slice(),
+            }),
+    );
+    // The remainder is below `total_segments`, itself a `u32`, so the
+    // conversion back cannot fail.
     u32::try_from(hash % u64::from(total_segments)).unwrap_or(0)
 }
 
@@ -3401,6 +3448,7 @@ mod tests {
     use super::*;
     use crate::schema::KeyType;
     use crate::{item, n, s};
+    use proptest::prelude::*;
 
     fn mock() -> MockDdb {
         MockDdb::with_table(
@@ -3416,6 +3464,83 @@ mod tests {
         let first = segment_of(&key, 4);
         assert!(first < 4);
         assert_eq!(first, segment_of(&key, 4));
+    }
+
+    #[test]
+    fn fnv1a_matches_the_specification_vectors() {
+        // The vectors published at <http://www.isthe.com/chongo/tech/comp/fnv/index.html>.
+        assert_eq!(fnv1a_64([b"".as_slice()]), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a_64([b"a".as_slice()]), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a_64([b"foobar".as_slice()]), 0x8594_4171_f739_67e8);
+        // Chunks are an unseparated stream: `["foo", "bar"]` is `"foobar"`.
+        assert_eq!(
+            fnv1a_64([b"foo".as_slice(), b"bar".as_slice()]),
+            fnv1a_64([b"foobar".as_slice()])
+        );
+    }
+
+    #[test]
+    fn segment_assignment_uses_the_partition_bytes_alone_for_a_key_only_item() {
+        let partition = Scalar::S("answer".into());
+        let sort = Scalar::N("42".into());
+        let key_only: ItemKey = (partition.clone(), None);
+        let full: ItemKey = (partition.clone(), Some(sort.clone()));
+        // Hashing the partition bytes alone is the same as hashing them as the
+        // prefix of the longer key, so the two keys agree on a one-segment scan.
+        assert_eq!(segment_of(&key_only, 1), 0);
+        assert_eq!(segment_of(&full, 1), 0);
+        // A sort scalar does move the item once there is more than one segment
+        // to choose from, which is what splits one partition across segments.
+        let differs =
+            (2..=64).any(|total| segment_of(&key_only, total) != segment_of(&full, total));
+        assert!(differs);
+    }
+
+    #[test]
+    fn segment_assignment_holds_both_ends_of_the_validated_range() {
+        // `totalSegments` is validated to 1..=1_000_000 with `segment < total`
+        // (see `parallel_scan_segments_are_disjoint_and_complete`), so those are
+        // the just-inside values this function has to survive.
+        let partitions = ["", "a", "zzz", "\u{1F600}"];
+        let sorts = [
+            None,
+            Some(Scalar::N("0".into())),
+            Some(Scalar::N("-1".into())),
+        ];
+        for partition in partitions {
+            for sort in &sorts {
+                let key: ItemKey = (Scalar::S(partition.into()), sort.clone());
+                // Just inside, lower bound: the only segment is 0.
+                assert_eq!(segment_of(&key, 1), 0);
+                // Just inside, upper bound: every index stays below the total.
+                assert!(segment_of(&key, 1_000_000) < 1_000_000);
+                // A binary key hashes its raw bytes, and they are part of the
+                // key space too.
+                let binary: ItemKey = (Scalar::B(vec![0x00, 0xff]), sort.clone());
+                assert!(segment_of(&binary, 1_000_000) < 1_000_000);
+                // Nothing above the total leaks out for any value a caller can
+                // reach: the invariant is `segment < total`, not `< 2^32`.
+                for total in [2, 3, 7, 4_096, 65_536] {
+                    assert!(segment_of(&key, total) < total);
+                }
+            }
+        }
+    }
+
+    proptest! {
+        /// Every key lands in a segment below the total for every total the
+        /// caller can reach, and the same key always lands in the same one.
+        #[test]
+        fn segment_assignment_is_total_and_deterministic(
+            partition in ".*",
+            sort in proptest::option::of("[0-9]{1,18}"),
+            total in 1u32..=1_000_000u32,
+        ) {
+            let key: ItemKey = (Scalar::S(partition), sort.map(Scalar::N));
+            let segment = segment_of(&key, total);
+            prop_assert!(segment < total);
+            prop_assert_eq!(segment, segment_of(&key, total));
+        }
     }
 
     #[test]
