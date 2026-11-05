@@ -285,6 +285,19 @@ If you need one of these for a test, the mock is the wrong tool for that
 assertion — integration tests against DynamoDB Local or a real account still
 have their place.
 
+## Why not an existing crate
+
+A crates.io lookup on 2026-11-05 (`in-process DynamoDB mock for tests`, ranked
+by adoption) returned `skyzen-services`, `rusty-gasket` and
+`winterbaume-partiql` — none of them an in-process DynamoDB double — so no
+maintained crate does this job and the implementation here is local on purpose.
+The doubles that do exist are services, not libraries: DynamoDB Local is a Java
+process (or a container), LocalStack a Python container and dynalite a Node.js
+server, so each brings a runtime, a port and start/stop sequencing into a test
+suite that should need none of them, while `aws_sdk_dynamodb` needs a real
+endpoint and real credentials. A `HashMap` in the test's own address space has
+neither.
+
 ## Time, determinism and concurrency
 
 TTL expiry reads the clock through `mock_ddb::Clock`. Pin it to make expiry

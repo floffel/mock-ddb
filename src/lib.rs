@@ -68,6 +68,19 @@
 //! | Streams API | `ListStreams`, `DescribeStream`, `GetShardIterator` and `GetRecords` with their wire shapes, limits and iterators, through [`MockDdb::streams`] |
 //! | PartiQL | `execute_statement` (`SELECT`/`INSERT`/`UPDATE`/`DELETE`) and `batch_execute_statement`, lowered onto the native calls |
 //!
+//! # Why not an existing crate
+//!
+//! A crates.io lookup on 2026-11-05 (`in-process DynamoDB mock for tests`,
+//! ranked by adoption) returned `skyzen-services`, `rusty-gasket` and
+//! `winterbaume-partiql` — none of them an in-process DynamoDB double — so no
+//! maintained crate does this job and the implementation is local on purpose.
+//! The doubles that do exist are services, not libraries: `DynamoDB Local` is a
+//! Java process (or a container), `LocalStack` a Python container and
+//! `dynalite` a Node.js server, so each brings a runtime, a port and start/stop
+//! sequencing into a test suite that should need none of them, while
+//! `aws_sdk_dynamodb` needs a real endpoint and real credentials. A `HashMap`
+//! in the test's own address space has neither.
+//!
 //! # Deliberate differences from the service
 //!
 //! - Writes are synchronous: a table exists in state `ACTIVE` as soon as
