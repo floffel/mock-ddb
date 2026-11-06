@@ -1522,7 +1522,7 @@ mod tests {
         let request = BatchGetItemRequest::new()
             .add("t", KeysAndAttributes::new(Vec::new()))
             .unwrap();
-        assert!(request.request_items["t"].keys.is_empty());
+        assert_eq!(request.request_items["t"].keys, Vec::new());
     }
 
     #[test]
