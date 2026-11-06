@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Attribute-value semantics now have executable laws: equality is reflexive,
+  symmetric and transitive; scalar ordering agrees with equality and is total;
+  set union is a superset and idempotent; and set difference is a subset that
+  removes exactly the shared members. The module-header examples for numeric
+  equality, set order and per-member sizing run as unit tests, and a new
+  `value_validation` fuzz target sends hostile values through the public write
+  validation path. Validation now rejects nesting deeper than DynamoDB's
+  32-level attribute limit instead of recursing without bound.
 - `MockDdb::throttle_next_batch_write` and `MockDdb::throttle_next_batch_get`:
   one-shot knobs that make the next `BatchWriteItem` / `BatchGetItem` report a
   prefix of its writes or keys as `UnprocessedItems` / `UnprocessedKeys`, with
