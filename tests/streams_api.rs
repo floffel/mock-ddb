@@ -3,6 +3,8 @@
 
 #![cfg(feature = "streams")]
 
+use std::collections::HashSet;
+
 use mock_ddb::{
     item, n, s, CreateTableRequest, DeleteItemRequest, DescribeStreamRequest, Error,
     GetRecordsRequest, GetShardIteratorRequest, Item, KeySchema, KeyType, ListStreamsRequest,
@@ -454,6 +456,91 @@ async fn get_records_pages_with_the_limit_and_chains_the_next_iterator() {
         .unwrap();
     assert_eq!(tail.records, []);
     assert!(tail.next_shard_iterator.is_some());
+}
+
+#[tokio::test]
+async fn event_ids_are_disjoint_across_two_tables_writing_in_the_same_millisecond() {
+    // Two tables write interleaved, so both streams count through the same
+    // sequence values in the same millisecond: the ids must still be distinct,
+    // or a consumer that deduplicates on `event_id` drops one of the writes.
+    let (mock, arns) = streamed(2, StreamViewType::KeysOnly).await;
+    let tables = ["table_1", "table_2"];
+    let mut written = 0;
+    for round in 0..8 {
+        for table in tables {
+            mock.put_item(PutItemRequest::new(
+                table,
+                item([("pk", s(format!("{table}#{round}")))]),
+            ))
+            .await
+            .unwrap();
+            written += 1;
+        }
+    }
+
+    let mut ids = HashSet::new();
+    let mut sequences: Vec<HashSet<String>> = Vec::new();
+    for arn in &arns {
+        let records = mock.get_records(arn).await.unwrap();
+        assert_eq!(records.len(), written / tables.len());
+        for record in &records {
+            assert!(
+                ids.insert(record.event_id.clone()),
+                "duplicate event id {}",
+                record.event_id
+            );
+        }
+        sequences.push(
+            records
+                .iter()
+                .map(|record| record.sequence_number.clone())
+                .collect(),
+        );
+    }
+    assert_eq!(ids.len(), written);
+
+    // The premise of the test: the two streams issue the same sequence
+    // numbers, so the sequence number alone cannot tell their records apart.
+    assert!(
+        sequences[0].intersection(&sequences[1]).next().is_some(),
+        "the two streams must cover the same sequence numbers"
+    );
+
+    // The wire shape carries the same ids, so a Lambda event source mapping
+    // sees the disjoint set too.
+    let streams = mock.streams();
+    let described = streams
+        .describe_stream(DescribeStreamRequest::new(&arns[1]))
+        .await
+        .unwrap();
+    let iterator = streams
+        .get_shard_iterator(GetShardIteratorRequest::new(
+            &arns[1],
+            described.stream_description.shards[0].shard_id.clone(),
+            ShardIteratorType::TrimHorizon,
+        ))
+        .await
+        .unwrap()
+        .shard_iterator;
+    let page = streams
+        .get_records(GetRecordsRequest::new(iterator))
+        .await
+        .unwrap();
+    assert_eq!(page.records.len(), written / tables.len());
+    let first_stream_ids: HashSet<String> = mock
+        .get_records(&arns[0])
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|record| record.event_id)
+        .collect();
+    for record in page.records {
+        assert!(ids.contains(&record.event_id));
+        assert!(
+            !first_stream_ids.contains(&record.event_id),
+            "the wire record repeats an id the other stream issued"
+        );
+    }
 }
 
 #[tokio::test]
