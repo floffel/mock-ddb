@@ -11,6 +11,12 @@
 //! caller reads every field but builds one with `Default` and field assignment,
 //! so a field the service grows does not break a caller that spelled a literal.
 //!
+//! The log is bounded rather than aged out: a stream retains its most recent
+//! [`MAX_RETAINED_STREAM_RECORDS`] records, an append past the cap trims the
+//! oldest, and [`MockDdb::clear_records`](crate::MockDdb::clear_records) empties
+//! it. A shard iterator's position keeps counting from the first record the
+//! stream ever appended, so a token still reads the right place after a trim.
+//!
 //! ```
 //! use mock_ddb::{s, CreateTableRequest, KeySchema, KeyType, MockDdb, PutItemRequest, StreamViewType, item};
 //!
@@ -33,7 +39,7 @@
 //! # }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -105,11 +111,35 @@ pub struct StreamRecord {
     pub old_image: Option<Item>,
 }
 
+/// How many records one stream retains.
+///
+/// The service keeps a shard's records for 24 hours and trims what is older; the
+/// mock has no retention clock for its log, so it trims by count instead. An
+/// append past this cap drops the oldest record — the window moves, the log does
+/// not grow — so a test or a property run that writes a million items cannot
+/// grow the mock's memory with its write history.
+///
+/// The oldest record is what a trim horizon points at:
+/// [`ShardIteratorType::TrimHorizon`] starts at the oldest record still
+/// retained, and a shard iterator that named a record which has since been
+/// trimmed resumes at that record. [`MockDdb::clear_records`](crate::MockDdb::clear_records)
+/// empties the log outright.
+pub const MAX_RETAINED_STREAM_RECORDS: usize = 10_000;
+
 /// The mutable state of one table's stream.
 #[derive(Debug)]
 pub(crate) struct StreamState {
     pub(crate) arn: String,
-    pub(crate) records: Vec<StreamRecord>,
+    /// The records still retained, oldest first. Bounded by
+    /// [`MAX_RETAINED_STREAM_RECORDS`].
+    pub(crate) records: VecDeque<StreamRecord>,
+    /// How many records the log has dropped off its front: the absolute log
+    /// position of `records.front()`.
+    ///
+    /// A shard iterator carries an absolute position — one that counts every
+    /// record the stream ever appended — so a token stays meaningful when a trim
+    /// shifts the retained window underneath it.
+    trimmed: usize,
     pub(crate) next_sequence: u64,
     pub(crate) view_type: StreamViewType,
     /// Creation time in seconds since the Unix epoch, as reported by
@@ -138,7 +168,8 @@ impl StreamState {
             arn: format!(
                 "arn:aws:dynamodb:{STREAM_REGION}:000000000000:table/{table_name}/stream/{label}-{discriminator}"
             ),
-            records: Vec::new(),
+            records: VecDeque::new(),
+            trimmed: 0,
             next_sequence: sequence_origin,
             view_type,
             creation_date_time: epoch_seconds(created_at),
@@ -160,7 +191,7 @@ impl StreamState {
         let keys = key_map(key_schema, new_item.or(old_item))?;
         let sequence = self.next_sequence;
         self.next_sequence += 1;
-        self.records.push(StreamRecord {
+        self.records.push_back(StreamRecord {
             event_id: event_id(epoch_millis, self.discriminator, sequence),
             event_name,
             table_name: table_name.to_string(),
@@ -170,7 +201,35 @@ impl StreamState {
             new_image: self.view_type.new_image(new_item),
             old_image: self.view_type.old_image(old_item),
         });
+        // Trim after the append: one record goes out of the front for every one
+        // that comes in at the back, so the log is bounded at all times.
+        if self.records.len() > MAX_RETAINED_STREAM_RECORDS {
+            self.records.pop_front();
+            self.trimmed = self.trimmed.saturating_add(1);
+        }
         Ok(())
+    }
+
+    /// The log position of the oldest record still retained: where a trim
+    /// horizon starts.
+    pub(crate) fn trim_horizon(&self) -> usize {
+        self.trimmed
+    }
+
+    /// The log position one past the last record: where `LATEST` starts.
+    pub(crate) fn end_position(&self) -> usize {
+        self.trimmed.saturating_add(self.records.len())
+    }
+
+    /// Drop every retained record.
+    ///
+    /// The positions already handed out stay absolute, so the log's end keeps
+    /// moving forward: a record appended after a clear gets a position past the
+    /// cleared ones, and a shard iterator that named a cleared record reads
+    /// nothing rather than a record out of the old window.
+    pub(crate) fn clear(&mut self) {
+        self.trimmed = self.end_position();
+        self.records.clear();
     }
 
     /// The shard this stream exposes. The mock gives every stream one open
@@ -192,12 +251,15 @@ impl StreamState {
     /// The log position of the record with `sequence`.
     ///
     /// The number is parsed, so an unpadded `"7"` finds the record whose own
-    /// sequence number is `"000000000000000000007"`.
+    /// sequence number is `"000000000000000000007"`. The position counts every
+    /// record the stream ever appended, so it survives a trim; a sequence number
+    /// that has already been trimmed away has no position.
     pub(crate) fn position_of(&self, sequence: &str) -> Option<usize> {
         let wanted = sequence.parse::<u64>().ok()?;
         self.records
             .iter()
             .position(|record| record.sequence_number.parse::<u64>() == Ok(wanted))
+            .map(|index| self.trimmed.saturating_add(index))
     }
 }
 

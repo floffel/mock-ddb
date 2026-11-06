@@ -103,13 +103,16 @@
 //!   `ItemCollectionMetrics`, and only a transaction that applied spends its
 //!   token: a cancelled one records nothing, so a retry re-evaluates its
 //!   conditions instead of replaying the cancellation.
-//! - Streams have a single open shard and unlimited retention: shard iterators
-//!   never expire, never split and never trim, where the service keeps 24 hours
-//!   and closes a shard after four hours of inactivity. The Streams API
-//!   (`ListStreams`, `DescribeStream`, `GetShardIterator`, `GetRecords`) is
-//!   modelled in full, including its paging and limits; the short
-//!   [`MockDdb::get_records`] reader stays for tests that do not care about
-//!   iterators.
+//! - Streams have a single open shard and a log bounded by count: a stream
+//!   retains its most recent [`MAX_RETAINED_STREAM_RECORDS`] records and an
+//!   append past that drops the oldest, where the service keeps 24 hours;
+//!   [`MockDdb::clear_records`] empties a log outright. Shard iterators never
+//!   expire and never split, and because their position counts every record the
+//!   stream ever appended, a token still reads the right place after a trim. The
+//!   Streams API (`ListStreams`, `DescribeStream`, `GetShardIterator`,
+//!   `GetRecords`) is modelled in full, including its paging and limits; the
+//!   short [`MockDdb::get_records`] reader stays for tests that do not care
+//!   about iterators.
 //!
 //! The README carries the full supported/not-supported matrix and the reasoning
 //! behind each difference.
@@ -179,8 +182,8 @@ pub use stream::{
     DescribeStreamOutput, DescribeStreamRequest, GetRecordsOutput, GetRecordsRequest,
     GetShardIteratorOutput, GetShardIteratorRequest, ListStreamsOutput, ListStreamsRequest,
     SequenceNumberRange, Shard, ShardIteratorType, StreamDescription, StreamRecord, StreamSummary,
-    StreamsApi, StreamsRecord, StreamsRecordData, MAX_RECORDS_PER_GET, MAX_SHARDS_PER_DESCRIBE,
-    MAX_STREAMS_PER_LIST, STREAM_CREATION_EPOCH_SECONDS, STREAM_REGION,
+    StreamsApi, StreamsRecord, StreamsRecordData, MAX_RECORDS_PER_GET, MAX_RETAINED_STREAM_RECORDS,
+    MAX_SHARDS_PER_DESCRIBE, MAX_STREAMS_PER_LIST, STREAM_CREATION_EPOCH_SECONDS, STREAM_REGION,
 };
 
 /// A DynamoDB item: attribute name → value.

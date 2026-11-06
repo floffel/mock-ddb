@@ -135,10 +135,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | Capacity | `ReturnConsumedCapacity` (`NONE`/`TOTAL`/`INDEXES`) and `ReturnItemCollectionMetrics` (`SIZE`) on every data-plane operation, with the units computed from the stored items and split per table and per index |
 | Transactions | `transact_write_items` (100 actions: `Put`, `Update`, `Delete`, `ConditionCheck`; atomic; per-member cancellation reasons; `ClientRequestToken` idempotency), `transact_get_items` |
 | TTL | `update_time_to_live`, `describe_time_to_live`, lazy expiry on every read path, `purge_expired` |
-| Streams | one ordered log per table, `get_records`, `list_streams`, `NEW_IMAGE` / `OLD_IMAGE` / `NEW_AND_OLD_IMAGES` / `KEYS_ONLY` (feature `streams`, on by default) |
+| Streams | one ordered log per table, bounded at 10 000 records (oldest trimmed), `get_records`, `list_streams`, `NEW_IMAGE` / `OLD_IMAGE` / `NEW_AND_OLD_IMAGES` / `KEYS_ONLY` (feature `streams`, on by default) |
 | Streams API | `MockDdb::streams()` returns the wire API: `list_streams` (with `ExclusiveStartStreamArn` and limit), `describe_stream` (label, view type, shard, sequence range), `get_shard_iterator` (`TRIM_HORIZON`, `LATEST`, `AT_SEQUENCE_NUMBER`, `AFTER_SEQUENCE_NUMBER`) and `get_records` (limit 1–1000, `NextShardIterator`), with records in the Kinesis adapter's shape |
 | PartiQL | `execute_statement` (`SELECT`, `INSERT`, `UPDATE`, `DELETE`) and `batch_execute_statement` (1–25 statements, all reads or all writes), lowered onto the native calls so capacity, TTL, streams and index maintenance stay in one place. `PartiqlStatement` types a statement (`kind`, `table_name`, `parameters`) before the wire sees it |
-| Test helpers | `seed`, `dump`, `count`, `clear`, `set_clock`, `purge_expired`, `item_to_value` for embedding an item as `AttributeValue::M`, and `item_ref_from_value` (borrowing), `into_item` (consuming) or `item_from_value` (cloning) to read it back |
+| Test helpers | `seed`, `dump`, `count`, `clear`, `clear_records`, `set_clock`, `purge_expired`, `item_to_value` for embedding an item as `AttributeValue::M`, and `item_ref_from_value` (borrowing), `into_item` (consuming) or `item_from_value` (cloning) to read it back |
 
 ### Expressions
 
@@ -219,15 +219,20 @@ that changes what a caller must do is called out.
    `scan`, `dump` and `count` the moment its timestamp passes, but its row is
    only removed when it is read or `purge_expired` runs. The service deletes
    within 48 hours in the background.
-7. **Streams are one open shard with unlimited retention.** A table's log is
-   readable through the in-process `get_records`/`list_streams` helpers or
-   through `MockDdb::streams()`, which speaks `ListStreams`, `DescribeStream`,
+7. **Streams are one open shard with a bounded log.** A table's log is readable
+   through the in-process `get_records`/`list_streams` helpers or through
+   `MockDdb::streams()`, which speaks `ListStreams`, `DescribeStream`,
    `GetShardIterator` and `GetRecords` with their real shapes, limits and
-   `NextShardIterator` chaining. Because there is no trimming, an iterator never
-   expires and `GetRecords` from `TRIM_HORIZON` always reaches the first record;
-   the service keeps 24 hours and closes a shard after four hours without
-   traffic. There are no shard splits, so `ParentShardId` is always absent and
-   `DescribeStream` returns exactly one shard.
+   `NextShardIterator` chaining. The service ages records out after 24 hours;
+   the mock has no clock for its log, so it trims by count instead: a stream
+   keeps its most recent `MAX_RETAINED_STREAM_RECORDS` (10 000) records and an
+   append past that drops the oldest, which keeps a test or a property run from
+   growing the mock with its whole write history. `clear_records` empties a log
+   outright. A shard iterator's position counts every record the stream ever
+   appended, so a token taken before a trim resumes at the oldest record still
+   retained rather than at one the trim removed. There are no shard splits, so
+   `ParentShardId` is always absent and `DescribeStream` returns exactly one
+   shard.
 8. **Transaction conflicts do not happen.** Nothing else writes concurrently
    inside the mock, so a transaction either commits or is cancelled by a failed
    condition. `ClientRequestToken` follows the service: the transaction that
@@ -365,11 +370,12 @@ cargo +nightly fuzz run parse_expression -- -max_total_time=60
 cargo +nightly fuzz run random_items -- -max_total_time=60
 ```
 
-- 573 tests (428 test functions plus 145 doctests): unit tests per module, an integration suite per area
+- 498 tests (761 with doctests) in 16 integration suites, unit tests per module
   (`surface`, `expressions`, `query_scan`, `batch_transact`, `ttl_streams`,
-  `streams_api`, `edge_cases`, `concurrency`, `coverage`), property tests with
-  `proptest`, and a doctest on every public type, every operation and every
-  error method. Builder setters are exercised by their request type's example.
+  `streams_api`, `stream_retention`, `edge_cases`, `concurrency`, `coverage`),
+  property tests with `proptest`, and a doctest on every public type, every
+  operation and every error method. Builder setters are exercised by their
+  request type's example.
 - Line coverage is 97 %+ with all features on (`cargo llvm-cov --all-features`).
 - Two fuzz targets: `parse_expression` (the condition/update/projection
   parsers and evaluators) and `random_items` (arbitrary attribute trees through
