@@ -910,3 +910,57 @@ async fn error_text_and_accessors_name_the_table_or_resource() {
     assert_eq!(Error::validation("bad").resource(), None);
     assert_eq!(Error::validation("bad").table(), None);
 }
+
+#[tokio::test]
+async fn a_stream_specification_must_be_coherent() {
+    // The fields are freely settable, so a caller could describe an enabled
+    // stream without a view type - a table the service rejects. Both halves of
+    // the invariant are enforced, not just the one the builder happens to keep.
+    let base = CreateTableRequest::new("events", KeySchema::hash("pk", KeyType::String));
+    let with_stream = |enabled: bool, view: Option<mock_ddb::StreamViewType>| CreateTableRequest {
+        stream_specification: Some(mock_ddb::StreamSpecification {
+            stream_enabled: enabled,
+            stream_view_type: view,
+        }),
+        ..base.clone()
+    };
+
+    let missing_view = MockDdb::new()
+        .create_table(with_stream(true, None))
+        .await
+        .unwrap_err();
+    assert!(
+        missing_view
+            .to_string()
+            .contains("StreamViewType must be specified"),
+        "{missing_view}"
+    );
+
+    let stray_view = MockDdb::new()
+        .create_table(with_stream(false, Some(mock_ddb::StreamViewType::NewImage)))
+        .await
+        .unwrap_err();
+    assert!(
+        stray_view
+            .to_string()
+            .contains("StreamViewType must not be specified"),
+        "{stray_view}"
+    );
+
+    // Just inside: a disabled stream with no view type stays a valid, streamless
+    // table.
+    let disabled = MockDdb::new()
+        .create_table(with_stream(false, None))
+        .await
+        .unwrap();
+    assert!(disabled.latest_stream_arn.is_none());
+
+    #[cfg(feature = "streams")]
+    {
+        let streamed = MockDdb::new()
+            .create_table(with_stream(true, Some(mock_ddb::StreamViewType::KeysOnly)))
+            .await
+            .unwrap();
+        assert!(streamed.latest_stream_arn.is_some());
+    }
+}
