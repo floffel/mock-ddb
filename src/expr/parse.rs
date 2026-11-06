@@ -26,9 +26,16 @@ use crate::{Error, Result};
 /// Repetition is not nesting and costs no level: `A AND A AND …` and
 /// `:v + :v + …` parse into the n-ary [`Condition::And`] /
 /// [`SetValue::Arithmetic`] chains, whose depth stays one no matter how many
-/// terms the 4096-byte expression limit allows. The only recursion left in
-/// the tree is the one this constant bounds.
+/// terms the operator limit allows. The only recursion left in the tree is the
+/// one this constant bounds.
 const MAX_DEPTH: u8 = 64;
+
+/// The service's limit on operators and functions in one expression.
+///
+/// The service reports a fixed count of 301 when the limit is crossed, rather
+/// than the actual number in the text, so the error is stable for expressions
+/// that exceed the limit by any amount.
+const MAX_OPERATORS: u16 = 300;
 
 /// The most document paths one update expression may write.
 ///
@@ -275,7 +282,7 @@ pub(crate) fn parse_condition(input: &str) -> Result<Condition> {
             "Invalid ConditionExpression: The expression can not be empty",
         ));
     }
-    let mut parser = Parser::new(&tokens);
+    let mut parser = Parser::new(&tokens, "ConditionExpression");
     let condition = parser.condition(0)?;
     if !parser.at_end() {
         return Err(parser.unexpected("end of expression"));
@@ -291,7 +298,7 @@ pub(crate) fn parse_update(input: &str) -> Result<Update> {
             "Invalid UpdateExpression: The expression can not be empty",
         ));
     }
-    let mut parser = Parser::new(&tokens);
+    let mut parser = Parser::new(&tokens, "UpdateExpression");
     let mut clauses: Vec<UpdateClause> = Vec::new();
     while !parser.at_end() {
         let Some(Token::Ident(keyword)) = parser.peek() else {
@@ -334,7 +341,7 @@ pub(crate) fn parse_projection(input: &str) -> Result<Vec<Path>> {
             "Invalid ProjectionExpression: The expression can not be empty",
         ));
     }
-    let mut parser = Parser::new(&tokens);
+    let mut parser = Parser::new(&tokens, "ProjectionExpression");
     let mut paths = vec![parser.path()?];
     while parser.eat(&Token::Comma) {
         paths.push(parser.path()?);
@@ -407,14 +414,31 @@ fn nested(level: u8) -> Result<u8> {
 struct Parser<'a> {
     tokens: &'a [Token],
     position: usize,
+    expression_kind: &'static str,
+    operators: u16,
 }
 
 impl<'a> Parser<'a> {
-    fn new(tokens: &'a [Token]) -> Self {
+    fn new(tokens: &'a [Token], expression_kind: &'static str) -> Self {
         Self {
             tokens,
             position: 0,
+            expression_kind,
+            operators: 0,
         }
+    }
+
+    /// Count one operator or function, failing as soon as the service limit is
+    /// crossed.
+    fn operator(&mut self) -> Result<()> {
+        self.operators += 1;
+        if self.operators > MAX_OPERATORS {
+            return Err(Error::validation(format!(
+                "Invalid {}: The expression contains too many operators; operator count: 301",
+                self.expression_kind
+            )));
+        }
+        Ok(())
     }
 
     fn at_end(&self) -> bool {
@@ -495,6 +519,7 @@ impl<'a> Parser<'a> {
     fn condition(&mut self, level: u8) -> Result<Condition> {
         let mut terms = vec![self.and_condition(level)?];
         while self.eat_keyword("OR") {
+            self.operator()?;
             terms.push(self.and_condition(level)?);
         }
         if terms.len() == 1 {
@@ -506,6 +531,7 @@ impl<'a> Parser<'a> {
     fn and_condition(&mut self, level: u8) -> Result<Condition> {
         let mut terms = vec![self.not_condition(level)?];
         while self.eat_keyword("AND") {
+            self.operator()?;
             terms.push(self.not_condition(level)?);
         }
         if terms.len() == 1 {
@@ -516,6 +542,7 @@ impl<'a> Parser<'a> {
 
     fn not_condition(&mut self, level: u8) -> Result<Condition> {
         let condition = if self.eat_keyword("NOT") {
+            self.operator()?;
             Condition::Not(Box::new(self.not_condition(nested(level)?)?))
         } else {
             self.primary_condition(level)?
@@ -548,6 +575,7 @@ impl<'a> Parser<'a> {
     }
 
     fn condition_function(&mut self, name: &str) -> Result<Condition> {
+        self.operator()?;
         let _ = self.advance();
         self.expect(&Token::LParen)?;
         let condition = match name {
@@ -586,6 +614,7 @@ impl<'a> Parser<'a> {
     fn comparison(&mut self) -> Result<Condition> {
         let left = self.operand()?;
         if self.eat_keyword("BETWEEN") {
+            self.operator()?;
             let low = self.operand()?;
             if !self.eat_keyword("AND") {
                 return Err(self.unexpected("AND"));
@@ -594,6 +623,7 @@ impl<'a> Parser<'a> {
             return Ok(Condition::Between(left, low, high));
         }
         if self.eat_keyword("IN") {
+            self.operator()?;
             self.expect(&Token::LParen)?;
             let mut entries = vec![self.operand()?];
             while self.eat(&Token::Comma) {
@@ -612,6 +642,7 @@ impl<'a> Parser<'a> {
             _ => return Err(self.unexpected("a comparison operator")),
         };
         self.advance();
+        self.operator()?;
         let right = self.operand()?;
         Ok(Condition::Compare(left, operator, right))
     }
@@ -625,6 +656,7 @@ impl<'a> Parser<'a> {
                 if name.eq_ignore_ascii_case("size") && self.peek() == Some(&Token::LParen) =>
             {
                 self.advance();
+                self.operator()?;
                 let path = self.path()?;
                 self.expect(&Token::RParen)?;
                 Ok(Operand::Size(path))
@@ -740,6 +772,7 @@ impl<'a> Parser<'a> {
             } else {
                 break;
             };
+            self.operator()?;
             rest.push((operator, self.term(level)?));
         }
         if rest.is_empty() {
@@ -755,6 +788,7 @@ impl<'a> Parser<'a> {
     /// operand.
     fn term(&mut self, level: u8) -> Result<SetValue> {
         if self.peek_keyword("if_not_exists") && self.peek_at(1) == Some(&Token::LParen) {
+            self.operator()?;
             self.advance();
             self.advance();
             let path = self.path()?;
@@ -764,6 +798,7 @@ impl<'a> Parser<'a> {
             return Ok(SetValue::IfNotExists(path, Box::new(fallback)));
         }
         if self.peek_keyword("list_append") && self.peek_at(1) == Some(&Token::LParen) {
+            self.operator()?;
             self.advance();
             self.advance();
             let first = self.term(nested(level)?)?;
@@ -859,13 +894,13 @@ mod tests {
 
     #[test]
     fn repeated_and_chains_parse_into_one_flat_node() {
-        // 300 terms is what the 4096-byte limit leaves for `a = :v AND …`
-        // (11 bytes per term); the shape, not the count, is what is asserted.
-        let text = vec!["a = :v"; 300].join(" AND ");
+        // Keep the expression below the operator limit so the shape, not the
+        // count, is what this test asserts.
+        let text = vec!["a = :v"; 150].join(" AND ");
         let Condition::And(terms) = parse_condition(&text).unwrap() else {
             panic!("a pure AND chain must parse into the n-ary variant");
         };
-        assert_eq!(terms.len(), 300);
+        assert_eq!(terms.len(), 150);
         // Repetition is not nesting, so every leaf stays a plain comparison.
         assert!(terms
             .iter()
@@ -884,7 +919,7 @@ mod tests {
 
     #[test]
     fn repeated_arithmetic_chains_parse_into_one_flat_node() {
-        let text = format!("SET v = {}", vec![":v"; 600].join(" + "));
+        let text = format!("SET v = {}", vec![":v"; 301].join(" + "));
         let Update { clauses } = parse_update(&text).unwrap();
         let Some(UpdateClause::Set(assignments)) = clauses.first() else {
             panic!("expected one SET clause");
@@ -892,13 +927,13 @@ mod tests {
         let (_, value) = assignments.first().expect("one assignment");
         assert!(matches!(
             value,
-            SetValue::Arithmetic { rest, .. } if rest.len() == 599
+            SetValue::Arithmetic { rest, .. } if rest.len() == 300
         ));
 
         // An alternating chain stays flat as well: one node, one step per
         // operator, never a left-deep tree.
         let mut alternating = String::from("SET v = :v");
-        for _ in 0..199 {
+        for _ in 0..150 {
             alternating.push_str(" + :v - :v");
         }
         let Update { clauses } = parse_update(&alternating).unwrap();
@@ -908,7 +943,48 @@ mod tests {
         let (_, value) = assignments.first().expect("one assignment");
         assert!(matches!(
             value,
-            SetValue::Arithmetic { rest, .. } if rest.len() == 398
+            SetValue::Arithmetic { rest, .. } if rest.len() == 300
         ));
+    }
+
+    #[test]
+    fn operator_limit_is_inclusive_and_reports_a_stable_count() {
+        let mut terms = vec![
+            "a BETWEEN :l AND :h",
+            "a IN (:a, :b)",
+            "NOT a = :v",
+            "attribute_exists(a)",
+            "size(a) = :v",
+            "NOT (a = :v OR a = :v)",
+            "(a = :v AND a = :v)",
+        ];
+        terms.extend(["a = :v"; 140]);
+        let at_limit = terms.join(" AND ");
+        assert!(parse_condition(&at_limit).is_ok());
+
+        let over_limit = at_limit.replacen("attribute_exists(a)", "NOT attribute_exists(a)", 1);
+        let error = parse_condition(&over_limit).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Invalid ConditionExpression: The expression contains too many operators; operator count: 301"
+        );
+
+        let mut update_at_limit = String::from("SET v = list_append(a, :x)");
+        for index in 0..149 {
+            update_at_limit.push_str(if index % 2 == 0 { " + " } else { " - " });
+            update_at_limit.push_str(if index % 2 == 0 {
+                "if_not_exists(a, :x)"
+            } else {
+                "list_append(a, :x)"
+            });
+        }
+        update_at_limit.push_str(" + :v");
+        assert!(parse_update(&update_at_limit).is_ok());
+        let update_over_limit = format!("{update_at_limit} + :v");
+        let error = parse_update(&update_over_limit).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Invalid UpdateExpression: The expression contains too many operators; operator count: 301"
+        );
     }
 }

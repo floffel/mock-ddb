@@ -123,12 +123,13 @@ impl ConditionExpression {
     /// # Errors
     ///
     /// Returns [`Error::Validation`](crate::Error::Validation) when the
-    /// expression is empty, longer than the service's 4096-byte limit,
-    /// malformed, nested too deeply or uses an unknown function. At most 64
-    /// nesting constructs — `(` groups and `NOT` prefixes together — may
-    /// enclose a comparison; the 65th is rejected. Repetition is not nesting:
-    /// `a = :v AND a = :v AND …` builds one flat chain, so the 4096-byte limit
-    /// bounds the number of terms and no term costs stack depth.
+    /// expression is empty, longer than the service's 4096-byte limit, carries
+    /// more than 300 operators or function calls, malformed, nested too deeply
+    /// or uses an unknown function. At most 64 nesting constructs — `(` groups
+    /// and `NOT` prefixes together — may enclose a comparison; the 65th is
+    /// rejected. Repetition is not nesting: `a = :v AND a = :v AND …` builds
+    /// one flat chain, so the operator limit bounds the number of terms and no
+    /// term costs stack depth.
     pub fn parse(input: &str) -> Result<Self> {
         Ok(Self {
             condition: parse_condition(input)?,
@@ -252,12 +253,12 @@ impl UpdateExpression {
     /// # Errors
     ///
     /// Returns [`Error::Validation`](crate::Error::Validation) when the
-    /// expression is longer than the service's 4096-byte limit, malformed,
-    /// repeats a clause, nests `if_not_exists` or `list_append` more than 64
-    /// deep, or writes two document paths that overlap — the same path, or an
-    /// attribute and anything below it. A `+`/`-` chain is repetition, not
-    /// nesting: it is stored flat, so the 4096-byte limit bounds its length
-    /// and no term costs stack depth.
+    /// expression is longer than the service's 4096-byte limit, carries more
+    /// than 300 operators or function calls, malformed, repeats a clause,
+    /// nests `if_not_exists` or `list_append` more than 64 deep, or writes two
+    /// document paths that overlap — the same path, or an attribute and
+    /// anything below it. A `+`/`-` chain is repetition, not nesting: it is
+    /// stored flat, and SET assignment `=` is syntax rather than an operator.
     ///
     /// Overlaps that only appear once `#alias` placeholders are resolved are
     /// rejected by [`UpdateExpression::apply`], the first point that has the
@@ -412,8 +413,9 @@ impl ProjectionExpression {
     /// # Errors
     ///
     /// Returns [`Error::Validation`](crate::Error::Validation) when the
-    /// expression is empty, longer than the service's 4096-byte limit, a path
-    /// is malformed, or it names more than 100 document paths.
+    /// expression is empty, longer than the service's 4096-byte limit, carries
+    /// more than 300 operators or function calls, a path is malformed, or it
+    /// names more than 100 document paths.
     pub fn parse(input: &str) -> Result<Self> {
         let paths = parse_projection(input)?;
         check_path_count(paths.len())?;
@@ -640,10 +642,10 @@ mod tests {
 
     #[test]
     fn repeated_chains_evaluate_on_a_small_stack() {
-        // Repetition is not nesting: 300 `AND` terms and 600 `+` terms are
-        // what the 4096-byte limit leaves, and neither may cost one stack
-        // frame per term — parse, evaluate, drop and the path collection all
-        // walk a flat `Vec`. 128 KiB catches a regression that recurses.
+        // Repetition is not nesting: these chains stay below the service's
+        // 300-operator limit, and neither may cost one stack frame per term —
+        // parse, evaluate, drop and the path collection all walk a flat
+        // `Vec`. 128 KiB catches a regression that recurses.
         std::thread::Builder::new()
             .stack_size(128 * 1024)
             .spawn(|| {
@@ -652,18 +654,18 @@ mod tests {
                 item.insert("a".into(), n("1"));
 
                 let condition =
-                    ConditionExpression::parse(&vec!["a = :v"; 300].join(" AND ")).unwrap();
+                    ConditionExpression::parse(&vec!["a = :v"; 150].join(" AND ")).unwrap();
                 assert!(condition
                     .evaluate(Some(&item), &HashMap::new(), &values)
                     .unwrap());
 
                 let update =
-                    UpdateExpression::parse(&format!("SET v = {}", vec![":v"; 600].join(" + ")))
+                    UpdateExpression::parse(&format!("SET v = {}", vec![":v"; 301].join(" + ")))
                         .unwrap();
                 update
                     .apply(&mut item, &schema(), &HashMap::new(), &values)
                     .unwrap();
-                assert_eq!(item["v"].as_n().unwrap(), "600");
+                assert_eq!(item["v"].as_n().unwrap(), "301");
 
                 // 10^5 terms is not a crash: the 4096-byte limit rejects the
                 // expression before a single tree node is allocated.

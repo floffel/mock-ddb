@@ -690,6 +690,62 @@ fn expression_size_limit_counts_bytes() {
     assert!(mock_ddb::ProjectionExpression::parse(&format!("{name}ü")).is_err());
 }
 
+/// The service counts operators and function calls separately from bytes. A
+/// condition at the operator boundary is accepted and one operator past it is
+/// rejected with the service's stable reported count.
+#[test]
+fn expression_operator_limit_applies_to_conditions() {
+    let mut terms = vec![
+        "a BETWEEN :l AND :h",
+        "a IN (:a, :b)",
+        "NOT a = :v",
+        "attribute_exists(a)",
+        "size(a) = :v",
+        "NOT (a = :v OR a = :v)",
+        "(a = :v AND a = :v)",
+    ];
+    terms.extend(["a = :v"; 140]);
+    let at_limit = terms.join(" AND ");
+    assert!(ConditionExpression::parse(&at_limit).is_ok());
+
+    let over_limit = at_limit.replacen("attribute_exists(a)", "NOT attribute_exists(a)", 1);
+    let error = ConditionExpression::parse(&over_limit).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Invalid ConditionExpression: The expression contains too many operators; operator count: 301"
+    );
+}
+
+/// Arithmetic operators count in updates, while the `=` in each SET assignment
+/// and the commas and clause keywords are syntax only.
+#[test]
+fn expression_operator_limit_applies_to_updates_without_counting_assignment() {
+    let mut at_limit = String::from("SET v = list_append(a, :x)");
+    for index in 0..149 {
+        at_limit.push_str(if index % 2 == 0 { " + " } else { " - " });
+        at_limit.push_str(if index % 2 == 0 {
+            "if_not_exists(a, :x)"
+        } else {
+            "list_append(a, :x)"
+        });
+    }
+    at_limit.push_str(" + :v");
+    assert!(mock_ddb::UpdateExpression::parse(&at_limit).is_ok());
+
+    let over_limit = format!("{at_limit} + :v");
+    let error = mock_ddb::UpdateExpression::parse(&over_limit).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Invalid UpdateExpression: The expression contains too many operators; operator count: 301"
+    );
+
+    let assignments = (0..300)
+        .map(|index| format!("a{index}=:v"))
+        .collect::<Vec<_>>()
+        .join(",");
+    assert!(mock_ddb::UpdateExpression::parse(&format!("SET {assignments}")).is_ok());
+}
+
 /// An oversized expression is rejected for its size, not for its syntax: the
 /// check runs before the text is tokenized.
 #[test]

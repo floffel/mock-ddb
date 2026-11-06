@@ -151,7 +151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | Paths | nested maps (`profile.city`), list indices (`items[0]`), `#aliased` and `#aliased.path` |
 | Update clauses | `SET` (with `+`, `-`, `if_not_exists`, `list_append` — including nested calls and `list_append(if_not_exists(list, :empty), :v)`), `REMOVE`, `ADD` (numbers and sets), `DELETE` (sets) |
 | Update safety | key attributes cannot be rewritten; overlapping paths, repeated clauses and malformed syntax are rejected before any write |
-| Expression size | the service's 4096-byte limit per expression string, checked before the text is tokenized |
+| Expression limits | the service's 4096-byte limit per expression string, checked before tokenization, and its 300-operator/function limit checked while parsing; SET assignment `=` is syntax, not an operator |
 | Projections | comma-separated paths with aliases; a list index keeps the named elements, in ascending order |
 
 Condition and update expressions can also be parsed and evaluated directly,
