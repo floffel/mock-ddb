@@ -3130,10 +3130,11 @@ fn fnv1a_64<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> u64 {
 /// into someone else's test build should not widen that build's tree for a
 /// non-cryptographic bucket index.
 ///
-/// The spread of the buckets is a separate question and is currently poor for
-/// keys whose last attribute value ends in a decimal digit: the reduction below
-/// reads the low bits of the digest, which FNV-1a does not mix well. That is
-/// tracked in issue #148 and does not change the choice of digest.
+/// The digest is mixed once more before the modulo reduction. FNV-1a's low bits
+/// are weak for keys whose last attribute ends in a decimal digit, so reducing
+/// the digest directly would starve every even segment for the common
+/// `("key-{n}", "{n}")` key shape. The finalizer only changes bucket assignment;
+/// the FNV digest itself stays pinned to the specification vectors below.
 fn segment_of(key: &ItemKey, total_segments: u32) -> u32 {
     let hash = fnv1a_64(
         [Some(&key.0), key.1.as_ref()]
@@ -3144,9 +3145,20 @@ fn segment_of(key: &ItemKey, total_segments: u32) -> u32 {
                 Scalar::B(bytes) => bytes.as_slice(),
             }),
     );
+    let hash = mix_segment_hash(hash);
     // The remainder is below `total_segments`, itself a `u32`, so the
     // conversion back cannot fail.
     u32::try_from(hash % u64::from(total_segments)).unwrap_or(0)
+}
+
+/// `SplitMix64`'s finalizer, used to mix an FNV digest before reducing it.
+///
+/// The finalizer is fixed by `SplitMix64` and avalanche-mixes all 64 bits, so a
+/// change in any digest bit can affect the low bits used for the modulus.
+fn mix_segment_hash(mut hash: u64) -> u64 {
+    hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^ (hash >> 31)
 }
 
 // ---------------------------------------------------------------------------
@@ -3515,6 +3527,27 @@ mod tests {
     }
 
     #[test]
+    fn segment_assignment_spreads_a_common_composite_key_shape() {
+        for total in [4, 8] {
+            let counts = segment_counts(total, |index| {
+                (
+                    Scalar::S(format!("key-{index}")),
+                    Some(Scalar::N(index.to_string())),
+                )
+            });
+            assert!(
+                counts.iter().all(|&count| count > 0),
+                "every segment must receive items: {counts:?}"
+            );
+            assert!(
+                counts.iter().all(|&count| count <= 256),
+                "no segment may hold more than half the items: {counts:?}"
+            );
+            assert_eq!(counts.iter().sum::<usize>(), 512);
+        }
+    }
+
+    #[test]
     fn fnv1a_matches_the_specification_vectors() {
         // The vectors published at <http://www.isthe.com/chongo/tech/comp/fnv/index.html>.
         assert_eq!(fnv1a_64([b"".as_slice()]), 0xcbf2_9ce4_8422_2325);
@@ -3589,6 +3622,43 @@ mod tests {
             prop_assert!(segment < total);
             prop_assert_eq!(segment, segment_of(&key, total));
         }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// A common prefix and decimal tail must not collapse a parallel scan
+        /// onto a subset of its segments.
+        #[test]
+        fn segment_assignment_spreads_common_key_shapes(
+            prefix in "[A-Za-z0-9:_-]{0,16}",
+            total in prop_oneof![Just(4u32), Just(8u32)],
+        ) {
+            let counts = segment_counts(total, |index| {
+                (
+                    Scalar::S(format!("{prefix}key-{index}")),
+                    Some(Scalar::N(index.to_string())),
+                )
+            });
+            prop_assert!(
+                counts.iter().all(|&count| count > 0),
+                "every segment must receive items: {:?}", counts
+            );
+            prop_assert!(
+                counts.iter().all(|&count| count <= 256),
+                "no segment may hold more than half the items: {:?}", counts
+            );
+            prop_assert_eq!(counts.iter().sum::<usize>(), 512);
+        }
+    }
+
+    fn segment_counts(total: u32, key: impl Fn(usize) -> ItemKey) -> Vec<usize> {
+        let mut counts = vec![0; usize::try_from(total).unwrap_or(0)];
+        for index in 0..512 {
+            let segment = segment_of(&key(index), total);
+            counts[usize::try_from(segment).unwrap_or(0)] += 1;
+        }
+        counts
     }
 
     #[test]

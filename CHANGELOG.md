@@ -109,6 +109,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Parallel scans no longer starve every even segment for keys whose last sort
+  value ends in a decimal digit. Segment assignment still hashes the primary
+  key with FNV-1a, but runs the digest through SplitMix64's finalizer before
+  reducing it modulo `totalSegments`; the raw FNV digest remains pinned to its
+  specification vectors. Four-way and eight-way scans now receive items in
+  every segment, where the common `("key-{n}", "{n}")` shape previously left
+  all even segments empty.
 - Stream `event_id` is unique across every stream in the process, not just
   inside one stream. The id was `<millis>-<sequence>`, and the sequence number
   is a per-stream counter: two tables writing inside the same millisecond

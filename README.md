@@ -251,8 +251,9 @@ that changes what a caller must do is called out.
     `SET a = b, b = a` swaps. This matches the service's single atomic update
     and makes an update's result independent of clause order.
 11. **Parallel scan segments are hash-based.** Items are assigned to a segment
-    by an FNV-1a hash of the primary key, so segments are disjoint and stable
-    across runs; the service's split is internal.
+    by an FNV-1a digest of the primary key mixed through SplitMix64's finalizer,
+    so segments are disjoint, spread across workers and stable across runs; the
+    service's split is internal.
 12. **Numbers are exact decimals.** 38 significant digits and the documented
     exponent range (`1E-130` … `9.99E+125`) are enforced, `"1.0"` and `"1"` are
     the same value (and the same key), and arithmetic is exact — no `f64`
