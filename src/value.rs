@@ -16,6 +16,13 @@ use crate::{Error, Item, Result};
 /// The documented maximum size of an item, in bytes.
 pub(crate) const MAX_ITEM_SIZE: usize = 400 * 1024;
 
+/// DynamoDB's documented maximum nested-attribute depth.
+///
+/// A top-level attribute is one level; every list element or map value below
+/// it adds one. The write path rejects values past this boundary before it
+/// recurses further, so a hostile document cannot exhaust the stack.
+pub(crate) const MAX_ATTRIBUTE_DEPTH: usize = 32;
+
 /// The error a write gets when the item it would store is too large.
 ///
 /// Shared so the `put` path and the update evaluator reject the same limit
@@ -356,10 +363,19 @@ fn set_member_validation_error(error: SetMemberError, path: &str) -> Error {
     }
 }
 
-/// Validate one value: numbers must parse within DynamoDB's limits and sets
-/// must be non-empty with unique, non-empty members. Recurses into lists and
-/// maps.
+/// Validate one value: numbers must parse within DynamoDB's limits, sets must
+/// be non-empty with unique, non-empty members, and lists and maps may nest at
+/// most [`MAX_ATTRIBUTE_DEPTH`] levels deep.
 pub(crate) fn validate_value(value: &AttributeValue, path: &str) -> Result<()> {
+    validate_value_at(value, path, 1)
+}
+
+fn validate_value_at(value: &AttributeValue, path: &str, level: usize) -> Result<()> {
+    if level > MAX_ATTRIBUTE_DEPTH {
+        return Err(Error::validation(format!(
+            "One or more parameter values were invalid: The nested attribute depth exceeds the maximum of {MAX_ATTRIBUTE_DEPTH} levels ({path})"
+        )));
+    }
     match value {
         AttributeValue::N(text) => crate::number::validate(text),
         AttributeValue::Ns(members) => {
@@ -386,13 +402,17 @@ pub(crate) fn validate_value(value: &AttributeValue, path: &str) -> Result<()> {
             }
             validate_set_members(value).map_err(|error| set_member_validation_error(error, path))
         }
-        AttributeValue::L(elements) => elements
-            .iter()
-            .enumerate()
-            .try_for_each(|(index, element)| validate_value(element, &format!("{path}[{index}]"))),
-        AttributeValue::M(entries) => entries
-            .iter()
-            .try_for_each(|(name, nested)| validate_value(nested, &format!("{path}.{name}"))),
+        AttributeValue::L(elements) => {
+            elements
+                .iter()
+                .enumerate()
+                .try_for_each(|(index, element)| {
+                    validate_value_at(element, &format!("{path}[{index}]"), level + 1)
+                })
+        }
+        AttributeValue::M(entries) => entries.iter().try_for_each(|(name, nested)| {
+            validate_value_at(nested, &format!("{path}.{name}"), level + 1)
+        }),
         _ => Ok(()),
     }
 }
@@ -892,5 +912,230 @@ mod tests {
             set_difference(&left, &right).unwrap(),
             Some(AttributeValue::Ns(Vec::new()))
         );
+    }
+
+    #[test]
+    fn module_header_contracts_are_executable() {
+        // Numeric equality is by value, not spelling.
+        assert!(value_eq(
+            &AttributeValue::N("1.0".into()),
+            &AttributeValue::N("1".into())
+        ));
+
+        // Sets compare and operate without regard to member order.
+        let in_order = AttributeValue::Ss(vec!["a".into(), "b".into()]);
+        let reversed = AttributeValue::Ss(vec!["b".into(), "a".into()]);
+        assert!(value_eq(&in_order, &reversed));
+        assert!(value_eq(
+            &set_union(&in_order, &reversed)
+                .expect("both values are string sets")
+                .expect("sets of one type have a union"),
+            &in_order
+        ));
+
+        // Every set member is charged its own three-byte overhead, plus its
+        // payload: one byte for "a", two for "bb", and 3 + 3 for the members.
+        assert_eq!(
+            value_size(&AttributeValue::Ss(vec!["a".into(), "bb".into()])),
+            9
+        );
+    }
+
+    #[test]
+    fn validation_accepts_the_maximum_attribute_depth() {
+        let mut value = AttributeValue::S("leaf".into());
+        for _ in 1..MAX_ATTRIBUTE_DEPTH {
+            value = AttributeValue::M(HashMap::from([("next".to_string(), value)]));
+        }
+        assert!(validate_value(&value, "root").is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_one_level_past_the_maximum_attribute_depth() {
+        let mut value = AttributeValue::L(vec![AttributeValue::S("leaf".into())]);
+        for _ in 1..MAX_ATTRIBUTE_DEPTH {
+            value = AttributeValue::M(HashMap::from([("next".to_string(), value)]));
+        }
+        let error = validate_value(&value, "root").unwrap_err();
+        assert!(error.to_string().contains("maximum of 32 levels"));
+    }
+
+    use proptest::prelude::*;
+
+    /// A storable number spelling. The second spelling deliberately differs
+    /// from the first so numeric equality is exercised rather than string
+    /// equality.
+    fn storable_number() -> impl Strategy<Value = String> {
+        proptest::sample::select(&["-100", "-2", "-1", "0", "1", "2", "1.0", "2.00", "10"])
+            .prop_map(str::to_string)
+    }
+
+    fn string_set() -> BoxedStrategy<AttributeValue> {
+        prop::collection::btree_set("[a-z]{1,5}", 1..6)
+            .prop_map(|members| AttributeValue::Ss(members.into_iter().collect()))
+            .boxed()
+    }
+
+    fn number_set() -> BoxedStrategy<AttributeValue> {
+        prop::collection::btree_set(-100_i64..100, 1..6)
+            .prop_map(|members| {
+                AttributeValue::Ns(
+                    members
+                        .into_iter()
+                        .map(|member| member.to_string())
+                        .collect(),
+                )
+            })
+            .boxed()
+    }
+
+    fn binary_set() -> BoxedStrategy<AttributeValue> {
+        prop::collection::btree_set(prop::collection::vec(any::<u8>(), 1..8), 1..6)
+            .prop_map(|members| AttributeValue::Bs(members.into_iter().map(Blob::new).collect()))
+            .boxed()
+    }
+
+    fn set(kind: u8) -> BoxedStrategy<AttributeValue> {
+        match kind % 3 {
+            0 => string_set(),
+            1 => number_set(),
+            _ => binary_set(),
+        }
+    }
+
+    /// Every shape the write path accepts: scalars, non-empty sets with unique
+    /// members, and bounded lists/maps of the same.
+    fn accepted_value() -> impl Strategy<Value = AttributeValue> {
+        let leaf = prop_oneof![
+            "[a-zA-Z0-9 _-]{0,12}".prop_map(AttributeValue::S),
+            storable_number().prop_map(AttributeValue::N),
+            prop::collection::vec(any::<u8>(), 0..8)
+                .prop_map(|bytes| AttributeValue::B(Blob::new(bytes))),
+            any::<bool>().prop_map(AttributeValue::Bool),
+            Just(AttributeValue::Null(true)),
+            string_set(),
+            number_set(),
+            binary_set(),
+        ];
+        leaf.prop_recursive(4, 32, 4, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..4).prop_map(AttributeValue::L),
+                prop::collection::hash_map("[a-z]{1,5}", inner, 0..4)
+                    .prop_map(|entries| AttributeValue::M(entries.into_iter().collect())),
+            ]
+        })
+    }
+
+    fn comparable_value(kind: u8) -> BoxedStrategy<AttributeValue> {
+        match kind % 3 {
+            0 => "[a-zA-Z0-9 _-]{0,12}".prop_map(AttributeValue::S).boxed(),
+            1 => storable_number().prop_map(AttributeValue::N).boxed(),
+            _ => prop::collection::vec(any::<u8>(), 0..8)
+                .prop_map(|bytes| AttributeValue::B(Blob::new(bytes)))
+                .boxed(),
+        }
+    }
+
+    fn comparable_triple() -> impl Strategy<Value = (AttributeValue, AttributeValue, AttributeValue)>
+    {
+        (0_u8..3).prop_flat_map(|kind| {
+            (
+                comparable_value(kind),
+                comparable_value(kind),
+                comparable_value(kind),
+            )
+        })
+    }
+
+    fn set_pair() -> impl Strategy<Value = (AttributeValue, AttributeValue)> {
+        (0_u8..3).prop_flat_map(|kind| (set(kind), set(kind)))
+    }
+
+    fn members(value: &AttributeValue) -> Vec<AttributeValue> {
+        match value {
+            AttributeValue::Ss(values) => values.iter().cloned().map(AttributeValue::S).collect(),
+            AttributeValue::Ns(values) => values.iter().cloned().map(AttributeValue::N).collect(),
+            AttributeValue::Bs(values) => values.iter().cloned().map(AttributeValue::B).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn contains(set: &AttributeValue, member: &AttributeValue) -> bool {
+        members(set)
+            .iter()
+            .any(|candidate| value_eq(candidate, member))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// Equality is an equivalence relation over every accepted value shape.
+        #[test]
+        fn value_equality_is_an_equivalence_relation(
+            left in accepted_value(),
+            middle in accepted_value(),
+            right in accepted_value(),
+        ) {
+            prop_assert!(value_eq(&left, &left), "reflexive: {left:?}");
+            prop_assert_eq!(value_eq(&left, &middle), value_eq(&middle, &left), "symmetric");
+            if value_eq(&left, &middle) && value_eq(&middle, &right) {
+                prop_assert!(value_eq(&left, &right), "transitive: {left:?} {middle:?} {right:?}");
+            }
+        }
+
+        /// Scalar ordering agrees with equality, is antisymmetric, and is total
+        /// for values of one DynamoDB type.
+        #[test]
+        fn value_ordering_agrees_with_equality_and_is_total(
+            (left, middle, right) in comparable_triple(),
+        ) {
+            let left_middle = value_cmp(&left, &middle);
+            let middle_left = value_cmp(&middle, &left);
+            prop_assert!(left_middle.is_some(), "same-type scalars are comparable");
+            prop_assert_eq!(left_middle, middle_left.map(Ordering::reverse));
+            prop_assert_eq!(left_middle == Some(Ordering::Equal), value_eq(&left, &middle));
+
+            if left_middle == Some(Ordering::Less) && value_cmp(&middle, &right) == Some(Ordering::Less) {
+                prop_assert_eq!(value_cmp(&left, &right), Some(Ordering::Less), "transitive ordering");
+            }
+        }
+
+        /// Union is a superset of both inputs and idempotent.
+        #[test]
+        fn set_union_is_a_superset_and_idempotent((left, right) in set_pair()) {
+            let union = set_union(&left, &right)
+                .expect("both values have valid members")
+                .expect("both values are sets of one type");
+            for member in members(&left).iter().chain(members(&right).iter()) {
+                prop_assert!(contains(&union, member), "union lost {member:?}");
+            }
+            let left_union = set_union(&left, &left)
+                .expect("left has valid members")
+                .expect("left is a set");
+            prop_assert!(value_eq(&left_union, &left), "union(x, x) != x");
+            let right_union = set_union(&union, &right)
+                .expect("both values have valid members")
+                .expect("both values are sets of one type");
+            prop_assert!(value_eq(&right_union, &union), "union(union(x, y), y) != union(x, y)");
+        }
+
+        /// Difference is a subset of the left operand and removes exactly the
+        /// members the right operand shares with it.
+        #[test]
+        fn set_difference_is_a_subset_and_removes_exactly_the_shared_members(
+            (left, right) in set_pair(),
+        ) {
+            let difference = set_difference(&left, &right)
+                .expect("both values have valid members")
+                .expect("both values are sets of one type");
+            for member in members(&difference) {
+                prop_assert!(contains(&left, &member), "difference invented {member:?}");
+                prop_assert!(!contains(&right, &member), "difference kept shared {member:?}");
+            }
+            for member in members(&left) {
+                let shared = contains(&right, &member);
+                prop_assert_eq!(contains(&difference, &member), !shared, "member {:?}", member);
+            }
+        }
     }
 }
