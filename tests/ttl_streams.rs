@@ -192,6 +192,20 @@ async fn purge_removes_expired_rows() {
 }
 
 #[tokio::test]
+async fn purge_removes_expired_rows_in_bounded_passes() {
+    let (mock, _clock) = ttl_table().await;
+    let rows = (0..1_026)
+        .map(|id| item([("pk", s(format!("u#{id:04}"))), ("expires_at", n("999999"))]))
+        .collect();
+    mock.seed("sessions", rows).unwrap();
+
+    assert_eq!(mock.purge_expired("sessions").unwrap(), 1_024);
+    assert_eq!(mock.dump("sessions").len(), 0);
+    assert_eq!(mock.purge_expired("sessions").unwrap(), 2);
+    assert_eq!(mock.purge_expired("sessions").unwrap(), 0);
+}
+
+#[tokio::test]
 async fn an_expired_item_is_not_returned_as_the_old_value() {
     let (mock, _clock) = ttl_table().await;
     mock.seed(
@@ -367,6 +381,30 @@ async fn a_transacted_update_unindexes_the_previous_row() {
     }
 }
 
+#[tokio::test]
+async fn purging_an_expired_indexed_row_removes_every_index_entry() {
+    let (mock, _clock) = ttl_indexed().await;
+    mock.put_item(PutItemRequest::new(
+        "sessions",
+        item([
+            ("pk", s("u#1")),
+            ("state", s("expired")),
+            ("expires_at", n("999999")),
+        ]),
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(indexed_count(&mock, "expired").await, 0);
+    assert_eq!(mock.purge_expired("sessions").unwrap(), 1);
+    assert_eq!(mock.dump("sessions").len(), 0);
+    assert_eq!(
+        indexed_count(&mock, "expired").await,
+        0,
+        "purging must remove the raw row and its index entry"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Streams
 // ---------------------------------------------------------------------------
@@ -512,6 +550,48 @@ mod streams {
                 .and_then(|old| old.get("expires_at")),
             Some(&n("2000000"))
         );
+    }
+
+    #[tokio::test]
+    async fn purge_emits_remove_for_each_expired_row() {
+        let (mock, _clock) = clocked();
+        let created = mock
+            .create_table(
+                CreateTableRequest::new("events", KeySchema::hash("pk", KeyType::String))
+                    .with_stream(StreamViewType::NewAndOldImages),
+            )
+            .await
+            .unwrap();
+        let arn = created.latest_stream_arn.expect("a stream ARN");
+        mock.update_time_to_live(UpdateTimeToLiveRequest::new("events", "expires_at", true))
+            .await
+            .unwrap();
+        mock.seed(
+            "events",
+            vec![
+                item([("pk", s("expired")), ("expires_at", n("999999"))]),
+                item([("pk", s("live")), ("expires_at", n("1000001"))]),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(mock.purge_expired("events").unwrap(), 1);
+        let records = mock.get_records(&arn).await.unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].event_name, StreamEventName::Insert);
+        assert_eq!(records[1].event_name, StreamEventName::Remove);
+        assert_eq!(records[1].keys, pk("expired"));
+        assert_eq!(
+            records[1]
+                .old_image
+                .as_ref()
+                .and_then(|old| old.get("expires_at")),
+            Some(&n("999999"))
+        );
+        assert!(records[1].new_image.is_none());
+
+        assert_eq!(mock.purge_expired("events").unwrap(), 0);
+        assert_eq!(mock.get_records(&arn).await.unwrap().len(), 2);
     }
 
     #[tokio::test]

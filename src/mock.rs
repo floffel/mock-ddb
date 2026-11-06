@@ -41,7 +41,9 @@ use crate::request::{
     WriteRequest,
 };
 use crate::schema::{CreateTableRequest, KeySchema, TableDescription};
-use crate::table::{index_key, IndexKey, ItemKey, Table, TableDefinition, Ttl};
+use crate::table::{
+    index_key, DeleteKind, IndexKey, ItemKey, StoreKind, Table, TableDefinition, Ttl,
+};
 use crate::value::{item_size, Scalar};
 use crate::Item;
 
@@ -426,16 +428,7 @@ impl MockDdb {
             keys.push(table.item_key(item)?);
         }
         for (key, item) in keys.into_iter().zip(items) {
-            let previous = table.items.get(&key).cloned();
-            // An expired row is logically absent: the stream sees an INSERT,
-            // exactly what the same write through `put_item` produces.
-            let previous_live = previous
-                .clone()
-                .filter(|existing| !table.is_expired(existing, now));
-            if !table.is_expired(&item, now) {
-                table.on_put(previous_live.as_ref(), &item, now_time)?;
-            }
-            table.store(key, item.clone(), previous.as_ref());
+            table.store(key, item, StoreKind::Seed, now, now_time)?;
         }
         Ok(())
     }
@@ -720,8 +713,7 @@ impl MockDdb {
             }
         }
 
-        table.on_put(previous_live.as_ref(), &request.item, now_time)?;
-        table.store(key, request.item.clone(), previous.as_ref());
+        table.store(key, request.item.clone(), StoreKind::Put, now, now_time)?;
         let mut breakdown = Breakdown::new();
         charge_write(
             table,
@@ -897,10 +889,7 @@ impl MockDdb {
             }
         }
 
-        if let Some(item) = &previous_live {
-            table.on_delete(item, now_time)?;
-        }
-        let removed = table.discard(&key);
+        let removed = table.delete(&key, DeleteKind::LiveOnly, now, now_time)?;
         let mut breakdown = Breakdown::new();
         charge_write(table, &mut breakdown, [previous_live.as_ref(), None]);
         let item_collection_metrics = previous_live.as_ref().and_then(|item| {
@@ -1000,8 +989,7 @@ impl MockDdb {
         };
         let touched = update.apply(&mut item, table.key_schema(), &names, &values)?;
         table.validate_item(&item)?;
-        table.on_update(previous_live.as_ref(), &item, now_time)?;
-        table.store(key, item.clone(), previous.as_ref());
+        table.store(key, item.clone(), StoreKind::Update, now, now_time)?;
 
         let mut breakdown = Breakdown::new();
         charge_write(table, &mut breakdown, [previous_live.as_ref(), Some(&item)]);
@@ -1452,11 +1440,10 @@ impl MockDdb {
                         let key = table.item_key(&item)?;
                         let previous = table.items.get(&key).cloned();
                         let previous_live = previous
-                            .clone()
+                            .as_ref()
                             .filter(|existing| !table.is_expired(existing, now));
-                        charge_write(table, &mut breakdown, [previous_live.as_ref(), Some(&item)]);
-                        table.on_put(previous_live.as_ref(), &item, now_time)?;
-                        table.store(key, item.clone(), previous.as_ref());
+                        charge_write(table, &mut breakdown, [previous_live, Some(&item)]);
+                        table.store(key, item.clone(), StoreKind::Put, now, now_time)?;
                         note_collection(
                             table,
                             &item,
@@ -1474,10 +1461,7 @@ impl MockDdb {
                             .filter(|existing| !table.is_expired(existing, now));
                         charge_write(table, &mut breakdown, [previous_live.as_ref(), None]);
                         if let Some(previous) = table.items.get(&key).cloned() {
-                            if !table.is_expired(&previous, now) {
-                                table.on_delete(&previous, now_time)?;
-                            }
-                            let _ = table.discard(&key);
+                            table.delete(&key, DeleteKind::LiveOnly, now, now_time)?;
                             note_collection(
                                 table,
                                 &previous,
@@ -2183,23 +2167,25 @@ impl MockDdb {
     /// assert_eq!(mock.purge_expired("users").unwrap(), 1);
     /// # }
     /// ```
-    /// Delete every expired item in a table and report how many were removed.
+    /// Delete up to 1024 expired items in a table and report how many were removed.
     ///
     /// The real service deletes asynchronously within 48 hours of expiry; the
     /// mock hides expired items from every read immediately and only removes
-    /// them when they are read or purged.
+    /// them when they are read or purged. A purge allocates a bounded batch of
+    /// keys, so repeat it until it returns zero when draining a large table.
+    /// When the table has a stream, each real removal appends a `REMOVE` record.
     ///
     /// # Errors
     ///
     /// Returns [`Error::ResourceNotFound`] for an unknown table.
     pub fn purge_expired(&self, table_name: &str) -> Result<usize> {
-        let now = self.epoch_now();
+        let (now_time, now) = self.now_parts();
         let mut inner = self.inner.write();
         let table = inner
             .tables
             .get_mut(table_name)
             .ok_or_else(|| Error::table_not_found(table_name))?;
-        Ok(table.purge_expired(now))
+        table.purge_expired(now, now_time)
     }
 
     // -- streams ------------------------------------------------------------
@@ -3188,10 +3174,6 @@ struct PreparedAction {
     /// The logical previous item: `None` when the key is free or the row has
     /// expired. Conditions, old-value reporting and capacity use this one.
     previous: Option<Item>,
-    /// The raw row the store holds for `key`, expired or not. Only index
-    /// maintenance needs it: an expired row is logically absent but still
-    /// occupies index entries that a rewrite has to remove.
-    stored: Option<Item>,
     condition: Option<ConditionExpression>,
     names: NameMap,
     values: ValueMap,
@@ -3216,7 +3198,6 @@ fn prepare_action(inner: &Inner, action: &TransactWriteItem, now: i64) -> Result
             Ok(PreparedAction {
                 table_name: put.table_name.clone(),
                 previous: live_item(table, &key, now),
-                stored: stored_item(table, &key),
                 key,
                 condition: parse_optional_condition(put.condition_expression.as_deref())?,
                 names: put.expression_attribute_names.clone().unwrap_or_default(),
@@ -3229,7 +3210,6 @@ fn prepare_action(inner: &Inner, action: &TransactWriteItem, now: i64) -> Result
             let table = action_table(inner, &update.table_name)?;
             let key = table.lookup_key(&update.key)?;
             let previous = live_item(table, &key, now);
-            let stored = stored_item(table, &key);
             let names = update
                 .expression_attribute_names
                 .clone()
@@ -3249,7 +3229,6 @@ fn prepare_action(inner: &Inner, action: &TransactWriteItem, now: i64) -> Result
                 table_name: update.table_name.clone(),
                 key,
                 previous,
-                stored,
                 condition: parse_optional_condition(update.condition_expression.as_deref())?,
                 names,
                 values,
@@ -3263,7 +3242,6 @@ fn prepare_action(inner: &Inner, action: &TransactWriteItem, now: i64) -> Result
             Ok(PreparedAction {
                 table_name: delete.table_name.clone(),
                 previous: live_item(table, &key, now),
-                stored: stored_item(table, &key),
                 key,
                 condition: parse_optional_condition(delete.condition_expression.as_deref())?,
                 names: delete
@@ -3284,7 +3262,6 @@ fn prepare_action(inner: &Inner, action: &TransactWriteItem, now: i64) -> Result
             Ok(PreparedAction {
                 table_name: check.table_name.clone(),
                 previous: live_item(table, &key, now),
-                stored: stored_item(table, &key),
                 key,
                 condition: Some(ConditionExpression::parse(&check.condition_expression)?),
                 names: check.expression_attribute_names.clone().unwrap_or_default(),
@@ -3309,9 +3286,8 @@ fn parse_optional_condition(expression: Option<&str>) -> Result<Option<Condition
 /// Read the raw row the store holds at a key, expired or not.
 ///
 /// An expired row is logically absent, so conditions, old-value reporting and
-/// capacity work from [`live_item`]. Its secondary-index entries are still
-/// there, though, so rewriting the key must unindex this value: that is what
-/// [`Table::store`] takes as its `previous` argument.
+/// capacity work from [`live_item`]. Its secondary-index entries remain until
+/// the self-contained table mutation removes the row.
 fn stored_item(table: &Table, key: &ItemKey) -> Option<Item> {
     table.items.get(key).cloned()
 }
@@ -3361,8 +3337,7 @@ fn apply_transaction(
                     &mut breakdown,
                     [action.previous.as_ref(), Some(&item)],
                 );
-                table.on_put(action.previous.as_ref(), &item, now_time)?;
-                table.store(action.key, item.clone(), action.stored.as_ref());
+                table.store(action.key, item.clone(), StoreKind::Put, now, now_time)?;
                 note_collection(
                     table,
                     &item,
@@ -3378,8 +3353,7 @@ fn apply_transaction(
                     &mut breakdown,
                     [action.previous.as_ref(), Some(&item)],
                 );
-                table.on_update(action.previous.as_ref(), &item, now_time)?;
-                table.store(action.key, item.clone(), action.stored.as_ref());
+                table.store(action.key, item.clone(), StoreKind::Update, now, now_time)?;
                 note_collection(
                     table,
                     &item,
@@ -3392,8 +3366,7 @@ fn apply_transaction(
             ActionKind::Delete => {
                 charge_write(table, &mut breakdown, [action.previous.as_ref(), None]);
                 if let Some(previous) = &action.previous {
-                    table.on_delete(previous, now_time)?;
-                    let _ = table.discard(&action.key);
+                    table.delete(&action.key, DeleteKind::LiveOnly, now, now_time)?;
                     note_collection(
                         table,
                         previous,
@@ -3403,7 +3376,7 @@ fn apply_transaction(
                         &mut collections,
                     );
                 } else {
-                    let _ = table.discard(&action.key);
+                    table.delete(&action.key, DeleteKind::LiveOnly, now, now_time)?;
                 }
             }
             ActionKind::ConditionCheck => {

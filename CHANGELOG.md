@@ -109,6 +109,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Table mutations now update items, secondary indexes and streams through one
+  self-contained operation. `Table::store` reads the row currently at the key
+  instead of trusting a caller-supplied previous image, so replacing an expired
+  or seeded row cannot leave permanent phantom index entries. TTL purge uses
+  the same delete path, counts only rows it actually removed, emits a `REMOVE`
+  stream record for successful expired-row deletions, and processes at most
+  1,024 expired rows per call so purging a large table has bounded key
+  allocation.
 - Parallel scans no longer starve every even segment for keys whose last sort
   value ends in a decimal digit. Segment assignment still hashes the primary
   key with FNV-1a, but runs the digest through SplitMix64's finalizer before
