@@ -116,6 +116,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   specification vectors. Four-way and eight-way scans now receive items in
   every segment, where the common `("key-{n}", "{n}")` shape previously left
   all even segments empty.
+- Number formatting bounds the run of padding zeros instead of the decimal
+  scale, so an in-range fraction within 38 significant digits still renders
+  when its scale exceeds 130. `UpdateItem` with `ADD` now accepts sums such as
+  `1.2345e-129 + 0.0001e-129` instead of reporting a false overflow; the 129-zero
+  worst case at the documented floor is covered directly.
 - Expression parsing now enforces the service's 300-operator/function limit in
   addition to the 4096-byte text limit. Comparisons, `AND`/`OR`/`NOT`,
   `BETWEEN`, `IN`, arithmetic, and expression function calls count; the `=` in

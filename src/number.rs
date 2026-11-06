@@ -52,10 +52,12 @@ const MAX_ORDER: i64 = 126;
 
 /// Longest run of padding zeros [`Number::to_plain_string`] will produce.
 ///
-/// The documented range covers it exactly: `1E+125` pads 125 zeros and
-/// `1E-130` pads 129. A number that needs more is not storable, and the
-/// formatter returns `None` instead of allocating it — a 5-byte input such as
-/// `1e2147483647` would otherwise ask for gigabytes.
+/// The documented range needs at most 129: `1E+125` pads 125 zeros, and the
+/// smallest positive fraction, `1E-130`, pads 129. A 38-digit mantissa at the
+/// bottom of the range has a scale as high as 167, but its padding is still
+/// only 129 zeros in front of the digits. Allowing 130 brackets that boundary;
+/// beyond it the formatter returns `None` instead of allocating, so a 5-byte
+/// input such as `1e2147483647` cannot ask for gigabytes.
 const MAX_PADDING: usize = 130;
 
 /// Longest literal [`Number::parse`] will look at, in bytes.
@@ -332,9 +334,9 @@ impl Number {
 
     /// Format the number the way DynamoDB stores it (no exponent notation).
     ///
-    /// `None` when rendering would need more than [`MAX_PADDING`] zeros — the
-    /// value is outside DynamoDB's range, so it is not storable and there is
-    /// nothing useful to render. Returning `None` keeps a 5-byte input like
+    /// `None` when rendering would need more than [`MAX_PADDING`] zeros.
+    /// DynamoDB's documented range needs at most 129, so every storable value
+    /// renders. Returning `None` for a larger run keeps a 5-byte input like
     /// `1e2147483647` from asking for gigabytes of zero padding.
     pub(crate) fn to_plain_string(&self) -> Option<String> {
         let Some((negative, digits)) = self.mantissa() else {
@@ -350,17 +352,15 @@ impl Number {
         } else {
             // `unsigned_abs` keeps `i64::MIN` from overflowing.
             let scale = usize::try_from(self.exponent.unsigned_abs()).ok()?;
-            if scale > MAX_PADDING {
+            let padding = scale.saturating_sub(digits.len());
+            if padding > MAX_PADDING {
                 return None;
             }
             if scale < digits.len() {
                 let split = digits.len() - scale;
                 Some(format!("{sign}{}.{}", &digits[..split], &digits[split..]))
             } else {
-                Some(format!(
-                    "{sign}0.{}{digits}",
-                    "0".repeat(scale - digits.len())
-                ))
+                Some(format!("{sign}0.{}{digits}", "0".repeat(padding)))
             }
         }
     }
@@ -726,14 +726,15 @@ mod tests {
         let past_limit = Number::parse("1e131").unwrap();
         assert_eq!(past_limit.to_plain_string(), None);
 
-        // Same on the fractional side: a scale of 130 pads 129 zeros, 131 is
-        // refused.
-        let fraction_limit = Number::parse("1e-130").unwrap();
+        // The guard is on the zeros actually materialised, not the scale: a
+        // scale of 131 still pads 130 zeros (one past the documented range),
+        // while 132 pads 131 and is refused.
+        let fraction_limit = Number::parse("1e-131").unwrap();
         assert_eq!(
             fraction_limit.to_plain_string().unwrap(),
-            format!("0.{}1", "0".repeat(129))
+            format!("0.{}1", "0".repeat(130))
         );
-        let fraction_past = Number::parse("1e-131").unwrap();
+        let fraction_past = Number::parse("1e-132").unwrap();
         assert_eq!(fraction_past.to_plain_string(), None);
 
         // Everything DynamoDB accepts still renders.
@@ -745,6 +746,36 @@ mod tests {
                 .len(),
             126
         );
+    }
+
+    #[test]
+    fn plain_string_bounds_fraction_padding_not_scale() {
+        // A fraction wide enough to normalise to a scale past `MAX_PADDING`
+        // still needs only its run of leading zeros, so an in-range value is
+        // rendered rather than reported as an overflow (issue #151).
+        for (literal, padding, digits) in [
+            ("1.5e-130", 129, "15"),
+            ("15e-131", 129, "15"),
+            ("1.2345e-129", 128, "12345"),
+        ] {
+            let number = Number::parse(literal).expect("a number");
+            assert!(validate(literal).is_ok(), "{literal}");
+            assert_eq!(
+                number.to_plain_string(),
+                Some(format!("0.{}{digits}", "0".repeat(padding))),
+                "{literal}"
+            );
+        }
+
+        // The 38-digit mantissa at the documented floor has a scale of 167,
+        // but only 129 zeros precede it: the plain form is 169 bytes.
+        let digits = "12345678901234567890123456789012345678";
+        let literal = format!("{digits}e-167");
+        let number = Number::parse(&literal).expect("a number");
+        assert!(validate(&literal).is_ok());
+        let rendered = number.to_plain_string().expect("a storable value renders");
+        assert_eq!(rendered, format!("0.{}{digits}", "0".repeat(129)));
+        assert_eq!(rendered.len(), 169);
     }
 
     #[test]
@@ -1036,6 +1067,24 @@ mod tests {
             let again = Number::parse(&plain).expect("the plain form is a literal");
             prop_assert_eq!(&again, &number, "{} -> {}", literal.as_str(), plain.as_str());
             prop_assert_eq!(again.canonical(), number.canonical());
+        }
+
+        /// Every storable fraction renders with the zero run it actually pads,
+        /// not its scale (issue #151). The generated mantissas reach the full
+        /// 38-digit limit, and the padding reaches the documented 129-zero
+        /// floor while staying inside the number range.
+        #[test]
+        fn storable_fractions_render_at_every_padding_length(
+            digits in "[1-9]([0-9]{0,36}[1-9])?",
+            padding in 0usize..=129,
+        ) {
+            let exponent = digits.len() + padding;
+            let literal = format!("{digits}e-{exponent}");
+            let number = Number::parse(&literal).expect("generated literals are valid");
+            prop_assert_eq!(number.storability(), Storability::Storable);
+            let expected = format!("0.{}{digits}", "0".repeat(padding));
+            let rendered = number.to_plain_string();
+            prop_assert_eq!(rendered.as_deref(), Some(expected.as_str()));
         }
 
         /// Ordering and arithmetic are one relation: `a < b` exactly when

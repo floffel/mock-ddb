@@ -28,7 +28,9 @@ use std::collections::BTreeSet;
 use aws_sdk_dynamodb::types::AttributeValue;
 
 use super::eval::Ctx;
-use super::parse::{reject_overlapping, ArithOp, Operand, Path, SetValue, Update, UpdateClause};
+use super::parse::{
+    reject_overlapping, ArithOp, Operand, Path, Segment, SetValue, Update, UpdateClause,
+};
 use super::path::{get_path, invalid_nested_path, remove_path, render, root, set_path};
 use crate::number::Number;
 use crate::schema::KeySchema;
@@ -110,17 +112,7 @@ pub(crate) fn apply(
                         .ok_or_else(|| invalid_nested_path(&resolved))?
                         .to_string();
                     reject_key_attribute(&name, key_schema)?;
-                    let delta = ctx
-                        .operand_value(operand, Some(item))?
-                        .map(Cow::into_owned)
-                        .ok_or_else(|| undefined_operand(operand))?;
-                    let rendered = render(&resolved);
-                    let delta = validate_add_delta(&delta, &rendered)?;
-                    let current = get_path(item, &resolved).cloned();
-                    let updated = match current {
-                        None => delta,
-                        Some(current) => add_values(&current, &delta, &rendered)?,
-                    };
+                    let updated = apply_add(item, ctx, &resolved, operand, &render(&resolved))?;
                     touched.insert(name);
                     mutations.push(Mutation::Set(resolved, updated));
                 }
@@ -186,6 +178,38 @@ pub(crate) fn apply(
     }
     *item = work;
     Ok(touched)
+}
+
+/// Apply one `ADD` pair and return the value to store.
+///
+/// A numeric delta is an operand, not necessarily a storable value by itself.
+/// `0.0001e-129` has a scale beyond the plain-form guard, yet adding it to an
+/// in-range value can still produce an in-range sum. Parse it in [`add_values`],
+/// where the sum is checked, instead of rendering it first. Other delta types
+/// keep the up-front checks that refuse malformed set members.
+fn apply_add(
+    item: &Item,
+    ctx: &Ctx<'_>,
+    resolved: &[Segment],
+    operand: &Operand,
+    rendered: &str,
+) -> Result<AttributeValue> {
+    let delta = ctx
+        .operand_value(operand, Some(item))?
+        .map(Cow::into_owned)
+        .ok_or_else(|| undefined_operand(operand))?;
+    let Some(current) = get_path(item, resolved).cloned() else {
+        return validate_add_delta(&delta, rendered);
+    };
+    if matches!(
+        (&current, &delta),
+        (AttributeValue::N(_), AttributeValue::N(_))
+    ) {
+        add_values(&current, &delta, rendered)
+    } else {
+        let delta = validate_add_delta(&delta, rendered)?;
+        add_values(&current, &delta, rendered)
+    }
 }
 
 /// An evaluated `SET` right-hand side, plus where the numbers in it came from.
@@ -340,12 +364,11 @@ fn arithmetic(
 
 /// Validate an `ADD` operand and return the value the item stores.
 ///
-/// `ADD` on an absent attribute stores its delta as it stands, so the checks
-/// belong here rather than on the arithmetic path alone: an unparseable number
-/// or an empty set would otherwise land in the item, where `PutItem` would have
-/// refused the same value and every later arithmetic read of it fails. Both
-/// arms run through this, so a present and an absent attribute reject the same
-/// operands with the same errors.
+/// `ADD` on an absent attribute stores its delta as it stands, so an
+/// unparseable number or an empty set would otherwise land in the item, where
+/// `PutItem` would have refused the same value and every later arithmetic read
+/// of it fails. A present numeric attribute is different: its delta is only an
+/// operand, so [`add_values`] parses it and checks the sum instead.
 ///
 /// A number comes back rendered plain (`1e3` → `1000`), the form the sum path
 /// produces. Set members keep their spelling, as they do on the union path.
@@ -905,6 +928,22 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(!target.contains_key("absent"));
+    }
+
+    #[test]
+    fn add_parses_a_present_numeric_delta_before_rendering_it() {
+        // `0.0001e-129` normalises to a scale of 133, so it cannot render on
+        // its own even though adding it can produce a storable value. Rendering
+        // the operand before the sum used to report a false overflow (#151).
+        let values = crate::values([(":tiny", n("0.0001e-129"))]);
+        let mut target = item([("pk", s("a")), ("v", n("1.2345e-129"))]);
+
+        apply("ADD v :tiny", &mut target, &values).unwrap();
+
+        assert_eq!(
+            target.get("v"),
+            Some(&n(format!("0.{}12346", "0".repeat(128))))
+        );
     }
 
     #[test]
