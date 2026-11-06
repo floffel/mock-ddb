@@ -25,6 +25,13 @@ use crate::{Error, Result};
 ///
 /// DynamoDB allows strings, numbers and binary as key types; nothing else is
 /// a valid key.
+///
+/// ```
+/// use mock_ddb::KeyType;
+///
+/// assert_eq!(KeyType::String.to_string(), "S");
+/// assert_eq!(KeyType::Number.to_string(), "N");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum KeyType {
@@ -38,6 +45,13 @@ pub enum KeyType {
 
 impl KeyType {
     /// The single-letter type name DynamoDB uses on the wire.
+    ///
+    /// ```
+    /// use mock_ddb::KeyType;
+    ///
+    /// assert_eq!(KeyType::Number.as_str(), "N");
+    /// assert_eq!(KeyType::Binary.as_str(), "B");
+    /// ```
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -827,7 +841,105 @@ fn is_name_character(character: char) -> bool {
 mod tests {
     use proptest::prelude::*;
 
-    use super::{echoed_name, MAX_ECHO_CHARS};
+    use super::{echoed_name, validate_table_name, MAX_ECHO_CHARS, MAX_NAME_LEN, MIN_NAME_LEN};
+
+    #[test]
+    fn table_name_length_window_is_inclusive_on_both_ends() {
+        // One character short of the minimum, then exactly the minimum.
+        let too_short = validate_table_name(&"a".repeat(MIN_NAME_LEN - 1))
+            .expect_err("a name below the minimum has to be rejected")
+            .to_string();
+        assert!(
+            too_short.contains("length greater than or equal to 3"),
+            "{too_short}"
+        );
+        assert!(validate_table_name(&"a".repeat(MIN_NAME_LEN)).is_ok());
+
+        // The empty name belongs to the same lower-bound rule.
+        let empty = validate_table_name("")
+            .expect_err("an empty name has to be rejected")
+            .to_string();
+        assert!(
+            empty.contains("length greater than or equal to 3"),
+            "{empty}"
+        );
+
+        // Exactly the maximum is accepted, one character over is not.
+        assert!(validate_table_name(&"a".repeat(MAX_NAME_LEN)).is_ok());
+        let too_long = validate_table_name(&"a".repeat(MAX_NAME_LEN + 1))
+            .expect_err("a name above the maximum has to be rejected")
+            .to_string();
+        assert!(
+            too_long.contains("length less than or equal to 255"),
+            "{too_long}"
+        );
+        assert!(
+            !too_long.contains("greater than or equal to"),
+            "the upper bound must not borrow the lower bound's wording: {too_long}"
+        );
+    }
+
+    #[test]
+    fn name_length_is_counted_in_characters_not_bytes() {
+        // 200 scalars are 400 bytes: inside the character window, outside a byte
+        // window. The charset rule has to be the one that rejects this — a
+        // byte-based length check would report it as too long instead.
+        let wide = "ä".repeat(200);
+        let error = validate_table_name(&wide)
+            .expect_err("a non-ASCII name has to be rejected")
+            .to_string();
+        assert!(
+            error.contains("regular expression pattern: [a-zA-Z0-9_.-]+"),
+            "{error}"
+        );
+        assert!(!error.contains("length"), "{error}");
+
+        // The same name at the minimum width: three scalars, six bytes.
+        let narrow = "äöü";
+        let error = validate_table_name(narrow)
+            .expect_err("a non-ASCII name has to be rejected")
+            .to_string();
+        assert!(
+            error.contains("regular expression pattern: [a-zA-Z0-9_.-]+"),
+            "{error}"
+        );
+    }
+
+    /// Names drawn from the allowed charset, at a length that straddles both
+    /// bounds of the window.
+    fn ascii_name() -> impl Strategy<Value = String> {
+        prop::collection::vec(prop::sample::select(b"abcXYZ019_.-".as_slice()), 0..=300)
+            .prop_map(|characters| characters.into_iter().map(char::from).collect())
+    }
+
+    proptest! {
+        #[test]
+        fn every_charset_conforming_name_is_accepted_exactly_inside_the_window(name in ascii_name()) {
+            let characters = name.chars().count();
+            let inside = (MIN_NAME_LEN..=MAX_NAME_LEN).contains(&characters);
+            prop_assert_eq!(
+                validate_table_name(&name).is_ok(),
+                inside,
+                "{} characters: {:?}",
+                characters,
+                name
+            );
+        }
+
+        #[test]
+        fn a_multi_byte_name_is_rejected_by_the_charset_rule(width in MIN_NAME_LEN..=MAX_NAME_LEN) {
+            let name = "ä".repeat(width);
+            let error = validate_table_name(&name)
+                .expect_err("a non-ASCII name has to be rejected")
+                .to_string();
+            prop_assert!(
+                error.contains("regular expression pattern"),
+                "{}",
+                error
+            );
+            prop_assert!(!error.contains("length"), "{}", error);
+        }
+    }
 
     #[test]
     fn echoes_a_value_that_fits_unchanged() {
