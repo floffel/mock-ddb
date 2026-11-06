@@ -34,6 +34,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::schema::{KeySchema, StreamViewType};
 use crate::Item;
@@ -74,6 +75,13 @@ impl StreamEventName {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamRecord {
     /// Event identifier, unique within the process.
+    ///
+    /// The id is `<millis>-<stream>-<sequence>`: the append's millisecond, a
+    /// discriminator every stream takes from one process-wide counter, and the
+    /// record's own sequence number. Two streams appending in the same
+    /// millisecond therefore never produce the same id, so a consumer that
+    /// deduplicates on `event_id` — a Lambda event source mapping does — cannot
+    /// drop a record written to a different table.
     pub event_id: String,
     /// What happened.
     pub event_name: StreamEventName,
@@ -103,7 +111,15 @@ pub(crate) struct StreamState {
     pub(crate) records: Vec<StreamRecord>,
     pub(crate) next_sequence: u64,
     pub(crate) view_type: StreamViewType,
+    /// Process-wide unique discriminator for this stream, part of every
+    /// `event_id` it issues.
+    discriminator: u64,
 }
+
+/// Hands out one discriminator per stream. A plain atomic counter, because the
+/// only requirement is that no two streams in the process share a value; the
+/// order they are handed out in is meaningless.
+static NEXT_STREAM_DISCRIMINATOR: AtomicU64 = AtomicU64::new(1);
 
 impl StreamState {
     pub(crate) fn new(table_name: &str, view_type: StreamViewType, sequence_origin: u64) -> Self {
@@ -114,6 +130,7 @@ impl StreamState {
             records: Vec::new(),
             next_sequence: sequence_origin,
             view_type,
+            discriminator: NEXT_STREAM_DISCRIMINATOR.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -130,7 +147,7 @@ impl StreamState {
         self.next_sequence += 1;
         let epoch_millis = date_time_suffix();
         self.records.push(StreamRecord {
-            event_id: format!("{epoch_millis}-{sequence}"),
+            event_id: event_id(epoch_millis, self.discriminator, sequence),
             event_name,
             table_name: table_name.to_string(),
             keys: key_map(key_schema, new_item.or(old_item)),
@@ -175,6 +192,18 @@ fn date_time_suffix() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis())
+}
+
+/// Build one record's event id: the append's millisecond, the stream's
+/// discriminator and the record's sequence number.
+///
+/// The millisecond alone cannot carry uniqueness — two tables write inside the
+/// same one all the time — and the sequence number is a per-stream counter, so
+/// two streams count through the same values. The discriminator is what keeps
+/// the ids of different streams apart; within one stream the sequence number
+/// does.
+fn event_id(epoch_millis: u128, discriminator: u64, sequence: u64) -> String {
+    format!("{epoch_millis}-{discriminator}-{sequence}")
 }
 
 impl StreamViewType {
@@ -586,6 +615,10 @@ pub struct StreamsRecordData {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamsRecord {
     /// Event identifier, unique within the process.
+    ///
+    /// Taken from the [`StreamRecord`] the page was built from, so it carries
+    /// that record's stream discriminator: two tables writing inside the same
+    /// millisecond still report distinct ids.
     pub event_id: String,
     /// What happened.
     pub event_name: StreamEventName,
@@ -705,4 +738,79 @@ fn byte_len(bytes: impl AsRef<[u8]>) -> u64 {
 
 fn byte_len_sum<'b>(values: impl Iterator<Item = &'b String>) -> u64 {
     values.fold(0, |sum, value| sum.saturating_add(byte_len(value)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use proptest::prelude::*;
+
+    #[test]
+    fn one_streams_ids_are_distinct_for_consecutive_sequences() {
+        // Inside the very same millisecond, which is the case the millisecond
+        // alone cannot cover.
+        let millis = 1_767_225_600_000;
+        assert_ne!(event_id(millis, 1, 0), event_id(millis, 1, 1));
+        assert_ne!(event_id(millis, 1, 1), event_id(millis, 1, 2));
+    }
+
+    #[test]
+    fn two_streams_at_the_same_millisecond_and_sequence_are_distinct() {
+        // The defect: both ids used to be `{millis}-{sequence}`, so a consumer
+        // deduplicating on them dropped one of the two writes.
+        let millis = 1_767_225_600_000;
+        assert_ne!(event_id(millis, 1, 7), event_id(millis, 2, 7));
+        assert_ne!(event_id(millis, 1, 7), event_id(millis, u64::MAX, 7));
+    }
+
+    #[test]
+    fn the_id_names_millisecond_stream_and_sequence() {
+        assert_eq!(event_id(1_767_225_600_000, 3, 42), "1767225600000-3-42");
+        assert_eq!(event_id(0, 1, 0), "0-1-0");
+        assert_eq!(
+            event_id(u128::MAX, u64::MAX, u64::MAX),
+            "340282366920938463463374607431768211455-18446744073709551615-18446744073709551615"
+        );
+    }
+
+    #[test]
+    fn every_stream_takes_its_own_discriminator() {
+        let first = StreamState::new("first", StreamViewType::KeysOnly, 1).discriminator;
+        let second = StreamState::new("second", StreamViewType::KeysOnly, 1).discriminator;
+        let third = StreamState::new("first", StreamViewType::KeysOnly, 1).discriminator;
+        assert_ne!(first, second);
+        assert_ne!(second, third);
+        assert_ne!(first, third);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// The id is injective on `(millisecond, stream, sequence)`: two ids
+        /// are equal exactly when all three components are. No combination of
+        /// a shared millisecond and a per-stream counter can collide.
+        #[test]
+        fn ids_are_injective_on_their_components(
+            left in (any::<u128>(), any::<u64>(), any::<u64>()),
+            right in (any::<u128>(), any::<u64>(), any::<u64>()),
+        ) {
+            let ids_equal = event_id(left.0, left.1, left.2) == event_id(right.0, right.1, right.2);
+            prop_assert_eq!(ids_equal, left == right);
+        }
+
+        /// The regression itself: inside one millisecond, two streams that
+        /// count through the same sequence values must still get different
+        /// ids.
+        #[test]
+        fn ids_stay_distinct_across_streams_inside_one_millisecond(
+            millis in any::<u128>(),
+            left in (any::<u64>(), any::<u64>()),
+            right in (any::<u64>(), any::<u64>()),
+        ) {
+            let ids_equal =
+                event_id(millis, left.0, left.1) == event_id(millis, right.0, right.1);
+            prop_assert_eq!(ids_equal, left == right);
+        }
+    }
 }

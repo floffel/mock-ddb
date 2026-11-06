@@ -109,6 +109,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Stream `event_id` is unique across every stream in the process, not just
+  inside one stream. The id was `<millis>-<sequence>`, and the sequence number
+  is a per-stream counter: two tables writing inside the same millisecond
+  produced byte-identical ids, so a consumer that deduplicates on `eventID` —
+  a Lambda event source mapping does — silently dropped the second record. The
+  id now carries a discriminator every stream takes from one process-wide
+  counter (`<millis>-<stream>-<sequence>`), which makes it unique across
+  streams and within one stream by construction; `StreamRecord::event_id` and
+  `StreamsRecord::event_id` state that scope. Two properties pin it: the id is
+  injective on its three components, and two streams sharing a millisecond and
+  a sequence value still differ.
 - `BatchGetItem` refuses a table that names the same primary key twice, with the
   service's `ValidationException` ("Provided list of item keys contains
   duplicates"). `KeysAndAttributes::keys` was a plain vector and the read looked
