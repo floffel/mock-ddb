@@ -105,6 +105,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   (`condition_expression`, `expression_attribute_values`, `scan_index_forward`,
   `return_values_on_condition_check_failure`, …), so an assertion written
   against the client keeps working.
+- **Responses are `#[non_exhaustive]`.** Every output's fields are public and
+  readable, and one is built with `Default` plus field assignment rather than a
+  struct literal — so a field the service adds to a response (the
+  `consumed_capacity` / `item_collection_metrics` pair was the last one) is a
+  minor release instead of a breaking change.
 - **Calls take a request struct** rather than the SDK's fluent builders:
   `mock.put_item(PutItemRequest::new("users", item).with_condition(...))`
   instead of `client.put_item().table_name(...).send()`.
