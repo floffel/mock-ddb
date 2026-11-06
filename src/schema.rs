@@ -315,6 +315,27 @@ impl StreamViewType {
 /// };
 /// assert!(specification.stream_enabled);
 /// ```
+///
+/// The two fields are kept consistent by [`MockDdb::create_table`]: a stream
+/// that is on needs a view type, and a view type without a stream is refused
+/// rather than silently dropped.
+///
+/// ```
+/// use mock_ddb::{CreateTableRequest, KeySchema, KeyType, MockDdb, StreamSpecification};
+///
+/// # #[tokio::main]
+/// # async fn main() {
+/// let request = CreateTableRequest {
+///     stream_specification: Some(StreamSpecification {
+///         stream_enabled: true,
+///         stream_view_type: None,
+///     }),
+///     ..CreateTableRequest::new("events", KeySchema::hash("pk", KeyType::String))
+/// };
+/// let error = MockDdb::new().create_table(request).await.unwrap_err();
+/// assert!(error.to_string().contains("StreamViewType"), "{error}");
+/// # }
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StreamSpecification {
     /// Whether the stream is on.
@@ -423,6 +444,7 @@ impl CreateTableRequest {
         let derived = self.derive_attribute_definitions()?;
         self.validate_index_names()?;
         self.validate_local_indexes()?;
+        self.validate_stream_specification()?;
         if self.attribute_definitions.is_empty() {
             return Ok(derived);
         }
@@ -548,6 +570,25 @@ impl CreateTableRequest {
                     index.index_name
                 )));
             }
+        }
+        Ok(())
+    }
+
+    /// A stream specification must be coherent: an enabled stream needs a view
+    /// type, and a view type has no meaning without an enabled stream.
+    fn validate_stream_specification(&self) -> Result<()> {
+        let Some(specification) = &self.stream_specification else {
+            return Ok(());
+        };
+        if specification.stream_enabled && specification.stream_view_type.is_none() {
+            return Err(Error::validation(
+                "One or more parameter values were invalid: StreamViewType must be specified when StreamEnabled is true",
+            ));
+        }
+        if !specification.stream_enabled && specification.stream_view_type.is_some() {
+            return Err(Error::validation(
+                "One or more parameter values were invalid: StreamViewType must not be specified when StreamEnabled is false",
+            ));
         }
         Ok(())
     }
