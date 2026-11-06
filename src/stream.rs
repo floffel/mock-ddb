@@ -871,6 +871,127 @@ mod tests {
 
     use proptest::prelude::*;
 
+    fn item_with(pk: &str, extra: Option<(&str, &str)>) -> Item {
+        let mut item = HashMap::from([("pk".to_string(), crate::s(pk))]);
+        if let Some((name, value)) = extra {
+            item.insert(name.to_string(), crate::s(value));
+        }
+        item
+    }
+
+    fn key_item(item: &Item) -> Item {
+        HashMap::from([("pk".to_string(), item["pk"].clone())])
+    }
+
+    const VIEW_TYPES: [StreamViewType; 4] = [
+        StreamViewType::KeysOnly,
+        StreamViewType::NewImage,
+        StreamViewType::OldImage,
+        StreamViewType::NewAndOldImages,
+    ];
+
+    const EVENT_NAMES: [StreamEventName; 3] = [
+        StreamEventName::Insert,
+        StreamEventName::Modify,
+        StreamEventName::Remove,
+    ];
+
+    fn keys_of(item: &Item) -> Item {
+        key_item(item)
+    }
+
+    #[test]
+    fn record_shape_matrix_covers_every_view_event_and_image_presence() {
+        let schema = KeySchema::hash("pk", crate::KeyType::String);
+        let old = item_with("u#1", Some(("state", "old")));
+        let new = item_with("u#1", Some(("state", "new")));
+
+        for view_type in VIEW_TYPES {
+            for event_name in EVENT_NAMES {
+                for (old_present, new_present) in
+                    [(false, false), (true, false), (false, true), (true, true)]
+                {
+                    let old_item = old_present.then_some(&old);
+                    let new_item = new_present.then_some(&new);
+                    let expected_new = matches!(
+                        view_type,
+                        StreamViewType::NewImage | StreamViewType::NewAndOldImages
+                    )
+                    .then(|| new.clone())
+                    .filter(|_| new_present);
+                    let expected_old = matches!(
+                        view_type,
+                        StreamViewType::OldImage | StreamViewType::NewAndOldImages
+                    )
+                    .then(|| old.clone())
+                    .filter(|_| old_present);
+                    let expected_keys = new_item.or(old_item).map_or_else(Item::new, key_item);
+
+                    let mut stream = StreamState::new("events", view_type, 1);
+                    stream.append("events", &schema, event_name, old_item, new_item);
+                    let record = stream.records.front().expect("one appended record");
+                    assert_eq!(record.event_name, event_name);
+                    assert_eq!(record.keys, expected_keys);
+                    assert_eq!(record.new_image, expected_new);
+                    assert_eq!(record.old_image, expected_old);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keys_only_still_carries_keys_for_empty_and_partial_schemas() {
+        let old = item_with("u#1", Some(("state", "old")));
+        let partial = HashMap::from([("pk".to_string(), crate::s("u#1"))]);
+        let composite =
+            KeySchema::hash_and_range("pk", crate::KeyType::String, "sk", crate::KeyType::String);
+
+        assert_eq!(key_map(&composite, Some(&old)), partial);
+        assert_eq!(key_map(&composite, None), Item::new());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn image_selectors_follow_the_full_view_and_presence_matrix(
+            view in prop_oneof![
+                Just(StreamViewType::KeysOnly),
+                Just(StreamViewType::NewImage),
+                Just(StreamViewType::OldImage),
+                Just(StreamViewType::NewAndOldImages),
+            ],
+            new_present in any::<bool>(),
+            old_present in any::<bool>(),
+            pk in "[a-z]{1,12}",
+        ) {
+            let new = item_with(&pk, Some(("state", "new")));
+            let old = item_with(&pk, Some(("state", "old")));
+            let new_input = new_present.then_some(&new);
+            let old_input = old_present.then_some(&old);
+            let expected_new = matches!(
+                view,
+                StreamViewType::NewImage | StreamViewType::NewAndOldImages
+            )
+            .then(|| new.clone())
+            .filter(|_| new_present);
+            let expected_old = matches!(
+                view,
+                StreamViewType::OldImage | StreamViewType::NewAndOldImages
+            )
+            .then(|| old.clone())
+            .filter(|_| old_present);
+
+            prop_assert_eq!(view.new_image(new_input), expected_new);
+            prop_assert_eq!(view.old_image(old_input), expected_old);
+            let selected = new_input.or(old_input);
+            prop_assert_eq!(
+                key_map(&KeySchema::hash("pk", crate::KeyType::String), selected),
+                selected.map_or_else(Item::new, keys_of)
+            );
+        }
+    }
+
     #[test]
     fn one_streams_ids_are_distinct_for_consecutive_sequences() {
         // Inside the very same millisecond, which is the case the millisecond
