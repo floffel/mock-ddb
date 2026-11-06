@@ -4,12 +4,14 @@
 #![cfg(feature = "streams")]
 
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::{Duration, UNIX_EPOCH};
 
 use mock_ddb::{
     item, n, s, CreateTableRequest, DeleteItemRequest, DescribeStreamRequest, Error,
     GetRecordsRequest, GetShardIteratorRequest, Item, KeySchema, KeyType, ListStreamsRequest,
-    MockDdb, PutItemRequest, ShardIteratorType, StreamViewType, MAX_RECORDS_PER_GET,
-    MAX_SHARDS_PER_DESCRIBE, MAX_STREAMS_PER_LIST, STREAM_CREATION_EPOCH_SECONDS, STREAM_REGION,
+    MockClock, MockDdb, PutItemRequest, ShardIteratorType, StreamViewType, MAX_RECORDS_PER_GET,
+    MAX_SHARDS_PER_DESCRIBE, MAX_STREAMS_PER_LIST, STREAM_REGION,
 };
 
 /// A mock holding `count` stream-enabled tables named `table_1`, `table_2`, …
@@ -71,7 +73,7 @@ async fn list_streams_reports_every_stream_with_its_label() {
         arns
     );
     assert_eq!(page.streams[0].table_name, "table_1");
-    assert_eq!(page.streams[0].stream_label, "2026-01-01T00:00:00.000");
+    assert!(page.streams[0].stream_label.starts_with("20"));
     assert_eq!(page.streams[0].stream_status, "ENABLED");
     assert!(page.last_evaluated_stream_arn.is_none());
 }
@@ -153,17 +155,14 @@ async fn describe_stream_reports_the_shard_and_the_view_type() {
         .unwrap()
         .stream_description;
     assert_eq!(description.stream_arn, arn);
-    assert_eq!(description.stream_label, "2026-01-01T00:00:00.000");
+    assert!(description.stream_label.starts_with("20"));
     assert_eq!(description.stream_status, "ENABLED");
     assert_eq!(description.table_name, "table_1");
     assert_eq!(
         description.stream_view_type,
         StreamViewType::NewAndOldImages
     );
-    assert_eq!(
-        description.creation_request_date_time,
-        STREAM_CREATION_EPOCH_SECONDS
-    );
+    assert!(description.creation_request_date_time > 0);
     assert_eq!(description.shards.len(), 1);
     assert_eq!(description.shards[0].shard_id, shard_id);
     assert!(description.shards[0].parent_shard_id.is_none());
@@ -541,6 +540,105 @@ async fn event_ids_are_disjoint_across_two_tables_writing_in_the_same_millisecon
             "the wire record repeats an id the other stream issued"
         );
     }
+}
+
+#[tokio::test]
+async fn stream_timestamps_follow_the_injected_clock() {
+    let clock = Arc::new(MockClock::at_epoch_seconds(1_700_000_000));
+    let mock = MockDdb::with_clock(clock.clone());
+    let created = mock
+        .create_table(
+            CreateTableRequest::new("events", KeySchema::hash("pk", KeyType::String))
+                .with_stream(StreamViewType::NewImage),
+        )
+        .await
+        .unwrap();
+    let arn = created.latest_stream_arn.unwrap();
+    assert!(arn.contains("/stream/2023-11-14T22:13:20.000-"));
+
+    mock.put_item(PutItemRequest::new("events", user("u#1")))
+        .await
+        .unwrap();
+    let first = mock.get_records(&arn).await.unwrap();
+    assert_eq!(first[0].approximate_creation_date_time, 1_700_000_000);
+    assert!(first[0].event_id.starts_with("1700000000000-"));
+
+    clock.advance(Duration::from_millis(1_234));
+    mock.put_item(PutItemRequest::new("events", user("u#2")))
+        .await
+        .unwrap();
+    let records = mock.get_records(&arn).await.unwrap();
+    assert_eq!(records[1].approximate_creation_date_time, 1_700_000_001);
+    assert!(records[1].event_id.starts_with("1700000001234-"));
+    assert_ne!(records[0].event_id, records[1].event_id);
+
+    let described = mock
+        .streams()
+        .describe_stream(DescribeStreamRequest::new(&arn))
+        .await
+        .unwrap()
+        .stream_description;
+    assert_eq!(described.creation_request_date_time, 1_700_000_000);
+    assert!(described
+        .stream_label
+        .starts_with("2023-11-14T22:13:20.000-"));
+}
+
+#[tokio::test]
+async fn a_recreated_table_gets_a_distinct_stream_arn() {
+    let clock = Arc::new(MockClock::at_epoch_seconds(1_700_000_000));
+    let mock = MockDdb::with_clock(clock);
+    let request = || {
+        CreateTableRequest::new("events", KeySchema::hash("pk", KeyType::String))
+            .with_stream(StreamViewType::KeysOnly)
+    };
+
+    let first = mock
+        .create_table(request())
+        .await
+        .unwrap()
+        .latest_stream_arn
+        .unwrap();
+    mock.put_item(PutItemRequest::new("events", user("u#1")))
+        .await
+        .unwrap();
+    mock.delete_table("events").await.unwrap();
+    let second = mock
+        .create_table(request())
+        .await
+        .unwrap()
+        .latest_stream_arn
+        .unwrap();
+
+    assert_ne!(first, second);
+    assert!(mock.get_records(&first).await.is_err());
+    assert_eq!(mock.get_records(&second).await.unwrap(), []);
+}
+
+#[tokio::test]
+async fn a_pre_epoch_clock_is_not_turned_into_an_epoch_stream() {
+    let clock = Arc::new(MockClock::new(UNIX_EPOCH - Duration::from_secs(1)));
+    let mock = MockDdb::with_clock(clock);
+    let error = mock
+        .create_table(
+            CreateTableRequest::new("events", KeySchema::hash("pk", KeyType::String))
+                .with_stream(StreamViewType::KeysOnly),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "InternalServerError");
+    assert!(mock.describe_table("events").await.is_err());
+
+    let midnight = Arc::new(MockClock::new(UNIX_EPOCH));
+    let mock = MockDdb::with_clock(midnight);
+    let created = mock
+        .create_table(
+            CreateTableRequest::new("events", KeySchema::hash("pk", KeyType::String))
+                .with_stream(StreamViewType::KeysOnly),
+        )
+        .await
+        .unwrap();
+    assert!(created.latest_stream_arn.is_some());
 }
 
 #[tokio::test]

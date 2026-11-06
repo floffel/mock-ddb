@@ -35,9 +35,11 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::clock::epoch_seconds;
 use crate::schema::{KeySchema, StreamViewType};
-use crate::Item;
+use crate::{Error, Item, Result};
 
 /// What a stream record reports happened to an item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,8 +97,7 @@ pub struct StreamRecord {
     /// When the change was appended, in seconds since the Unix epoch.
     ///
     /// The service rounds `ApproximateCreationDateTime` to whole seconds; so
-    /// does the mock, using the wall clock, because the stream log is written
-    /// outside the TTL clock path.
+    /// does the mock, using the injected [`Clock`](crate::Clock).
     pub approximate_creation_date_time: i64,
     /// The item after the write, subject to the stream's view type.
     pub new_image: Option<Item>,
@@ -111,6 +112,9 @@ pub(crate) struct StreamState {
     pub(crate) records: Vec<StreamRecord>,
     pub(crate) next_sequence: u64,
     pub(crate) view_type: StreamViewType,
+    /// Creation time in seconds since the Unix epoch, as reported by
+    /// `DescribeStream`.
+    pub(crate) creation_date_time: i64,
     /// Process-wide unique discriminator for this stream, part of every
     /// `event_id` it issues.
     discriminator: u64,
@@ -122,16 +126,24 @@ pub(crate) struct StreamState {
 static NEXT_STREAM_DISCRIMINATOR: AtomicU64 = AtomicU64::new(1);
 
 impl StreamState {
-    pub(crate) fn new(table_name: &str, view_type: StreamViewType, sequence_origin: u64) -> Self {
-        Self {
+    pub(crate) fn new(
+        table_name: &str,
+        view_type: StreamViewType,
+        sequence_origin: u64,
+        created_at: SystemTime,
+    ) -> Result<Self> {
+        let discriminator = NEXT_STREAM_DISCRIMINATOR.fetch_add(1, Ordering::Relaxed);
+        let label = stream_label(created_at)?;
+        Ok(Self {
             arn: format!(
-                "arn:aws:dynamodb:ddb-local:000000000000:table/{table_name}/stream/2026-01-01T00:00:00.000"
+                "arn:aws:dynamodb:{STREAM_REGION}:000000000000:table/{table_name}/stream/{label}-{discriminator}"
             ),
             records: Vec::new(),
             next_sequence: sequence_origin,
             view_type,
-            discriminator: NEXT_STREAM_DISCRIMINATOR.fetch_add(1, Ordering::Relaxed),
-        }
+            creation_date_time: epoch_seconds(created_at),
+            discriminator,
+        })
     }
 
     /// Append one record, filtering the images by the configured view type.
@@ -142,20 +154,23 @@ impl StreamState {
         event_name: StreamEventName,
         old_item: Option<&Item>,
         new_item: Option<&Item>,
-    ) {
+        now: SystemTime,
+    ) -> Result<()> {
+        let epoch_millis = epoch_millis(now)?;
+        let keys = key_map(key_schema, new_item.or(old_item))?;
         let sequence = self.next_sequence;
         self.next_sequence += 1;
-        let epoch_millis = date_time_suffix();
         self.records.push(StreamRecord {
             event_id: event_id(epoch_millis, self.discriminator, sequence),
             event_name,
             table_name: table_name.to_string(),
-            keys: key_map(key_schema, new_item.or(old_item)),
+            keys,
             sequence_number: format!("{sequence:021}"),
             approximate_creation_date_time: i64::try_from(epoch_millis / 1_000).unwrap_or(i64::MAX),
             new_image: self.view_type.new_image(new_item),
             old_image: self.view_type.old_image(old_item),
         });
+        Ok(())
     }
 
     /// The shard this stream exposes. The mock gives every stream one open
@@ -188,10 +203,51 @@ impl StreamState {
 
 /// Milliseconds since the Unix epoch, used to make event ids look like the
 /// service's.
-fn date_time_suffix() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis())
+fn epoch_millis(time: SystemTime) -> Result<u128> {
+    time.duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .map_err(|_| {
+            Error::internal("stream timestamps require a clock instant at or after the Unix epoch")
+        })
+}
+
+/// Render an instant as the millisecond-precision UTC timestamp a stream ARN
+/// carries, for example `2026-01-01T00:00:00.000`.
+fn stream_label(time: SystemTime) -> Result<String> {
+    let millis = epoch_millis(time)?;
+    let seconds = i64::try_from(millis / 1_000)
+        .map_err(|_| Error::internal("stream creation time is outside the supported range"))?;
+    let milliseconds = millis % 1_000;
+    let days = seconds.div_euclid(86_400);
+    let second_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = second_of_day / 3_600;
+    let minute = second_of_day % 3_600 / 60;
+    let second = second_of_day % 60;
+    Ok(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{milliseconds:03}"
+    ))
+}
+
+/// Convert days since 1970-01-01 to a proleptic Gregorian date.
+///
+/// Howard Hinnant's civil-from-days algorithm; accepted instants are at or
+/// after the Unix epoch, so `days` is non-negative.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let days = days + 719_468;
+    let era = days / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    (year, month, day)
 }
 
 /// Build one record's event id: the append's millisecond, the stream's
@@ -223,16 +279,20 @@ impl StreamViewType {
 }
 
 /// Extract the key attributes from an item, as a stream record reports them.
-fn key_map(key_schema: &KeySchema, item: Option<&Item>) -> Item {
+fn key_map(key_schema: &KeySchema, item: Option<&Item>) -> Result<Item> {
+    let item = item
+        .ok_or_else(|| Error::internal("stream record has no item from which to derive its key"))?;
     let mut keys = HashMap::new();
-    if let Some(item) = item {
-        for element in key_schema.elements() {
-            if let Some(value) = item.get(&element.attribute_name) {
-                keys.insert(element.attribute_name.clone(), value.clone());
-            }
-        }
+    for element in key_schema.elements() {
+        let value = item.get(&element.attribute_name).ok_or_else(|| {
+            Error::internal(format!(
+                "stream record is missing key attribute `{}`",
+                element.attribute_name
+            ))
+        })?;
+        keys.insert(element.attribute_name.clone(), value.clone());
     }
-    keys
+    Ok(keys)
 }
 
 // ---------------------------------------------------------------------------
@@ -253,8 +313,11 @@ pub const MAX_SHARDS_PER_DESCRIBE: u32 = 100;
 /// carry.
 pub const STREAM_REGION: &str = "ddb-local";
 
-/// The creation time every mock stream reports, in seconds since the Unix
-/// epoch: the `2026-01-01T00:00:00.000` the stream ARN ends with.
+/// The fixed creation time older mock versions reported for every stream.
+///
+/// Kept as a public constant for source compatibility. New streams derive
+/// their label and `DescribeStream` timestamp from the injected
+/// [`Clock`](crate::Clock), so this value is not what an ARN ends with.
 pub const STREAM_CREATION_EPOCH_SECONDS: i64 = 1_767_225_600;
 
 /// Where [`GetShardIteratorRequest`] starts reading.
@@ -776,12 +839,64 @@ mod tests {
 
     #[test]
     fn every_stream_takes_its_own_discriminator() {
-        let first = StreamState::new("first", StreamViewType::KeysOnly, 1).discriminator;
-        let second = StreamState::new("second", StreamViewType::KeysOnly, 1).discriminator;
-        let third = StreamState::new("first", StreamViewType::KeysOnly, 1).discriminator;
+        let created_at = UNIX_EPOCH + std::time::Duration::from_secs(1_767_225_600);
+        let first = StreamState::new("first", StreamViewType::KeysOnly, 1, created_at)
+            .unwrap()
+            .discriminator;
+        let second = StreamState::new("second", StreamViewType::KeysOnly, 1, created_at)
+            .unwrap()
+            .discriminator;
+        let third = StreamState::new("first", StreamViewType::KeysOnly, 1, created_at)
+            .unwrap()
+            .discriminator;
         assert_ne!(first, second);
         assert_ne!(second, third);
         assert_ne!(first, third);
+    }
+
+    #[test]
+    fn stream_label_uses_the_captured_creation_instant() {
+        let created_at = UNIX_EPOCH + std::time::Duration::from_millis(1_767_225_600_123);
+        assert_eq!(stream_label(created_at).unwrap(), "2026-01-01T00:00:00.123");
+    }
+
+    #[test]
+    fn a_pre_epoch_clock_is_an_explicit_stream_error() {
+        let before_epoch = UNIX_EPOCH - std::time::Duration::from_secs(1);
+        let error =
+            StreamState::new("events", StreamViewType::KeysOnly, 1, before_epoch).unwrap_err();
+        assert_eq!(error.code(), "InternalServerError");
+        assert!(error.to_string().contains("at or after the Unix epoch"));
+    }
+
+    #[test]
+    fn key_map_requires_an_item_and_every_key_attribute() {
+        let hash = KeySchema::hash("pk", crate::KeyType::String);
+        let no_item = key_map(&hash, None).unwrap_err();
+        assert!(no_item.to_string().contains("no item"));
+
+        let missing = Item::new();
+        let error = key_map(&hash, Some(&missing)).unwrap_err();
+        assert!(error.to_string().contains("missing key attribute `pk`"));
+
+        let mut one_key = Item::new();
+        one_key.insert("pk".to_string(), crate::s("u#1"));
+        assert_eq!(
+            key_map(&hash, Some(&one_key)).unwrap(),
+            one_key,
+            "a one-key stream reports exactly that key"
+        );
+
+        let composite =
+            KeySchema::hash_and_range("pk", crate::KeyType::String, "sk", crate::KeyType::Number);
+        let mut both_keys = Item::new();
+        both_keys.insert("pk".to_string(), crate::s("u#1"));
+        both_keys.insert("sk".to_string(), crate::n("7"));
+        assert_eq!(key_map(&composite, Some(&both_keys)).unwrap(), both_keys);
+
+        both_keys.remove("sk");
+        let error = key_map(&composite, Some(&both_keys)).unwrap_err();
+        assert!(error.to_string().contains("missing key attribute `sk`"));
     }
 
     proptest! {

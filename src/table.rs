@@ -118,7 +118,7 @@ impl Table {
         definition: TableDefinition,
         created_at: SystemTime,
         sequence_origin: u64,
-    ) -> Self {
+    ) -> Result<Self> {
         #[cfg(not(feature = "streams"))]
         let _ = sequence_origin;
         let mut indexes = IndexMap::new();
@@ -126,20 +126,16 @@ impl Table {
             indexes.insert(index.index_name.clone(), BTreeMap::new());
         }
         #[cfg(feature = "streams")]
-        let stream = definition
-            .stream_specification
-            .and_then(|(enabled, view_type)| {
-                if enabled {
-                    Some(StreamState::new(
-                        &definition.table_name,
-                        view_type.unwrap_or_default(),
-                        sequence_origin,
-                    ))
-                } else {
-                    None
-                }
-            });
-        Self {
+        let stream = match definition.stream_specification {
+            Some((true, view_type)) => Some(StreamState::new(
+                &definition.table_name,
+                view_type.unwrap_or_default(),
+                sequence_origin,
+                created_at,
+            )?),
+            Some((false, _)) | None => None,
+        };
+        Ok(Self {
             definition,
             items: ItemMap::new(),
             indexes,
@@ -147,7 +143,7 @@ impl Table {
             #[cfg(feature = "streams")]
             stream,
             created_at,
-        }
+        })
     }
 
     /// The table's key schema.
@@ -328,18 +324,32 @@ impl Table {
         event_name: StreamEventName,
         old_item: Option<&Item>,
         new_item: Option<&Item>,
-    ) {
+        now: SystemTime,
+    ) -> Result<()> {
         let table_name = self.definition.table_name.clone();
         let key_schema = self.definition.key_schema.clone();
         if let Some(stream) = self.stream.as_mut() {
-            stream.append(&table_name, &key_schema, event_name, old_item, new_item);
+            stream.append(
+                &table_name,
+                &key_schema,
+                event_name,
+                old_item,
+                new_item,
+                now,
+            )?;
         }
+        Ok(())
     }
 
     /// Hook for a write that created or replaced an item.
     // The receiver is only read when the `streams` feature is on.
     #[allow(clippy::unused_self)]
-    pub(crate) fn on_put(&mut self, previous: Option<&Item>, item: &Item) {
+    pub(crate) fn on_put(
+        &mut self,
+        previous: Option<&Item>,
+        item: &Item,
+        now: SystemTime,
+    ) -> Result<()> {
         #[cfg(feature = "streams")]
         {
             let event = if previous.is_some() {
@@ -347,34 +357,42 @@ impl Table {
             } else {
                 StreamEventName::Insert
             };
-            self.record(event, previous, Some(item));
+            self.record(event, previous, Some(item), now)?;
         }
         #[cfg(not(feature = "streams"))]
         {
-            let _ = (previous, item);
+            let _ = (previous, item, now);
         }
+        Ok(())
     }
 
     /// Hook for an update of an existing item.
     #[allow(clippy::unused_self)]
-    pub(crate) fn on_update(&mut self, previous: Option<&Item>, item: &Item) {
+    pub(crate) fn on_update(
+        &mut self,
+        previous: Option<&Item>,
+        item: &Item,
+        now: SystemTime,
+    ) -> Result<()> {
         #[cfg(feature = "streams")]
-        self.record(StreamEventName::Modify, previous, Some(item));
+        self.record(StreamEventName::Modify, previous, Some(item), now)?;
         #[cfg(not(feature = "streams"))]
         {
-            let _ = (previous, item);
+            let _ = (previous, item, now);
         }
+        Ok(())
     }
 
     /// Hook for a delete.
     #[allow(clippy::unused_self)]
-    pub(crate) fn on_delete(&mut self, item: &Item) {
+    pub(crate) fn on_delete(&mut self, item: &Item, now: SystemTime) -> Result<()> {
         #[cfg(feature = "streams")]
-        self.record(StreamEventName::Remove, Some(item), None);
+        self.record(StreamEventName::Remove, Some(item), None, now)?;
         #[cfg(not(feature = "streams"))]
         {
-            let _ = item;
+            let _ = (item, now);
         }
+        Ok(())
     }
 
     /// Read an item's key attributes without rejecting extra attributes, which
@@ -588,7 +606,7 @@ mod tests {
             KeySchema::hash_and_range("pk", KeyType::String, "sk", KeyType::String),
         );
         let definition = TableDefinition::from_request(&request).unwrap();
-        Table::new(definition, SystemTime::UNIX_EPOCH, 1)
+        Table::new(definition, SystemTime::UNIX_EPOCH, 1).unwrap()
     }
 
     #[test]
@@ -603,7 +621,8 @@ mod tests {
             },
             SystemTime::UNIX_EPOCH,
             1,
-        );
+        )
+        .unwrap();
 
         let mut item = Item::new();
         item.insert("pk".into(), crate::s("u#1"));
