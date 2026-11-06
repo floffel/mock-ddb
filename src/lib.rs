@@ -96,7 +96,6 @@
 //!   `return_item_collection_metrics` reports the collection a write touched,
 //!   but there is no provisioned throughput, no throttling, no
 //!   `ProvisionedThroughputExceededException` and no 10 GB collection limit.
-//! - A `Query` without a key condition returns every item instead of failing.
 //! - An idempotency token is remembered for ten minutes on the injected clock,
 //!   as on the service, and a resubmitted token with different actions is
 //!   refused with `IdempotentParameterMismatchException`. A replay returns an

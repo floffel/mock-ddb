@@ -226,6 +226,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `Query` without a key condition is rejected instead of returning every item.
+  `key_condition_expression` is an `Option`, and `None` used to read the whole
+  table in key order: a request the service answers with a `ValidationException`
+  (`Value null at 'keyConditionExpression' … Member must not be null`), so a
+  request built from `QueryRequest::default()` passed here and failed against
+  DynamoDB, and a test asserting on the returned set silently asserted against
+  the whole table instead of one partition. The read path now fails closed with
+  the service's message before the table is looked up; when a test really means
+  every item, `scan` is the operation for it.
 - `BatchGetItemRequest::add` returns `Result<Self>`: it appends the keys of a
   second call for a table instead of replacing the first call's
   `KeysAndAttributes`, and a second call whose lookup options disagree with the
