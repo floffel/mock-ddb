@@ -6,6 +6,35 @@
 //! real client to the mock is a matter of calling `mock.put_item(request)`
 //! instead of `client.put_item().set_…().send()`.
 //!
+//! Responses are `#[non_exhaustive]`: every field is public and readable, but a
+//! caller builds one with `Default` and field assignment, not with a struct
+//! literal. A response field the service adds later — another capacity
+//! breakdown, another cursor — is therefore a minor release instead of a
+//! breaking one for every test that spelled the literal out.
+//!
+//! ```
+//! use mock_ddb::QueryOutput;
+//!
+//! let mut output = QueryOutput::default();
+//! output.count = 3;
+//! assert_eq!(output.count, 3);
+//! assert!(output.consumed_capacity.is_none());
+//! ```
+//!
+//! The literal form is rejected, which is what makes the guarantee above hold:
+//!
+//! ```compile_fail
+//! use mock_ddb::QueryOutput;
+//!
+//! let output = QueryOutput {
+//!     items: Vec::new(),
+//!     count: 0,
+//!     scanned_count: 0,
+//!     last_evaluated_key: None,
+//!     consumed_capacity: None,
+//! };
+//! ```
+//!
 //! ```
 //! use mock_ddb::{GetItemRequest, KeySchema, KeyType, MockDdb, PutItemRequest, item, s};
 //!
@@ -227,6 +256,7 @@ impl PutItemRequest {
 
 /// `PutItem` output.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct PutItemOutput {
     /// The previous item, when `ReturnValues::AllOld` was requested.
     pub attributes: Option<Item>,
@@ -289,6 +319,7 @@ impl GetItemRequest {
 
 /// `GetItem` output. `item` is `None` when the key is absent or expired.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct GetItemOutput {
     /// The item, if it exists.
     pub item: Option<Item>,
@@ -386,6 +417,7 @@ impl DeleteItemRequest {
 
 /// `DeleteItem` output.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct DeleteItemOutput {
     /// The deleted item, when `ReturnValues::AllOld` was requested.
     pub attributes: Option<Item>,
@@ -489,6 +521,7 @@ impl UpdateItemRequest {
 
 /// `UpdateItem` output.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct UpdateItemOutput {
     /// The attributes selected by `return_values`.
     pub attributes: Option<Item>,
@@ -622,6 +655,7 @@ impl QueryRequest {
 
 /// `Query` output.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct QueryOutput {
     /// Matching items, in key order.
     pub items: Vec<Item>,
@@ -750,6 +784,7 @@ impl ScanRequest {
 
 /// `Scan` output.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct ScanOutput {
     /// Matching items.
     pub items: Vec<Item>,
@@ -827,6 +862,7 @@ impl BatchWriteItemRequest {
 
 /// `BatchWriteItem` output.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct BatchWriteItemOutput {
     /// Writes the call did not process. Empty unless the mock was throttled
     /// with [`MockDdb::throttle_next_batch_write`](crate::MockDdb::throttle_next_batch_write).
@@ -997,6 +1033,7 @@ impl BatchGetItemRequest {
 
 /// `BatchGetItem` output.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct BatchGetItemOutput {
     /// Table name → found items, in request order. Missing keys are omitted.
     pub responses: BTreeMap<String, Vec<Item>>,
@@ -1241,6 +1278,7 @@ impl TransactWriteItemsRequest {
 /// A transaction writes to several tables at once, so the capacity is one entry
 /// per table, in table-name order.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct TransactWriteItemsOutput {
     /// One entry per table the transaction wrote to, when requested.
     pub consumed_capacity: Vec<ConsumedCapacity>,
@@ -1302,6 +1340,7 @@ impl TransactGetItemsRequest {
 
 /// `TransactGetItems` output.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct TransactGetItemsOutput {
     /// One entry per request, in order. `None` when the key was absent.
     pub responses: Vec<Option<Item>>,
@@ -1377,6 +1416,7 @@ pub struct ListTablesRequest {
 
 /// `ListTables` output.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct ListTablesOutput {
     /// Table names, sorted.
     pub table_names: Vec<String>,

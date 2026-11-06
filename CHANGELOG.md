@@ -90,6 +90,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   explicitly, points equality at `==` (which compares entries, not order) and a
   golden or log assertion at `ordered_item`.
 
+### Changed
+
+- Every response type is `#[non_exhaustive]`: the eleven data-plane outputs
+  (`PutItemOutput`, `GetItemOutput`, `DeleteItemOutput`, `UpdateItemOutput`,
+  `QueryOutput`, `ScanOutput`, `BatchWriteItemOutput`, `BatchGetItemOutput`,
+  `TransactWriteItemsOutput`, `TransactGetItemsOutput`, `ListTablesOutput`), the
+  four Streams outputs (`ListStreamsOutput`, `DescribeStreamOutput`,
+  `GetShardIteratorOutput`, `GetRecordsOutput`) and `TableDescription` (the
+  value `create_table`, `describe_table` and `delete_table` return). Every field
+  stays public and readable; a response that has a `Default` is built from it
+  plus field assignment rather than a struct literal, and a `compile_fail`
+  doctest pins that the literal no longer compiles. Growing a response with a
+  field the service
+  offers — the last such pair was `consumed_capacity` /
+  `item_collection_metrics` — used to be a breaking change for every caller
+  that wrote the literal out; from here it is a minor release.
+
 ### Fixed
 
 - `BatchGetItem` refuses a table that names the same primary key twice, with the

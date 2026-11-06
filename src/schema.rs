@@ -576,6 +576,10 @@ impl CreateTableRequest {
 /// `table_status` is always `ACTIVE`: the mock has no async table lifecycle, so
 /// a table exists the moment `create_table` returns.
 ///
+/// Like every other response type it is `#[non_exhaustive]`: every field is
+/// readable and the mock is the only place that builds one, so a field the
+/// service reports later does not break a caller.
+///
 /// ```
 /// use mock_ddb::{KeyType, MockDdb, CreateTableRequest, KeySchema};
 ///
@@ -594,6 +598,7 @@ impl CreateTableRequest {
 /// # }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TableDescription {
     /// Table name.
     pub table_name: String,

@@ -7,6 +7,10 @@
 //! `DescribeStream`, `GetShardIterator` and `GetRecords`, with the shard
 //! iterators and paging the DynamoDB Streams Kinesis Adapter speaks.
 //!
+//! The wire API's outputs are `#[non_exhaustive]` like the data-plane ones: a
+//! caller reads every field but builds one with `Default` and field assignment,
+//! so a field the service grows does not break a caller that spelled a literal.
+//!
 //! ```
 //! use mock_ddb::{s, CreateTableRequest, KeySchema, KeyType, MockDdb, PutItemRequest, StreamViewType, item};
 //!
@@ -345,6 +349,7 @@ pub struct StreamSummary {
 
 /// `ListStreams` output.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ListStreamsOutput {
     /// The page of streams, sorted by ARN.
     pub streams: Vec<StreamSummary>,
@@ -439,6 +444,7 @@ pub struct StreamDescription {
 
 /// `DescribeStream` output.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DescribeStreamOutput {
     /// The stream's description.
     pub stream_description: StreamDescription,
@@ -496,6 +502,7 @@ impl GetShardIteratorRequest {
 
 /// `GetShardIterator` output.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct GetShardIteratorOutput {
     /// The opaque token [`GetRecordsRequest`] takes. Feed it back unchanged;
     /// its shape is not part of the API.
@@ -594,6 +601,7 @@ pub struct StreamsRecord {
 
 /// `GetRecords` output.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct GetRecordsOutput {
     /// The page of records, in write order.
     pub records: Vec<StreamsRecord>,
