@@ -201,10 +201,7 @@ that changes what a caller must do is called out.
    `ValidationException` (the mock charges the same bytes the service does).
    The 10 GB local-index collection limit is not modelled, although the error
    variant exists for callers that match on error classes.
-5. **`Query` without a key condition is allowed.** The service requires one.
-   The mock returns every item in key order, which is what tests that want to
-   inspect a whole table actually mean.
-6. **A wrongly typed operand of `begins_with`/`contains`/`size` is rejected.** A
+5. **A wrongly typed operand of `begins_with`/`contains`/`size` is rejected.** A
    number where a string prefix belongs, a string prefix on a binary, a set
    needle of a type the set cannot hold, `size()` of a number: the service
    raises `ValidationException`
@@ -213,11 +210,11 @@ that changes what a caller must do is called out.
    `size(NULL) > :n`, an expression on a missing attribute — still evaluate to
    false. Conditions are also rejected for malformed syntax, unknown aliases
    and undefined values.
-7. **TTL deletes lazily.** An expired item is invisible to `get_item`, `query`,
+6. **TTL deletes lazily.** An expired item is invisible to `get_item`, `query`,
    `scan`, `dump` and `count` the moment its timestamp passes, but its row is
    only removed when it is read or `purge_expired` runs. The service deletes
    within 48 hours in the background.
-8. **Streams are one open shard with unlimited retention.** A table's log is
+7. **Streams are one open shard with unlimited retention.** A table's log is
    readable through the in-process `get_records`/`list_streams` helpers or
    through `MockDdb::streams()`, which speaks `ListStreams`, `DescribeStream`,
    `GetShardIterator` and `GetRecords` with their real shapes, limits and
@@ -226,7 +223,7 @@ that changes what a caller must do is called out.
    the service keeps 24 hours and closes a shard after four hours without
    traffic. There are no shard splits, so `ParentShardId` is always absent and
    `DescribeStream` returns exactly one shard.
-9. **Transaction conflicts do not happen.** Nothing else writes concurrently
+8. **Transaction conflicts do not happen.** Nothing else writes concurrently
    inside the mock, so a transaction either commits or is cancelled by a failed
    condition. `ClientRequestToken` follows the service: the transaction that
    spends a token is remembered for ten minutes on the mock's clock, a replay of
@@ -236,7 +233,7 @@ that changes what a caller must do is called out.
    `ConsumedCapacity`/`ItemCollectionMetrics`, and only a transaction that
    applied spends its token, so a retry of a cancelled one re-evaluates the
    conditions.
-10. **Batch writes are all-or-nothing unless a test asks otherwise.** Up to 25
+9. **Batch writes are all-or-nothing unless a test asks otherwise.** Up to 25
     writes are validated first and then applied; `UnprocessedItems` and
     `UnprocessedKeys` are empty by default, where the service can return
     unprocessed work under load. A test that has to exercise the caller's
@@ -244,31 +241,31 @@ that changes what a caller must do is called out.
     `throttle_next_batch_write` / `throttle_next_batch_get`: the next batch call
     leaves a prefix of the writes or keys unprocessed (no capacity charged, the
     rest applied or read) and every later call runs unthrottled again.
-11. **Update expressions read the pre-update image.** All right-hand sides are
+10. **Update expressions read the pre-update image.** All right-hand sides are
     evaluated against the item as it was before the first clause, so
     `SET a = b, b = a` swaps. This matches the service's single atomic update
     and makes an update's result independent of clause order.
-12. **Parallel scan segments are hash-based.** Items are assigned to a segment
+11. **Parallel scan segments are hash-based.** Items are assigned to a segment
     by an FNV-1a hash of the primary key, so segments are disjoint and stable
     across runs; the service's split is internal.
-13. **Numbers are exact decimals.** 38 significant digits and the documented
+12. **Numbers are exact decimals.** 38 significant digits and the documented
     exponent range (`1E-130` … `9.99E+125`) are enforced, `"1.0"` and `"1"` are
     the same value (and the same key), and arithmetic is exact — no `f64`
     rounding. A number outside the range is a validation error, never an
     oversized allocation.
-14. **Reserved-word quoting uses placeholders.** DynamoDB's reserved-word list
+13. **Reserved-word quoting uses placeholders.** DynamoDB's reserved-word list
     is not modelled: a bare attribute name is accepted whenever it is not a
     keyword of the expression grammar itself (`AND`, `BETWEEN`, `SET`, …). Use
     `#alias` for those.
-15. **Table names are validated** against the documented pattern and length
+14. **Table names are validated** against the documented pattern and length
     (3–255 characters, `[a-zA-Z0-9_.-]+`), so a test cannot pass with a name the
     service would reject.
-16. **A `SELECT` whose `WHERE` does not pin the partition key scans.** The
+15. **A `SELECT` whose `WHERE` does not pin the partition key scans.** The
     service raises `ValidationException` for such a statement; the mock reads
     the table with a `Scan` instead, which is what a test that wants to inspect
     a whole table actually means. A `WHERE` that does pin it becomes a `Query`,
     so ordering, `Limit` and `NextToken` behave like the native call.
-17. **PartiQL covers DynamoDB's dialect, not full PartiQL.** `RETURNING`,
+16. **PartiQL covers DynamoDB's dialect, not full PartiQL.** `RETURNING`,
     `ORDER BY`, aggregates, joins and multi-statement strings are absent from
     the service's dialect too and are rejected with the service's
     `ValidationException`. An `INSERT` on an existing primary key is a

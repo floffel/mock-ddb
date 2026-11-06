@@ -227,8 +227,7 @@ async fn query_projection_and_count_select() {
 }
 
 #[tokio::test]
-async fn query_without_key_condition_returns_everything() {
-    // Documented divergence: the service requires a key condition.
+async fn query_without_key_condition_is_rejected() {
     let mock = orders();
     mock.put_item(mock_ddb::PutItemRequest::new(
         "orders",
@@ -243,14 +242,39 @@ async fn query_without_key_condition_returns_everything() {
     .await
     .unwrap();
 
-    let page = mock
+    // Outside: no condition at all is what the service rejects, so the mock has
+    // to fail closed instead of reading the whole table.
+    let missing = mock
         .query(QueryRequest {
             table_name: "orders".to_string(),
             ..QueryRequest::default()
         })
         .await
+        .expect_err("a query needs a key condition");
+    assert_eq!(missing.code(), "ValidationException");
+    assert_eq!(
+        missing.to_string(),
+        "1 validation error detected: Value null at 'keyConditionExpression' failed to satisfy constraint: Member must not be null"
+    );
+
+    // Outside, the other side of the boundary: an empty string is present but is
+    // not a condition, so it fails as a malformed expression instead.
+    let empty = mock
+        .query(QueryRequest::new("orders", ""))
+        .await
+        .expect_err("an empty key condition is not a condition");
+    assert_eq!(empty.code(), "ValidationException");
+
+    // Inside: the same table with a condition still reads that partition, so the
+    // rejections above are the condition and not a broken query path.
+    let page = mock
+        .query(
+            QueryRequest::new("orders", "pk = :pk")
+                .with_values(values([(":pk", s("customer#c1"))])),
+        )
+        .await
         .unwrap();
-    assert_eq!(page.count, 2);
+    assert_eq!(page.count, 1);
 }
 
 #[tokio::test]

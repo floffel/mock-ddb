@@ -1029,20 +1029,30 @@ impl MockDdb {
     /// # Errors
     ///
     /// Returns [`Error::ResourceNotFound`] for an unknown table or index,
-    /// [`Error::Validation`] for a key condition that does not constrain the
-    /// partition key or references a non-key attribute, and for a malformed
-    /// filter or projection.
+    /// [`Error::Validation`] for a missing key condition, for a key condition
+    /// that does not constrain the partition key or references a non-key
+    /// attribute, and for a malformed filter or projection.
     ///
     /// The expressions and every `#name`/`:value` they use are validated before
     /// the first item is read, so a page that reaches no item — an empty table,
     /// or one where the key condition or TTL leaves nothing — still rejects them
-    /// instead of returning an empty `Ok`.
+    /// instead of returning an empty `Ok`. A request without a key condition is
+    /// rejected the way the service rejects it rather than degrading into a
+    /// table-wide read; [`MockDdb::scan`] is the operation that reads everything.
     pub async fn query(&self, request: QueryRequest) -> Result<QueryOutput> {
         self.query_inner(&request)
     }
 
     pub(crate) fn query_inner(&self, request: &QueryRequest) -> Result<QueryOutput> {
         validate_limit(request.limit)?;
+        // Fail closed: the service rejects a `Query` without a key condition, so
+        // a request that drops one must not quietly become a table-wide read
+        // that a test then asserts against.
+        let Some(expression) = request.key_condition_expression.as_deref() else {
+            return Err(Error::validation(
+                "1 validation error detected: Value null at 'keyConditionExpression' failed to satisfy constraint: Member must not be null",
+            ));
+        };
         let now = self.epoch_now();
         let inner = self.inner.read();
         let table = inner
@@ -1063,14 +1073,11 @@ impl MockDdb {
             .clone()
             .unwrap_or_default();
 
-        let key_condition = match &request.key_condition_expression {
-            None => None,
-            Some(expression) => {
-                let condition = ConditionExpression::parse(expression)?;
-                validate_key_condition(condition.condition(), key_schema, &names)?;
-                condition.validate_maps(&names, &values)?;
-                Some(condition)
-            }
+        let key_condition = {
+            let condition = ConditionExpression::parse(expression)?;
+            validate_key_condition(condition.condition(), key_schema, &names)?;
+            condition.validate_maps(&names, &values)?;
+            Some(condition)
         };
         let (filter, projection) = read_expressions(
             request.filter_expression.as_deref(),

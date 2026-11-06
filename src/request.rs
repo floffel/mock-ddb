@@ -512,7 +512,9 @@ pub struct QueryRequest {
     pub table_name: String,
     /// Index to query instead of the table.
     pub index_name: Option<String>,
-    /// The key condition. The mock also accepts `None` and returns every item.
+    /// The key condition, required exactly as the service requires it: a
+    /// `Query` without one is rejected with a `ValidationException`, and
+    /// `scan` is the way to read a whole table.
     pub key_condition_expression: Option<String>,
     /// Optional filter applied after the key condition.
     pub filter_expression: Option<String>,
