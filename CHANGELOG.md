@@ -116,6 +116,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   specification vectors. Four-way and eight-way scans now receive items in
   every segment, where the common `("key-{n}", "{n}")` shape previously left
   all even segments empty.
+- Expression parsing now enforces the service's 300-operator/function limit in
+  addition to the 4096-byte text limit. Comparisons, `AND`/`OR`/`NOT`,
+  `BETWEEN`, `IN`, arithmetic, and expression function calls count; the `=` in
+  a SET assignment and syntax-only punctuation do not. Crossing the limit
+  returns the service's `ValidationException` with its stable
+  `operator count: 301`.
 - Stream `event_id` is unique across every stream in the process, not just
   inside one stream. The id was `<millis>-<sequence>`, and the sequence number
   is a per-stream counter: two tables writing inside the same millisecond
