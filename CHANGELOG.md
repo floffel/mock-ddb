@@ -226,6 +226,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `BatchGetItemRequest::add` returns `Result<Self>`: it appends the keys of a
+  second call for a table instead of replacing the first call's
+  `KeysAndAttributes`, and a second call whose lookup options disagree with the
+  first is a `ValidationException` rather than a silent override.
 - Number values are backed by `bigdecimal::BigDecimal` instead of a local
   hand-written decimal: ordering, equality, normalisation and `+`/`-` are the
   maintained crate's, so `"1.0"` equals `"1"` and 38-significant-digit

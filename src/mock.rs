@@ -1283,12 +1283,12 @@ impl MockDdb {
     /// let batch = BatchGetItemRequest::new().add(
     ///     "users",
     ///     KeysAndAttributes::new(vec![item([("pk", s("u#1"))]), item([("pk", s("u#2"))])]),
-    /// );
+    /// ).unwrap();
     /// let first = mock.batch_get_item(batch).await.unwrap();
     /// assert_eq!(first.responses["users"].len(), 1);
     /// assert_eq!(first.unprocessed_keys["users"].keys.len(), 1);
     ///
-    /// let retry = BatchGetItemRequest::new().add("users", first.unprocessed_keys["users"].clone());
+    /// let retry = BatchGetItemRequest::new().add("users", first.unprocessed_keys["users"].clone()).unwrap();
     /// let second = mock.batch_get_item(retry).await.unwrap();
     /// assert_eq!(second.responses["users"].len(), 1);
     /// assert!(second.unprocessed_keys.is_empty());
@@ -1479,7 +1479,8 @@ impl MockDdb {
     /// let response = mock
     ///     .batch_get_item(
     ///         BatchGetItemRequest::new()
-    ///             .add("users", KeysAndAttributes::new(vec![item([("pk", s("u#1"))])])),
+    ///             .add("users", KeysAndAttributes::new(vec![item([("pk", s("u#1"))])]))
+    ///             .unwrap(),
     ///     )
     ///     .await
     ///     .unwrap();
@@ -3710,6 +3711,7 @@ mod tests {
         .unwrap();
         let request = BatchGetItemRequest::new()
             .add("events", two_keys(["a", "b"]))
+            .unwrap()
             .with_return_consumed_capacity(ReturnConsumedCapacity::Total);
 
         mock.throttle_next_batch_get(1);
@@ -3725,8 +3727,9 @@ mod tests {
             vec![item([("pk", s("b")), ("sk", n("1"))])]
         );
 
-        let retry =
-            BatchGetItemRequest::new().add("events", first.unprocessed_keys["events"].clone());
+        let retry = BatchGetItemRequest::new()
+            .add("events", first.unprocessed_keys["events"].clone())
+            .unwrap();
         let second = mock.batch_get_item(retry).await.unwrap();
         assert!(second.unprocessed_keys.is_empty());
         assert_eq!(second.responses["events"].len(), 1);
@@ -3753,7 +3756,11 @@ mod tests {
 
         mock.throttle_next_batch_get(1);
         let first = mock
-            .batch_get_item(BatchGetItemRequest::new().add("events", attributes.clone()))
+            .batch_get_item(
+                BatchGetItemRequest::new()
+                    .add("events", attributes.clone())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert!(first.responses.is_empty());
@@ -3761,7 +3768,9 @@ mod tests {
 
         let retry = mock
             .batch_get_item(
-                BatchGetItemRequest::new().add("events", first.unprocessed_keys["events"].clone()),
+                BatchGetItemRequest::new()
+                    .add("events", first.unprocessed_keys["events"].clone())
+                    .unwrap(),
             )
             .await
             .unwrap();
@@ -3796,11 +3805,19 @@ mod tests {
         let mut attributes = two_keys(["a", "b"]);
         attributes.projection_expression = Some("pk, #missing".to_string());
         assert!(mock
-            .batch_get_item(BatchGetItemRequest::new().add("events", attributes))
+            .batch_get_item(
+                BatchGetItemRequest::new()
+                    .add("events", attributes)
+                    .unwrap()
+            )
             .await
             .is_err());
         let still_armed = mock
-            .batch_get_item(BatchGetItemRequest::new().add("events", two_keys(["a", "b"])))
+            .batch_get_item(
+                BatchGetItemRequest::new()
+                    .add("events", two_keys(["a", "b"]))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(still_armed.unprocessed_keys["events"].keys.len(), 1);
@@ -3816,7 +3833,11 @@ mod tests {
 
         // A read spends the read knob only, so the write knob still applies.
         let read = mock
-            .batch_get_item(BatchGetItemRequest::new().add("events", two_keys(["a", "b"])))
+            .batch_get_item(
+                BatchGetItemRequest::new()
+                    .add("events", two_keys(["a", "b"]))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(read.unprocessed_keys["events"].keys.len(), 1);
@@ -3826,7 +3847,11 @@ mod tests {
 
         // Both knobs are spent: these calls are whole again.
         assert!(mock
-            .batch_get_item(BatchGetItemRequest::new().add("events", two_keys(["a", "b"])))
+            .batch_get_item(
+                BatchGetItemRequest::new()
+                    .add("events", two_keys(["a", "b"]))
+                    .unwrap()
+            )
             .await
             .unwrap()
             .unprocessed_keys

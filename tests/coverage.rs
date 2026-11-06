@@ -130,10 +130,12 @@ fn request_builders_set_every_field() {
 
 #[test]
 fn batch_and_transaction_builders_set_every_field() {
-    let batch_get = BatchGetItemRequest::new().add(
-        "users",
-        KeysAndAttributes::new(vec![item([("pk", s("a"))])]).with_projection("pk"),
-    );
+    let batch_get = BatchGetItemRequest::new()
+        .add(
+            "users",
+            KeysAndAttributes::new(vec![item([("pk", s("a"))])]).with_projection("pk"),
+        )
+        .unwrap();
     assert_eq!(batch_get.request_items["users"].keys.len(), 1);
     assert!(batch_get.request_items["users"]
         .projection_expression
@@ -770,11 +772,16 @@ async fn batch_and_transaction_edge_limits() {
     // A batch get with a projection and a missing key.
     let response = mock
         .batch_get_item(
-            BatchGetItemRequest::new().add(
-                "users",
-                KeysAndAttributes::new(vec![item([("pk", s("u#1"))]), item([("pk", s("nope"))])])
+            BatchGetItemRequest::new()
+                .add(
+                    "users",
+                    KeysAndAttributes::new(vec![
+                        item([("pk", s("u#1"))]),
+                        item([("pk", s("nope"))]),
+                    ])
                     .with_projection("pk"),
-            ),
+                )
+                .unwrap(),
         )
         .await
         .unwrap();

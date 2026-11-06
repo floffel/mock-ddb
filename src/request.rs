@@ -24,6 +24,7 @@
 //! # }
 //! ```
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -32,7 +33,7 @@ use crate::capacity::{
     ConsumedCapacity, ItemCollectionMetrics, ReturnConsumedCapacity, ReturnItemCollectionMetrics,
 };
 use crate::schema::TableDescription;
-use crate::Item;
+use crate::{Error, Item, Result};
 
 /// Build an item from `(name, value)` pairs.
 ///
@@ -865,6 +866,38 @@ impl KeysAndAttributes {
     }
 }
 
+/// Merge the alias map a second [`BatchGetItemRequest::add`] brings for a
+/// table into the one the first call already sent.
+///
+/// The lookup options belong to the table, not to the call, so a second `add`
+/// may only widen them: aliases it repeats have to mean the same attribute, and
+/// any alias it adds is carried into the merged map. Returns the map the merged
+/// entry keeps.
+fn merged_aliases(
+    table_name: &str,
+    existing: &KeysAndAttributes,
+    added: &KeysAndAttributes,
+) -> Result<Option<HashMap<String, String>>> {
+    let Some(added_names) = added.expression_attribute_names.as_ref() else {
+        return Ok(existing.expression_attribute_names.clone());
+    };
+    let mut merged = existing
+        .expression_attribute_names
+        .clone()
+        .unwrap_or_default();
+    for (alias, name) in added_names {
+        if let Some(previous) = merged.get(alias) {
+            if previous != name {
+                return Err(Error::validation(format!(
+                    "1 validation error detected: Value at 'requestItems.{table_name}.expressionAttributeNames' failed to satisfy constraint: the alias `{alias}` names both `{previous}` and `{name}`"
+                )));
+            }
+        }
+        merged.insert(alias.clone(), name.clone());
+    }
+    Ok(Some(merged))
+}
+
 /// `BatchGetItem` input.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BatchGetItemRequest {
@@ -881,11 +914,70 @@ impl BatchGetItemRequest {
         Self::default()
     }
 
-    /// Add keys for one table.
-    #[must_use]
-    pub fn add(mut self, table_name: impl Into<String>, keys: KeysAndAttributes) -> Self {
-        self.request_items.insert(table_name.into(), keys);
-        self
+    /// Append keys for one table.
+    ///
+    /// Two calls for the same table add up: the keys of the second call follow
+    /// the keys of the first instead of replacing them, the way
+    /// [`BatchWriteItemRequest::add`] appends its writes. A batch built in
+    /// steps therefore reads every key it names; before, the second call
+    /// overwrote the first one's `KeysAndAttributes` and the request silently
+    /// shrank — a partly built batch that still passed the 1–100 key check.
+    ///
+    /// The lookup options belong to the table rather than to the call, so the
+    /// first call sets them and a second call has to agree: a different
+    /// `projection_expression`, or an alias that already names another
+    /// attribute, is a `ValidationException` instead of a silent override.
+    /// Aliases that do not overlap are merged, and `consistent_read` may
+    /// differ because the mock is always strongly consistent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] when this call's lookup options contradict
+    /// the ones an earlier call already sent for the same table: a different
+    /// `projection_expression` (including one call naming a projection and the
+    /// other none), or an alias that already maps to another attribute. The
+    /// keys are never silently dropped, so refusing the second call is the only
+    /// way to keep both calls' intent.
+    ///
+    /// ```
+    /// use mock_ddb::{BatchGetItemRequest, KeysAndAttributes, item, s};
+    ///
+    /// let batch = BatchGetItemRequest::new()
+    ///     .add("users", KeysAndAttributes::new(vec![item([("pk", s("u#1"))])]))
+    ///     .unwrap()
+    ///     .add("users", KeysAndAttributes::new(vec![item([("pk", s("u#2"))])]))
+    ///     .unwrap();
+    /// assert_eq!(batch.request_items["users"].keys.len(), 2);
+    ///
+    /// let conflict = BatchGetItemRequest::new()
+    ///     .add("users", KeysAndAttributes::new(vec![]).with_projection("pk"))
+    ///     .unwrap()
+    ///     .add(
+    ///         "users",
+    ///         KeysAndAttributes::new(vec![]).with_projection("pk, email"),
+    ///     );
+    /// assert_eq!(conflict.unwrap_err().code(), "ValidationException");
+    /// ```
+    pub fn add(mut self, table_name: impl Into<String>, keys: KeysAndAttributes) -> Result<Self> {
+        match self.request_items.entry(table_name.into()) {
+            Entry::Vacant(slot) => {
+                slot.insert(keys);
+            }
+            Entry::Occupied(mut slot) => {
+                let table_name = slot.key().clone();
+                let existing = slot.get_mut();
+                if existing.projection_expression != keys.projection_expression {
+                    return Err(Error::validation(format!(
+                        "1 validation error detected: Value at 'requestItems.{table_name}.projectionExpression' failed to satisfy constraint: two calls for one table have to name the same projection"
+                    )));
+                }
+                let aliases = merged_aliases(&table_name, existing, &keys)?;
+                existing.expression_attribute_names = aliases;
+                existing.keys.extend(keys.keys);
+                existing.consistent_read |= keys.consistent_read;
+            }
+        }
+        Ok(self)
     }
 
     /// Choose what the response reports about consumed capacity.
@@ -1291,6 +1383,145 @@ pub type DescribeTableOutput = TableDescription;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One key for `name` in the table the batch tests use.
+    fn batch_keys(name: &str) -> KeysAndAttributes {
+        KeysAndAttributes::new(vec![item([("pk", crate::s(name))])])
+    }
+
+    /// The same `KeysAndAttributes` with an `#alias` → attribute pair.
+    fn with_aliases(mut keys: KeysAndAttributes, pairs: &[(&str, &str)]) -> KeysAndAttributes {
+        let map = keys
+            .expression_attribute_names
+            .get_or_insert_with(HashMap::new);
+        for (alias, name) in pairs {
+            map.insert((*alias).to_string(), (*name).to_string());
+        }
+        keys
+    }
+
+    #[test]
+    fn two_adds_for_one_table_append_their_keys() {
+        let request = BatchGetItemRequest::new()
+            .add("t", batch_keys("a"))
+            .unwrap()
+            .add("t", batch_keys("b"))
+            .unwrap()
+            .add("t", batch_keys("c"))
+            .unwrap();
+
+        // One entry, three keys: the second and third `add` extend instead of
+        // replacing the first one's `KeysAndAttributes`.
+        assert_eq!(request.request_items.len(), 1);
+        assert_eq!(request.request_items["t"].keys.len(), 3);
+        assert_eq!(request.request_items["t"].keys[0]["pk"], crate::s("a"));
+        assert_eq!(request.request_items["t"].keys[2]["pk"], crate::s("c"));
+    }
+
+    #[test]
+    fn a_second_add_may_repeat_the_projection_but_not_change_it() {
+        let repeated = BatchGetItemRequest::new()
+            .add("t", batch_keys("a").with_projection("pk"))
+            .unwrap()
+            .add("t", batch_keys("b").with_projection("pk"))
+            .unwrap();
+        assert_eq!(repeated.request_items["t"].keys.len(), 2);
+        assert_eq!(
+            repeated.request_items["t"].projection_expression.as_deref(),
+            Some("pk")
+        );
+
+        // None against Some is as much a conflict as two different
+        // expressions: one of the two calls would have had its projection
+        // dropped.
+        let first_none = BatchGetItemRequest::new()
+            .add("t", batch_keys("a"))
+            .unwrap()
+            .add("t", batch_keys("b").with_projection("pk"))
+            .unwrap_err();
+        assert_eq!(first_none.code(), "ValidationException");
+        assert!(first_none.to_string().contains("projectionExpression"));
+
+        let second_none = BatchGetItemRequest::new()
+            .add("t", batch_keys("a").with_projection("pk"))
+            .unwrap()
+            .add("t", batch_keys("b"))
+            .unwrap_err();
+        assert_eq!(second_none.code(), "ValidationException");
+
+        let different = BatchGetItemRequest::new()
+            .add("t", batch_keys("a").with_projection("pk"))
+            .unwrap()
+            .add("t", batch_keys("b").with_projection("pk, email"))
+            .unwrap_err();
+        assert_eq!(different.code(), "ValidationException");
+    }
+
+    #[test]
+    fn a_second_add_merges_aliases_it_does_not_repeat() {
+        let disjoint = BatchGetItemRequest::new()
+            .add(
+                "t",
+                with_aliases(batch_keys("a").with_projection("#n"), &[("#n", "note")]),
+            )
+            .unwrap()
+            .add(
+                "t",
+                with_aliases(
+                    batch_keys("b").with_projection("#n"),
+                    &[("#n", "note"), ("#t", "title")],
+                ),
+            )
+            .unwrap();
+        let aliases = disjoint.request_items["t"]
+            .expression_attribute_names
+            .as_ref()
+            .expect("the merged entry keeps the alias map");
+        assert_eq!(aliases.len(), 2);
+        assert_eq!(aliases["#t"], "title");
+        assert_eq!(disjoint.request_items["t"].keys.len(), 2);
+    }
+
+    #[test]
+    fn a_second_add_refuses_an_alias_that_already_names_another_attribute() {
+        let conflict = BatchGetItemRequest::new()
+            .add(
+                "t",
+                with_aliases(batch_keys("a").with_projection("#n"), &[("#n", "note")]),
+            )
+            .unwrap()
+            .add(
+                "t",
+                with_aliases(batch_keys("b").with_projection("#n"), &[("#n", "title")]),
+            )
+            .unwrap_err();
+        assert_eq!(conflict.code(), "ValidationException");
+        assert!(conflict.to_string().contains("expressionAttributeNames"));
+    }
+
+    #[test]
+    fn a_second_add_keeps_a_consistent_read_the_first_one_asked_for() {
+        let mut first = batch_keys("a");
+        first.consistent_read = true;
+        let mut second = batch_keys("b");
+        second.consistent_read = false;
+
+        let request = BatchGetItemRequest::new()
+            .add("t", first)
+            .unwrap()
+            .add("t", second)
+            .unwrap();
+        assert!(request.request_items["t"].consistent_read);
+        assert_eq!(request.request_items["t"].keys.len(), 2);
+    }
+
+    #[test]
+    fn add_still_refuses_nothing_for_a_fresh_table() {
+        let request = BatchGetItemRequest::new()
+            .add("t", KeysAndAttributes::new(Vec::new()))
+            .unwrap();
+        assert!(request.request_items["t"].keys.is_empty());
+    }
 
     #[test]
     fn transaction_actions_carry_their_expressions() {

@@ -230,7 +230,9 @@ async fn batch_get_spans_tables_and_keeps_request_order() {
                     "orders",
                     KeysAndAttributes::new(vec![order_key("c1", 2), order_key("c1", 1)]),
                 )
-                .add("users", KeysAndAttributes::new(vec![user_key("u#1")])),
+                .unwrap()
+                .add("users", KeysAndAttributes::new(vec![user_key("u#1")]))
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -244,12 +246,69 @@ async fn batch_get_spans_tables_and_keeps_request_order() {
     assert_eq!(response.unprocessed_keys.len(), 0);
 
     let bad_key = mock
-        .batch_get_item(BatchGetItemRequest::new().add(
-            "orders",
-            KeysAndAttributes::new(vec![item([("pk", s("customer#c1"))])]),
-        ))
+        .batch_get_item(
+            BatchGetItemRequest::new()
+                .add(
+                    "orders",
+                    KeysAndAttributes::new(vec![item([("pk", s("customer#c1"))])]),
+                )
+                .unwrap(),
+        )
         .await;
     assert!(bad_key.is_err());
+}
+
+#[tokio::test]
+async fn a_batch_get_built_in_two_steps_reads_both_steps_keys() {
+    let mock = orders();
+    mock.seed("orders", vec![order("c1", 1, "1"), order("c1", 2, "2")])
+        .unwrap();
+
+    // The second `add` appends to the first. Before, it replaced the table's
+    // `KeysAndAttributes` and this batch read one key while claiming to read
+    // two, without an error anywhere.
+    let request = BatchGetItemRequest::new()
+        .add("orders", KeysAndAttributes::new(vec![order_key("c1", 1)]))
+        .unwrap()
+        .add("orders", KeysAndAttributes::new(vec![order_key("c1", 2)]))
+        .unwrap();
+    assert_eq!(request.request_items["orders"].keys.len(), 2);
+    let response = mock.batch_get_item(request).await.unwrap();
+    assert_eq!(response.responses["orders"].len(), 2);
+}
+
+#[tokio::test]
+async fn two_adds_that_together_overshoot_a_hundred_keys_are_refused() {
+    let mock = orders();
+    let first: Vec<_> = (1..=60).map(|id| order_key("c1", id)).collect();
+    let forty: Vec<_> = (61..=100).map(|id| order_key("c1", id)).collect();
+    let forty_one: Vec<_> = (61..=101).map(|id| order_key("c1", id)).collect();
+
+    let at_limit = BatchGetItemRequest::new()
+        .add("orders", KeysAndAttributes::new(first.clone()))
+        .unwrap()
+        .add("orders", KeysAndAttributes::new(forty))
+        .unwrap();
+    assert_eq!(at_limit.request_items["orders"].keys.len(), 100);
+    // An entry for a table with no matching item is omitted, so a batch read
+    // that matches nothing answers with nothing at all.
+    assert!(mock
+        .batch_get_item(at_limit)
+        .await
+        .unwrap()
+        .responses
+        .is_empty());
+
+    // One key past the limit is refused, and the merged keys are what the
+    // check counts.
+    let past_limit = BatchGetItemRequest::new()
+        .add("orders", KeysAndAttributes::new(first))
+        .unwrap()
+        .add("orders", KeysAndAttributes::new(forty_one))
+        .unwrap();
+    assert_eq!(past_limit.request_items["orders"].keys.len(), 101);
+    let err = mock.batch_get_item(past_limit).await.unwrap_err();
+    assert_eq!(err.code(), "ValidationException");
 }
 
 #[tokio::test]
