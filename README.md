@@ -262,9 +262,9 @@ that changes what a caller must do is called out.
     is not modelled: a bare attribute name is accepted whenever it is not a
     keyword of the expression grammar itself (`AND`, `BETWEEN`, `SET`, …). Use
     `#alias` for those.
-14. **Table names are validated** against the documented pattern and length
-    (3–255 characters, `[a-zA-Z0-9_.-]+`), so a test cannot pass with a name the
-    service would reject.
+14. **Table and index names are validated** against the documented pattern and
+    length (3–255 characters, `[a-zA-Z0-9_.-]+`), so a test cannot pass with a
+    name the service would reject.
 15. **A `SELECT` whose `WHERE` does not pin the partition key scans.** The
     service raises `ValidationException` for such a statement; the mock reads
     the table with a `Scan` instead, which is what a test that wants to inspect

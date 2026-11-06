@@ -191,6 +191,117 @@ async fn rejects(request: CreateTableRequest) -> bool {
     MockDdb::new().create_table(request).await.is_err()
 }
 
+/// The message the definition is rejected with.
+async fn rejection(request: CreateTableRequest) -> String {
+    MockDdb::new()
+        .create_table(request)
+        .await
+        .expect_err("the definition has to be rejected")
+        .to_string()
+}
+
+#[tokio::test]
+async fn index_names_carry_the_service_name_rule() {
+    // The service applies one rule to table and index names: 3 to 255
+    // characters out of [a-zA-Z0-9_.-]. An index name outside it used to create
+    // a mock table that a deploy would fail to create.
+    let base = CreateTableRequest::new(
+        "orders",
+        KeySchema::hash_and_range("pk", KeyType::String, "sk", KeyType::String),
+    );
+    let global = |name: String| {
+        base.clone().with_global_index(SecondaryIndex::new(
+            name,
+            KeySchema::hash("state", KeyType::String),
+        ))
+    };
+
+    // Lower length bound: one character short, then exactly the minimum.
+    let too_short = rejection(global("ab".to_string())).await;
+    assert!(
+        too_short.contains("globalSecondaryIndexes.1.member.indexName"),
+        "{too_short}"
+    );
+    assert!(
+        too_short.contains("length greater than or equal to 3"),
+        "{too_short}"
+    );
+    assert!(MockDdb::new()
+        .create_table(global("abc".to_string()))
+        .await
+        .is_ok());
+
+    // An empty name falls under the same rule instead of a separate message.
+    let empty = rejection(global(String::new())).await;
+    assert!(
+        empty.contains("globalSecondaryIndexes.1.member.indexName"),
+        "{empty}"
+    );
+    assert!(
+        empty.contains("length greater than or equal to 3"),
+        "{empty}"
+    );
+
+    // Upper length bound: exactly the maximum, then one character over.
+    assert!(MockDdb::new()
+        .create_table(global("a".repeat(255)))
+        .await
+        .is_ok());
+    let too_long = rejection(global("a".repeat(256))).await;
+    assert!(
+        too_long.contains("globalSecondaryIndexes.1.member.indexName"),
+        "{too_long}"
+    );
+    assert!(
+        too_long.contains("length less than or equal to 255"),
+        "{too_long}"
+    );
+
+    // Charset: every allowed character passes, one foreign character does not.
+    assert!(MockDdb::new()
+        .create_table(global("a.b_c-9".to_string()))
+        .await
+        .is_ok());
+    for forbidden in ["by email", "by@email", "by-emäil", "by\u{0}name"] {
+        let error = rejection(global(forbidden.to_string())).await;
+        assert!(
+            error.contains("regular expression pattern: [a-zA-Z0-9_.-]+"),
+            "{forbidden:?}: {error}"
+        );
+        assert!(
+            error.contains("globalSecondaryIndexes.1.member.indexName"),
+            "{forbidden:?}: {error}"
+        );
+    }
+
+    // A local index names its own path, and the member number is 1-based.
+    let local = base.clone().with_local_index(SecondaryIndex::new(
+        "xy",
+        KeySchema::hash_and_range("pk", KeyType::String, "lsi_sk", KeyType::String),
+    ));
+    let local_error = rejection(local).await;
+    assert!(
+        local_error.contains("localSecondaryIndexes.1.member.indexName"),
+        "{local_error}"
+    );
+
+    let second_index = base
+        .clone()
+        .with_global_index(SecondaryIndex::new(
+            "by-state",
+            KeySchema::hash("state", KeyType::String),
+        ))
+        .with_global_index(SecondaryIndex::new(
+            "no",
+            KeySchema::hash("city", KeyType::String),
+        ));
+    let second_error = rejection(second_index).await;
+    assert!(
+        second_error.contains("globalSecondaryIndexes.2.member.indexName"),
+        "{second_error}"
+    );
+}
+
 #[tokio::test]
 async fn a_local_index_needs_a_table_range_key() {
     // DynamoDB offers local secondary indexes only on tables with a range key,
