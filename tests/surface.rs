@@ -223,6 +223,43 @@ async fn a_local_index_needs_a_table_range_key() {
 }
 
 #[tokio::test]
+async fn one_attribute_cannot_hold_both_key_roles() {
+    // A schema whose sort key names the partition key's attribute leaves the
+    // primary key ambiguous and the derived definitions silently collapse the
+    // duplicate, so the table is refused instead of half-built.
+    let ambiguous = CreateTableRequest::new(
+        "events",
+        KeySchema::hash_and_range("pk", KeyType::String, "pk", KeyType::String),
+    );
+    let error = MockDdb::new().create_table(ambiguous).await.unwrap_err();
+    assert!(matches!(error, Error::Validation { .. }), "{error}");
+    let message = error.to_string();
+    assert!(message.contains("the table"), "{message}");
+    assert!(message.contains("attribute pk as both"), "{message}");
+    assert!(message.contains("both partition and sort key"), "{message}");
+
+    // Just inside: two attributes of the same type are accepted and both are
+    // derived, so the rejected case above is not a same-type artefact.
+    let distinct = CreateTableRequest::new(
+        "events",
+        KeySchema::hash_and_range("pk", KeyType::String, "sk", KeyType::String),
+    );
+    let description = MockDdb::new().create_table(distinct).await.unwrap();
+    assert_eq!(description.attribute_definitions.len(), 2);
+
+    // An index has the same constraint, and the error names the index.
+    let indexed = CreateTableRequest::new("events", KeySchema::hash("pk", KeyType::String))
+        .with_global_index(SecondaryIndex::new(
+            "by-time",
+            KeySchema::hash_and_range("at", KeyType::String, "at", KeyType::String),
+        ));
+    let error = MockDdb::new().create_table(indexed).await.unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("by-time"), "{message}");
+    assert!(message.contains("both partition and sort key"), "{message}");
+}
+
+#[tokio::test]
 async fn list_tables_paginates() {
     let mock = MockDdb::new();
     for name in ["tbl-a", "tbl-b", "tbl-c"] {

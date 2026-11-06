@@ -110,6 +110,9 @@ impl KeySchema {
     }
 
     /// A schema with both a partition and a sort key.
+    ///
+    /// The two must name different attributes: one attribute cannot hold both
+    /// key roles, and [`MockDdb::create_table`] rejects such a schema.
     #[must_use]
     pub fn hash_and_range(
         partition_name: impl Into<String>,
@@ -440,6 +443,7 @@ impl CreateTableRequest {
     /// should carry.
     pub(crate) fn validate(&self) -> Result<Vec<AttributeDefinition>> {
         validate_table_name(&self.table_name)?;
+        self.validate_key_schemas()?;
         self.validate_index_limits()?;
         let derived = self.derive_attribute_definitions()?;
         self.validate_index_names()?;
@@ -450,6 +454,37 @@ impl CreateTableRequest {
         }
         self.validate_declared_definitions(&derived)?;
         Ok(self.attribute_definitions.clone())
+    }
+
+    /// Every key schema must name two different attributes on its two roles.
+    ///
+    /// One attribute cannot be both the partition and the sort key: the
+    /// resulting primary key would be ambiguous, and the derived definitions
+    /// hide the duplicate because they collapse same-named attributes.
+    fn validate_key_schemas(&self) -> Result<()> {
+        let key_schemas = std::iter::once(("the table", &self.key_schema))
+            .chain(
+                self.global_secondary_indexes
+                    .iter()
+                    .map(|index| (index.index_name.as_str(), &index.key_schema)),
+            )
+            .chain(
+                self.local_secondary_indexes
+                    .iter()
+                    .map(|index| (index.index_name.as_str(), &index.key_schema)),
+            );
+        for (owner, schema) in key_schemas {
+            let Some(sort_key) = &schema.sort_key else {
+                continue;
+            };
+            if sort_key.attribute_name == schema.partition_key.attribute_name {
+                return Err(Error::validation(format!(
+                    "One or more parameter values were invalid: Key schema of {owner} uses attribute {} as both partition and sort key",
+                    sort_key.attribute_name
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Enforce the per-table index limits.
