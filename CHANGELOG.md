@@ -105,7 +105,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `get_records` cloned the entire log while the write lock was held. Shard
   iterators now carry an absolute log position, so `TRIM_HORIZON`,
   `AT_SEQUENCE_NUMBER` and a token taken before a trim all keep pointing at the
-  same record after the window has moved.
+  same record after the window has moved. The in-process `get_records` now
+  returns a point-in-time `StreamRecordSnapshot` backed by shared records, so a
+  read shares the retained log instead of deep-cloning every item image.
 
 - Every response type is `#[non_exhaustive]`: the eleven data-plane outputs
   (`PutItemOutput`, `GetItemOutput`, `DeleteItemOutput`, `UpdateItemOutput`,

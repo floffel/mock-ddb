@@ -49,7 +49,7 @@ use crate::Item;
 use crate::stream::{
     wire_record, DescribeStreamOutput, DescribeStreamRequest, GetRecordsOutput, GetRecordsRequest,
     GetShardIteratorOutput, GetShardIteratorRequest, ListStreamsOutput, ListStreamsRequest, Shard,
-    StreamDescription, StreamRecord, StreamState, StreamSummary, StreamsApi, StreamsRecord,
+    StreamDescription, StreamRecordSnapshot, StreamState, StreamSummary, StreamsApi, StreamsRecord,
     MAX_RECORDS_PER_GET, MAX_SHARDS_PER_DESCRIBE, MAX_STREAMS_PER_LIST,
 };
 
@@ -2237,10 +2237,9 @@ impl MockDdb {
     /// The log is bounded: a stream retains its most recent
     /// [`MAX_RETAINED_STREAM_RECORDS`](crate::MAX_RETAINED_STREAM_RECORDS)
     /// records and appending past that drops the oldest, so this returns at most
-    /// that many and never the whole write history. The records are cloned out
-    /// of the lock, which is what a reader that wants to hold them past the call
-    /// needs; a test that only counts them pays the same clone, bounded by the
-    /// same cap.
+    /// that many and never the whole write history. The snapshot shares the
+    /// retained records rather than deep-cloning their item images, so taking it
+    /// is cheap after the first read following a write.
     ///
     /// # Errors
     ///
@@ -2267,12 +2266,12 @@ impl MockDdb {
     /// assert_eq!(mock.get_records(&arn).await.unwrap().len(), 1);
     /// # }
     /// ```
-    pub async fn get_records(&self, stream_arn: &str) -> Result<Vec<StreamRecord>> {
+    pub async fn get_records(&self, stream_arn: &str) -> Result<StreamRecordSnapshot> {
         let inner = self.inner.read();
         for table in inner.tables.values() {
             if let Some(stream) = &table.stream {
                 if stream.arn == stream_arn {
-                    return Ok(stream.records.iter().cloned().collect());
+                    return Ok(stream.snapshot());
                 }
             }
         }

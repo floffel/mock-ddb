@@ -293,7 +293,7 @@ async fn at_and_after_sequence_number_differ_by_one_record() {
         .await
         .unwrap()
         .into_iter()
-        .map(|record| record.sequence_number)
+        .map(|record| record.sequence_number.clone())
         .collect();
     let streams = mock.streams();
 
@@ -531,7 +531,7 @@ async fn event_ids_are_disjoint_across_two_tables_writing_in_the_same_millisecon
         .await
         .unwrap()
         .into_iter()
-        .map(|record| record.event_id)
+        .map(|record| record.event_id.clone())
         .collect();
     for record in page.records {
         assert!(ids.contains(&record.event_id));
@@ -612,7 +612,7 @@ async fn a_recreated_table_gets_a_distinct_stream_arn() {
 
     assert_ne!(first, second);
     assert!(mock.get_records(&first).await.is_err());
-    assert_eq!(mock.get_records(&second).await.unwrap(), []);
+    assert!(mock.get_records(&second).await.unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -112,7 +112,8 @@
 //!   Streams API (`ListStreams`, `DescribeStream`, `GetShardIterator`,
 //!   `GetRecords`) is modelled in full, including its paging and limits; the
 //!   short [`MockDdb::get_records`] reader stays for tests that do not care
-//!   about iterators.
+//!   about iterators, and returns a [`StreamRecordSnapshot`] that shares the
+//!   retained records instead of deep-cloning them.
 //!
 //! The README carries the full supported/not-supported matrix and the reasoning
 //! behind each difference.
@@ -181,9 +182,10 @@ pub use stream::StreamEventName;
 pub use stream::{
     DescribeStreamOutput, DescribeStreamRequest, GetRecordsOutput, GetRecordsRequest,
     GetShardIteratorOutput, GetShardIteratorRequest, ListStreamsOutput, ListStreamsRequest,
-    SequenceNumberRange, Shard, ShardIteratorType, StreamDescription, StreamRecord, StreamSummary,
-    StreamsApi, StreamsRecord, StreamsRecordData, MAX_RECORDS_PER_GET, MAX_RETAINED_STREAM_RECORDS,
-    MAX_SHARDS_PER_DESCRIBE, MAX_STREAMS_PER_LIST, STREAM_CREATION_EPOCH_SECONDS, STREAM_REGION,
+    SequenceNumberRange, Shard, ShardIteratorType, StreamDescription, StreamRecord,
+    StreamRecordSnapshot, StreamSummary, StreamsApi, StreamsRecord, StreamsRecordData,
+    MAX_RECORDS_PER_GET, MAX_RETAINED_STREAM_RECORDS, MAX_SHARDS_PER_DESCRIBE,
+    MAX_STREAMS_PER_LIST, STREAM_CREATION_EPOCH_SECONDS, STREAM_REGION,
 };
 
 /// A DynamoDB item: attribute name → value.

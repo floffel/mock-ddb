@@ -228,7 +228,7 @@ async fn clear_records_empties_the_log() {
         .clone();
 
     mock.clear_records(&arn).unwrap();
-    assert_eq!(mock.get_records(&arn).await.unwrap(), []);
+    assert!(mock.get_records(&arn).await.unwrap().is_empty());
 
     let stale = mock
         .streams()
@@ -250,6 +250,25 @@ async fn clear_records_empties_the_log() {
         "sequence numbers must keep running: {} vs {last_before}",
         after[0].sequence_number
     );
+}
+
+/// A snapshot is a point-in-time view: later writes and a clear do not mutate it.
+#[tokio::test]
+async fn a_snapshot_stays_stable_after_writes_and_clear() {
+    let (mock, arn) = streamed().await;
+    write(&mock, 0, 1).await;
+    let snapshot = mock.get_records(&arn).await.unwrap();
+    assert_eq!(snapshot.len(), 1);
+    let original = pk_of(&snapshot[0]);
+
+    write(&mock, 1, 1).await;
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(pk_of(&snapshot[0]), original);
+    assert_eq!(mock.get_records(&arn).await.unwrap().len(), 2);
+
+    mock.clear_records(&arn).unwrap();
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(pk_of(&snapshot[0]), original);
 }
 
 /// Clearing a stream that does not exist is the same `ResourceNotFound` every

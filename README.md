@@ -227,12 +227,13 @@ that changes what a caller must do is called out.
    the mock has no clock for its log, so it trims by count instead: a stream
    keeps its most recent `MAX_RETAINED_STREAM_RECORDS` (10 000) records and an
    append past that drops the oldest, which keeps a test or a property run from
-   growing the mock with its whole write history. `clear_records` empties a log
-   outright. A shard iterator's position counts every record the stream ever
-   appended, so a token taken before a trim resumes at the oldest record still
-   retained rather than at one the trim removed. There are no shard splits, so
-   `ParentShardId` is always absent and `DescribeStream` returns exactly one
-   shard.
+   growing the mock with its whole write history. The in-process `get_records`
+   returns a point-in-time snapshot that shares the retained records instead of
+   deep-cloning their item images. `clear_records` empties a log outright. A
+   shard iterator's position counts every record the stream ever appended, so a
+   token taken before a trim resumes at the oldest record still retained rather
+   than at one the trim removed. There are no shard splits, so `ParentShardId`
+   is always absent and `DescribeStream` returns exactly one shard.
 8. **Transaction conflicts do not happen.** Nothing else writes concurrently
    inside the mock, so a transaction either commits or is cancelled by a failed
    condition. `ClientRequestToken` follows the service: the transaction that

@@ -717,7 +717,7 @@ mod stream_paging {
                     .await
                     .unwrap()
                     .into_iter()
-                    .map(|record| record.sequence_number)
+                    .map(|record| record.sequence_number.clone())
                     .collect();
                 assert_eq!(seen, expected);
                 assert!(
