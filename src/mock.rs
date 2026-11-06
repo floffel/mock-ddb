@@ -12,7 +12,7 @@
 //! the mock — cannot stretch the critical section or deadlock a task sharing a
 //! clone, and the write lock only ever covers the state transition itself.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
@@ -24,8 +24,8 @@ use crate::capacity::{
 use crate::clock::{epoch_seconds, Clock, SystemClock};
 use crate::error::{CancellationReason, CancellationReasonCode, Error, Result};
 use crate::expr::{
-    CmpOp, Condition, ConditionExpression, NameMap, Operand, ProjectionExpression,
-    ResolvedProjection, Segment, UpdateExpression, ValueMap,
+    validate_expression_maps, CmpOp, Condition, ConditionExpression, ExpressionUsage, NameMap,
+    Operand, ProjectionExpression, ResolvedProjection, Segment, UpdateExpression, ValueMap,
 };
 use crate::partiql::{
     BatchExecuteStatementOutput, BatchExecuteStatementRequest, ExecuteStatementOutput,
@@ -689,15 +689,21 @@ impl MockDdb {
         let previous = table.items.get(&key).cloned();
         let previous_live = previous.clone().filter(|item| !table.is_expired(item, now));
 
+        let names = request
+            .expression_attribute_names
+            .clone()
+            .unwrap_or_default();
+        let values = request
+            .expression_attribute_values
+            .clone()
+            .unwrap_or_default();
+        let mut usage = ExpressionUsage::default();
         if let Some(expression) = &request.condition_expression {
-            let names = request
-                .expression_attribute_names
-                .clone()
-                .unwrap_or_default();
-            let values = request
-                .expression_attribute_values
-                .clone()
-                .unwrap_or_default();
+            let condition = ConditionExpression::parse(expression)?;
+            usage.add_condition(condition.condition());
+        }
+        validate_expression_maps(&usage, &names, &values)?;
+        if let Some(expression) = &request.condition_expression {
             let condition = ConditionExpression::parse(expression)?;
             if !condition.evaluate(previous_live.as_ref(), &names, &values)? {
                 let item = if request.return_values_on_condition_check_failure {
@@ -781,19 +787,20 @@ impl MockDdb {
         // expression or an undefined `#alias` is rejected on a key the table
         // does not hold too — the service validates the request, not the
         // response.
+        let names = request
+            .expression_attribute_names
+            .clone()
+            .unwrap_or_default();
+        let mut usage = ExpressionUsage::default();
         let projection = match request.projection_expression.as_deref() {
             None => None,
             Some(expression) => {
-                let names = request
-                    .expression_attribute_names
-                    .clone()
-                    .unwrap_or_default();
-                Some(ResolvedProjection::new(
-                    &ProjectionExpression::parse(expression)?,
-                    &names,
-                )?)
+                let parsed = ProjectionExpression::parse(expression)?;
+                usage.add_projection(&parsed);
+                Some(ResolvedProjection::new(&parsed, &names)?)
             }
         };
+        validate_expression_maps(&usage, &names, &HashMap::new())?;
         let stored = table
             .items
             .get(&key)
@@ -865,15 +872,21 @@ impl MockDdb {
         let previous = table.items.get(&key).cloned();
         let previous_live = previous.clone().filter(|item| !table.is_expired(item, now));
 
+        let names = request
+            .expression_attribute_names
+            .clone()
+            .unwrap_or_default();
+        let values = request
+            .expression_attribute_values
+            .clone()
+            .unwrap_or_default();
+        let mut usage = ExpressionUsage::default();
         if let Some(expression) = &request.condition_expression {
-            let names = request
-                .expression_attribute_names
-                .clone()
-                .unwrap_or_default();
-            let values = request
-                .expression_attribute_values
-                .clone()
-                .unwrap_or_default();
+            let condition = ConditionExpression::parse(expression)?;
+            usage.add_condition(condition.condition());
+        }
+        validate_expression_maps(&usage, &names, &values)?;
+        if let Some(expression) = &request.condition_expression {
             let condition = ConditionExpression::parse(expression)?;
             if !condition.evaluate(previous_live.as_ref(), &names, &values)? {
                 let item = if request.return_values_on_condition_check_failure {
@@ -950,16 +963,26 @@ impl MockDdb {
         let previous = table.items.get(&key).cloned();
         let previous_live = previous.clone().filter(|item| !table.is_expired(item, now));
 
-        if let Some(expression) = &request.condition_expression {
-            let names = request
-                .expression_attribute_names
-                .clone()
-                .unwrap_or_default();
-            let values = request
-                .expression_attribute_values
-                .clone()
-                .unwrap_or_default();
-            let condition = ConditionExpression::parse(expression)?;
+        let names = request
+            .expression_attribute_names
+            .clone()
+            .unwrap_or_default();
+        let values = request
+            .expression_attribute_values
+            .clone()
+            .unwrap_or_default();
+        let condition = match &request.condition_expression {
+            Some(expression) => Some((expression, ConditionExpression::parse(expression)?)),
+            None => None,
+        };
+        let update = UpdateExpression::parse(&request.update_expression)?;
+        let mut usage = ExpressionUsage::default();
+        if let Some((_, condition)) = &condition {
+            usage.add_condition(condition.condition());
+        }
+        usage.add_update(update.update());
+        validate_expression_maps(&usage, &names, &values)?;
+        if let Some((expression, condition)) = condition {
             if !condition.evaluate(previous_live.as_ref(), &names, &values)? {
                 let item = if request.return_values_on_condition_check_failure {
                     previous_live
@@ -973,16 +996,6 @@ impl MockDdb {
                 ));
             }
         }
-
-        let names = request
-            .expression_attribute_names
-            .clone()
-            .unwrap_or_default();
-        let values = request
-            .expression_attribute_values
-            .clone()
-            .unwrap_or_default();
-        let update = UpdateExpression::parse(&request.update_expression)?;
         let mut item = match &previous_live {
             Some(existing) => existing.clone(),
             None => key_only_item(table.key_schema(), &request.key),
@@ -1092,9 +1105,11 @@ impl MockDdb {
             .expression_attribute_values
             .clone()
             .unwrap_or_default();
+        let mut usage = ExpressionUsage::default();
 
         let key_condition = {
             let condition = ConditionExpression::parse(expression)?;
+            usage.add_condition(condition.condition());
             validate_key_condition(condition.condition(), key_schema, &names)?;
             condition.validate_maps(&names, &values)?;
             Some(condition)
@@ -1105,6 +1120,13 @@ impl MockDdb {
             &names,
             &values,
         )?;
+        if let Some(filter) = &filter {
+            usage.add_condition(filter.condition());
+        }
+        if let Some(projection) = &projection {
+            usage.add_projection(projection.expression());
+        }
+        validate_expression_maps(&usage, &names, &values)?;
 
         let page = Page {
             limit: request.limit,
@@ -1217,6 +1239,14 @@ impl MockDdb {
             &names,
             &values,
         )?;
+        let mut usage = ExpressionUsage::default();
+        if let Some(filter) = &filter {
+            usage.add_condition(filter.condition());
+        }
+        if let Some(projection) = &projection {
+            usage.add_projection(projection.expression());
+        }
+        validate_expression_maps(&usage, &names, &values)?;
 
         let page = Page {
             limit: request.limit,
@@ -1563,13 +1593,16 @@ impl MockDdb {
                 .expression_attribute_names
                 .clone()
                 .unwrap_or_default();
+            let mut usage = ExpressionUsage::default();
             let projection = match &attributes.projection_expression {
                 None => None,
                 Some(expression) => {
                     let parsed = ProjectionExpression::parse(expression)?;
+                    usage.add_projection(&parsed);
                     Some(ResolvedProjection::new(&parsed, &names)?)
                 }
             };
+            validate_expression_maps(&usage, &names, &HashMap::new())?;
             let mut keys = Vec::with_capacity(attributes.keys.len());
             for key in &attributes.keys {
                 keys.push(table.lookup_key(key)?);
@@ -2015,14 +2048,30 @@ impl MockDdb {
                 request.transact_items.len()
             )));
         }
-        let mut responses = Vec::with_capacity(request.transact_items.len());
-        let mut breakdowns: BTreeMap<String, Breakdown> = BTreeMap::new();
+        let mut steps = Vec::with_capacity(request.transact_items.len());
         for get in &request.transact_items {
             let table = inner
                 .tables
                 .get(&get.table_name)
                 .ok_or_else(|| Error::table_not_found(&get.table_name))?;
             let key = table.lookup_key(&get.key)?;
+            let names = get.expression_attribute_names.clone().unwrap_or_default();
+            let mut usage = ExpressionUsage::default();
+            let projection = match get.projection_expression.as_deref() {
+                None => None,
+                Some(expression) => {
+                    let parsed = ProjectionExpression::parse(expression)?;
+                    usage.add_projection(&parsed);
+                    Some(ResolvedProjection::new(&parsed, &names)?)
+                }
+            };
+            validate_expression_maps(&usage, &names, &HashMap::new())?;
+            steps.push((get, table, key, projection));
+        }
+
+        let mut responses = Vec::with_capacity(request.transact_items.len());
+        let mut breakdowns: BTreeMap<String, Breakdown> = BTreeMap::new();
+        for (get, table, key, projection) in steps {
             let stored = table
                 .items
                 .get(&key)
@@ -2031,16 +2080,10 @@ impl MockDdb {
                 .entry(get.table_name.clone())
                 .or_default()
                 .charge_table(Units::read(read_units(stored.map_or(0, item_size))));
-            let item = match stored {
-                None => None,
-                Some(item) => match &get.projection_expression {
-                    None => Some(item.clone()),
-                    Some(expression) => {
-                        let names = get.expression_attribute_names.clone().unwrap_or_default();
-                        Some(ProjectionExpression::parse(expression)?.project(item, &names)?)
-                    }
-                },
-            };
+            let item = stored.map(|item| match &projection {
+                None => item.clone(),
+                Some(projection) => projection.project(item),
+            });
             responses.push(item);
         }
         let consumed_capacity = breakdowns
@@ -2965,7 +3008,7 @@ fn start_cursor(table: &Table, index_name: Option<&str>, key: &Item) -> Result<C
                 )
             })?;
             let position = table
-                .cursor_key(key)
+                .cursor_key(key)?
                 .map_or(GroupPosition::End, GroupPosition::At);
             Ok(CursorKey::Indexed(index_key, position))
         }
@@ -3031,19 +3074,22 @@ fn projected_item(
     index_name: Option<&str>,
     projection: Option<&ResolvedProjection>,
     item: &Item,
-) -> Item {
-    let base = match index_name.and_then(|name| table.projected_attributes(name)) {
+) -> Result<Item> {
+    let base = match index_name {
         None => item.clone(),
-        Some(allowed) => item
-            .iter()
-            .filter(|(name, _)| allowed.contains(*name))
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect(),
+        Some(name) => match table.projected_attributes(name)? {
+            None => item.clone(),
+            Some(allowed) => item
+                .iter()
+                .filter(|(name, _)| allowed.contains(*name))
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        },
     };
-    match projection {
+    Ok(match projection {
         None => base,
         Some(projection) => projection.project(&base),
-    }
+    })
 }
 
 /// Collect one page of a query or scan.
@@ -3114,7 +3160,7 @@ fn collect_page(
         if matches {
             count += 1;
             if page.select != Select::Count {
-                items.push(projected_item(table, index_name, page.projection, item));
+                items.push(projected_item(table, index_name, page.projection, item)?);
             }
         }
         if limit.is_some_and(|limit| scanned >= limit) {
@@ -3253,89 +3299,142 @@ fn action_table<'a>(inner: &'a Inner, table_name: &str) -> Result<&'a Table> {
 
 fn prepare_action(inner: &Inner, action: &TransactWriteItem, now: i64) -> Result<PreparedAction> {
     match action {
-        TransactWriteItem::Put(put) => {
-            let table = action_table(inner, &put.table_name)?;
-            table.validate_item(&put.item)?;
-            let key = table.item_key(&put.item)?;
-            Ok(PreparedAction {
-                table_name: put.table_name.clone(),
-                previous: live_item(table, &key, now),
-                key,
-                condition: parse_optional_condition(put.condition_expression.as_deref())?,
-                names: put.expression_attribute_names.clone().unwrap_or_default(),
-                values: put.expression_attribute_values.clone().unwrap_or_default(),
-                kind: ActionKind::Put(put.item.clone()),
-                wants_old_image: put.return_values_on_condition_check_failure,
-            })
-        }
-        TransactWriteItem::Update(update) => {
-            let table = action_table(inner, &update.table_name)?;
-            let key = table.lookup_key(&update.key)?;
-            let previous = live_item(table, &key, now);
-            let names = update
-                .expression_attribute_names
-                .clone()
-                .unwrap_or_default();
-            let values = update
-                .expression_attribute_values
-                .clone()
-                .unwrap_or_default();
-            let expression = UpdateExpression::parse(&update.update_expression)?;
-            let mut item = match &previous {
-                Some(existing) => existing.clone(),
-                None => key_only_item(table.key_schema(), &update.key),
-            };
-            expression.apply(&mut item, table.key_schema(), &names, &values)?;
-            table.validate_item(&item)?;
-            Ok(PreparedAction {
-                table_name: update.table_name.clone(),
-                key,
-                previous,
-                condition: parse_optional_condition(update.condition_expression.as_deref())?,
-                names,
-                values,
-                kind: ActionKind::Update(item),
-                wants_old_image: update.return_values_on_condition_check_failure,
-            })
-        }
-        TransactWriteItem::Delete(delete) => {
-            let table = action_table(inner, &delete.table_name)?;
-            let key = table.lookup_key(&delete.key)?;
-            Ok(PreparedAction {
-                table_name: delete.table_name.clone(),
-                previous: live_item(table, &key, now),
-                key,
-                condition: parse_optional_condition(delete.condition_expression.as_deref())?,
-                names: delete
-                    .expression_attribute_names
-                    .clone()
-                    .unwrap_or_default(),
-                values: delete
-                    .expression_attribute_values
-                    .clone()
-                    .unwrap_or_default(),
-                kind: ActionKind::Delete,
-                wants_old_image: delete.return_values_on_condition_check_failure,
-            })
-        }
-        TransactWriteItem::ConditionCheck(check) => {
-            let table = action_table(inner, &check.table_name)?;
-            let key = table.lookup_key(&check.key)?;
-            Ok(PreparedAction {
-                table_name: check.table_name.clone(),
-                previous: live_item(table, &key, now),
-                key,
-                condition: Some(ConditionExpression::parse(&check.condition_expression)?),
-                names: check.expression_attribute_names.clone().unwrap_or_default(),
-                values: check
-                    .expression_attribute_values
-                    .clone()
-                    .unwrap_or_default(),
-                kind: ActionKind::ConditionCheck,
-                wants_old_image: check.return_values_on_condition_check_failure,
-            })
-        }
+        TransactWriteItem::Put(put) => prepare_put(inner, put, now),
+        TransactWriteItem::Update(update) => prepare_update(inner, update, now),
+        TransactWriteItem::Delete(delete) => prepare_delete(inner, delete, now),
+        TransactWriteItem::ConditionCheck(check) => prepare_condition_check(inner, check, now),
     }
+}
+
+fn prepare_put(
+    inner: &Inner,
+    put: &crate::request::TransactPut,
+    now: i64,
+) -> Result<PreparedAction> {
+    let table = action_table(inner, &put.table_name)?;
+    table.validate_item(&put.item)?;
+    let key = table.item_key(&put.item)?;
+    let names = put.expression_attribute_names.clone().unwrap_or_default();
+    let values = put.expression_attribute_values.clone().unwrap_or_default();
+    let condition = parse_optional_condition(put.condition_expression.as_deref())?;
+    let mut usage = ExpressionUsage::default();
+    if let Some(condition) = &condition {
+        usage.add_condition(condition.condition());
+    }
+    validate_expression_maps(&usage, &names, &values)?;
+    Ok(PreparedAction {
+        table_name: put.table_name.clone(),
+        previous: live_item(table, &key, now),
+        key,
+        condition,
+        names,
+        values,
+        kind: ActionKind::Put(put.item.clone()),
+        wants_old_image: put.return_values_on_condition_check_failure,
+    })
+}
+
+fn prepare_update(
+    inner: &Inner,
+    update: &crate::request::TransactUpdate,
+    now: i64,
+) -> Result<PreparedAction> {
+    let table = action_table(inner, &update.table_name)?;
+    let key = table.lookup_key(&update.key)?;
+    let previous = live_item(table, &key, now);
+    let names = update
+        .expression_attribute_names
+        .clone()
+        .unwrap_or_default();
+    let values = update
+        .expression_attribute_values
+        .clone()
+        .unwrap_or_default();
+    let expression = UpdateExpression::parse(&update.update_expression)?;
+    let condition = parse_optional_condition(update.condition_expression.as_deref())?;
+    let mut usage = ExpressionUsage::default();
+    if let Some(condition) = &condition {
+        usage.add_condition(condition.condition());
+    }
+    usage.add_update(expression.update());
+    validate_expression_maps(&usage, &names, &values)?;
+    let mut item = match &previous {
+        Some(existing) => existing.clone(),
+        None => key_only_item(table.key_schema(), &update.key),
+    };
+    expression.apply(&mut item, table.key_schema(), &names, &values)?;
+    table.validate_item(&item)?;
+    Ok(PreparedAction {
+        table_name: update.table_name.clone(),
+        key,
+        previous,
+        condition,
+        names,
+        values,
+        kind: ActionKind::Update(item),
+        wants_old_image: update.return_values_on_condition_check_failure,
+    })
+}
+
+fn prepare_delete(
+    inner: &Inner,
+    delete: &crate::request::TransactDelete,
+    now: i64,
+) -> Result<PreparedAction> {
+    let table = action_table(inner, &delete.table_name)?;
+    let key = table.lookup_key(&delete.key)?;
+    let names = delete
+        .expression_attribute_names
+        .clone()
+        .unwrap_or_default();
+    let values = delete
+        .expression_attribute_values
+        .clone()
+        .unwrap_or_default();
+    let condition = parse_optional_condition(delete.condition_expression.as_deref())?;
+    let mut usage = ExpressionUsage::default();
+    if let Some(condition) = &condition {
+        usage.add_condition(condition.condition());
+    }
+    validate_expression_maps(&usage, &names, &values)?;
+    Ok(PreparedAction {
+        table_name: delete.table_name.clone(),
+        previous: live_item(table, &key, now),
+        key,
+        condition,
+        names,
+        values,
+        kind: ActionKind::Delete,
+        wants_old_image: delete.return_values_on_condition_check_failure,
+    })
+}
+
+fn prepare_condition_check(
+    inner: &Inner,
+    check: &crate::request::TransactConditionCheck,
+    now: i64,
+) -> Result<PreparedAction> {
+    let table = action_table(inner, &check.table_name)?;
+    let key = table.lookup_key(&check.key)?;
+    let names = check.expression_attribute_names.clone().unwrap_or_default();
+    let values = check
+        .expression_attribute_values
+        .clone()
+        .unwrap_or_default();
+    let condition = ConditionExpression::parse(&check.condition_expression)?;
+    let mut usage = ExpressionUsage::default();
+    usage.add_condition(condition.condition());
+    validate_expression_maps(&usage, &names, &values)?;
+    Ok(PreparedAction {
+        table_name: check.table_name.clone(),
+        previous: live_item(table, &key, now),
+        key,
+        condition: Some(condition),
+        names,
+        values,
+        kind: ActionKind::ConditionCheck,
+        wants_old_image: check.return_values_on_condition_check_failure,
+    })
 }
 
 fn parse_optional_condition(expression: Option<&str>) -> Result<Option<ConditionExpression>> {
