@@ -213,6 +213,7 @@ async fn a_key_that_does_not_exist_still_costs_one_unit() {
                         item([("pk", s("c"))]),
                     ]),
                 )
+                .unwrap()
                 .with_return_consumed_capacity(ReturnConsumedCapacity::Total),
         )
         .await

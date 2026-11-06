@@ -656,11 +656,13 @@ async fn batch_get_respects_projection_and_limits() {
 
     let response = mock
         .batch_get_item(
-            mock_ddb::BatchGetItemRequest::new().add(
-                "users",
-                KeysAndAttributes::new(vec![user_key("u#1"), user_key("missing")])
-                    .with_projection("pk"),
-            ),
+            mock_ddb::BatchGetItemRequest::new()
+                .add(
+                    "users",
+                    KeysAndAttributes::new(vec![user_key("u#1"), user_key("missing")])
+                        .with_projection("pk"),
+                )
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -669,10 +671,14 @@ async fn batch_get_respects_projection_and_limits() {
     assert_eq!(found[0].len(), 1);
 
     let too_many = mock
-        .batch_get_item(mock_ddb::BatchGetItemRequest::new().add(
-            "users",
-            KeysAndAttributes::new((0..101).map(|i| user_key(&format!("u#{i}"))).collect()),
-        ))
+        .batch_get_item(
+            mock_ddb::BatchGetItemRequest::new()
+                .add(
+                    "users",
+                    KeysAndAttributes::new((0..101).map(|i| user_key(&format!("u#{i}"))).collect()),
+                )
+                .unwrap(),
+        )
         .await;
     assert!(too_many.is_err());
 
@@ -684,7 +690,8 @@ async fn batch_get_respects_projection_and_limits() {
     let unknown = mock
         .batch_get_item(
             mock_ddb::BatchGetItemRequest::new()
-                .add("nope", KeysAndAttributes::new(vec![user_key("u#1")])),
+                .add("nope", KeysAndAttributes::new(vec![user_key("u#1")]))
+                .unwrap(),
         )
         .await;
     assert!(unknown.is_err());
