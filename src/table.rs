@@ -430,18 +430,20 @@ impl Table {
 
     /// Read an item's key attributes without rejecting extra attributes, which
     /// is what a pagination cursor containing index keys needs.
-    pub(crate) fn cursor_key(&self, map: &Item) -> Option<ItemKey> {
-        let partition = map
-            .get(&self.definition.key_schema.partition_key.attribute_name)
-            .and_then(Scalar::from_value)?;
+    pub(crate) fn cursor_key(&self, map: &Item) -> Result<Option<ItemKey>> {
+        let partition_element = &self.definition.key_schema.partition_key;
+        if !map.contains_key(&partition_element.attribute_name) {
+            return Ok(None);
+        }
+        let partition = scalar_from(map, partition_element, KeyExpectation::Cursor)?;
         let sort = match &self.definition.key_schema.sort_key {
-            Some(element) => Some(
-                map.get(&element.attribute_name)
-                    .and_then(Scalar::from_value)?,
-            ),
+            Some(element) if map.contains_key(&element.attribute_name) => {
+                Some(scalar_from(map, element, KeyExpectation::Cursor)?)
+            }
+            Some(_) => return Ok(None),
             None => None,
         };
-        Some((partition, sort))
+        Ok(Some((partition, sort)))
     }
 
     /// Whether an item can belong to an item collection the service tracks:
@@ -494,44 +496,31 @@ impl Table {
     }
 
     /// The projected attributes an index exposes, or `None` for "all".
-    pub(crate) fn projected_attributes(&self, index_name: &str) -> Option<BTreeSet<String>> {
-        let index = self.definition.index(index_name).ok()?;
+    pub(crate) fn projected_attributes(
+        &self,
+        index_name: &str,
+    ) -> Result<Option<BTreeSet<String>>> {
+        let index = self.definition.index(index_name)?;
+        let mut names: BTreeSet<String> = self
+            .definition
+            .key_schema
+            .elements()
+            .iter()
+            .map(|element| element.attribute_name.clone())
+            .collect();
+        names.extend(
+            index
+                .key_schema
+                .elements()
+                .iter()
+                .map(|element| element.attribute_name.clone()),
+        );
         match &index.projection {
-            Projection::All => None,
-            Projection::KeysOnly => {
-                let mut names: BTreeSet<String> = self
-                    .definition
-                    .key_schema
-                    .elements()
-                    .iter()
-                    .map(|element| element.attribute_name.clone())
-                    .collect();
-                names.extend(
-                    index
-                        .key_schema
-                        .elements()
-                        .iter()
-                        .map(|element| element.attribute_name.clone()),
-                );
-                Some(names)
-            }
+            Projection::All => Ok(None),
+            Projection::KeysOnly => Ok(Some(names)),
             Projection::Include(extra) => {
-                let mut names: BTreeSet<String> = self
-                    .definition
-                    .key_schema
-                    .elements()
-                    .iter()
-                    .map(|element| element.attribute_name.clone())
-                    .collect();
-                names.extend(
-                    index
-                        .key_schema
-                        .elements()
-                        .iter()
-                        .map(|element| element.attribute_name.clone()),
-                );
                 names.extend(extra.iter().cloned());
-                Some(names)
+                Ok(Some(names))
             }
         }
     }
@@ -542,6 +531,9 @@ impl Table {
 enum KeyExpectation {
     /// A whole item about to be written.
     Item,
+    /// A pagination cursor, whose missing table key means "past this group"
+    /// only when the caller explicitly handles that absence.
+    Cursor,
 }
 
 /// Read one key attribute and check its type.
@@ -550,12 +542,17 @@ fn scalar_from(
     element: &KeySchemaElement,
     expectation: KeyExpectation,
 ) -> Result<Scalar> {
-    let _ = expectation;
     let Some(value) = item.get(&element.attribute_name) else {
-        return Err(Error::validation(format!(
-            "One or more parameter values were invalid: Missing the key {} in the item",
-            element.attribute_name
-        )));
+        return Err(Error::validation(match expectation {
+            KeyExpectation::Item => format!(
+                "One or more parameter values were invalid: Missing the key {} in the item",
+                element.attribute_name
+            ),
+            KeyExpectation::Cursor => {
+                "The provided starting key is invalid: it does not contain the table key attributes"
+                    .to_string()
+            }
+        }));
     };
     let Some(scalar) = Scalar::from_value(value) else {
         return Err(Error::validation(format!(
@@ -805,6 +802,43 @@ mod tests {
         item.insert("pk".into(), crate::s("u#1"));
         item.insert("sk".into(), crate::s("profile"));
         item
+    }
+
+    #[test]
+    fn cursor_keys_validate_type_and_empty_values_like_item_keys() {
+        let table = table();
+
+        let typed = table
+            .cursor_key(&crate::item([("pk", crate::s("a")), ("sk", crate::n("1"))]))
+            .unwrap_err();
+        assert!(
+            typed.to_string().contains("Type mismatch for key sk"),
+            "unexpected error: {typed}"
+        );
+
+        let empty = table
+            .cursor_key(&crate::item([("pk", crate::s("")), ("sk", crate::s("a"))]))
+            .unwrap_err();
+        assert!(
+            empty
+                .to_string()
+                .contains("cannot contain an empty string value"),
+            "unexpected error: {empty}"
+        );
+
+        assert_eq!(
+            table
+                .cursor_key(&crate::item([("pk", crate::s("a")), ("sk", crate::s("b"))]))
+                .unwrap(),
+            Some((Scalar::S("a".to_string()), Some(Scalar::S("b".to_string()))))
+        );
+        assert_eq!(
+            table
+                .cursor_key(&crate::item([("pk", crate::s("a"))]))
+                .unwrap(),
+            None,
+            "a cursor without the full table key names a group end"
+        );
     }
 
     #[test]

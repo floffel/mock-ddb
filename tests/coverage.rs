@@ -209,8 +209,7 @@ async fn every_transaction_action_variant_applies() {
             "users",
             item([("pk", s("u#4"))]),
             "attribute_not_exists(pk)",
-        )
-        .with_values(values([(":t", s("N"))])),
+        ),
         TransactWriteItem::put("users", item([("pk", s("u#3"))]))
             .with_condition("attribute_not_exists(pk)"),
     ]))

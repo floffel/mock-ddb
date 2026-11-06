@@ -70,7 +70,158 @@ pub(crate) use parse::{
 pub(crate) use path::{check_path_count, project};
 
 use crate::schema::KeySchema;
-use crate::{Item, Result};
+use crate::{Error, Item, Result};
+
+/// The `#alias` and `:value` placeholders one request's expressions name.
+///
+/// The maps belong to the request, not to one expression: an update request
+/// shares them between its condition and its update, and a query shares them
+/// between the key condition, filter and projection. Collecting the union here
+/// lets every operation reject a stale map entry at the request boundary.
+#[derive(Debug, Default)]
+pub(crate) struct ExpressionUsage {
+    names: BTreeSet<String>,
+    values: BTreeSet<String>,
+}
+
+impl ExpressionUsage {
+    pub(crate) fn add_condition(&mut self, condition: &Condition) {
+        match condition {
+            Condition::AttributeExists(path) | Condition::AttributeNotExists(path) => {
+                self.add_path(path);
+            }
+            Condition::AttributeType(path, operand)
+            | Condition::BeginsWith(path, operand)
+            | Condition::Contains(path, operand) => {
+                self.add_path(path);
+                self.add_operand(operand);
+            }
+            Condition::Compare(left, _, right) => {
+                self.add_operand(left);
+                self.add_operand(right);
+            }
+            Condition::Between(value, low, high) => {
+                self.add_operand(value);
+                self.add_operand(low);
+                self.add_operand(high);
+            }
+            Condition::In(value, entries) => {
+                self.add_operand(value);
+                for entry in entries {
+                    self.add_operand(entry);
+                }
+            }
+            Condition::And(terms) | Condition::Or(terms) => {
+                for term in terms {
+                    self.add_condition(term);
+                }
+            }
+            Condition::Not(inner) => self.add_condition(inner),
+        }
+    }
+
+    pub(crate) fn add_update(&mut self, update: &Update) {
+        for clause in &update.clauses {
+            match clause {
+                parse::UpdateClause::Set(assignments) => {
+                    for (path, value) in assignments {
+                        self.add_path(path);
+                        self.add_set_value(value);
+                    }
+                }
+                parse::UpdateClause::Remove(paths) => {
+                    for path in paths {
+                        self.add_path(path);
+                    }
+                }
+                parse::UpdateClause::Add(pairs) | parse::UpdateClause::Delete(pairs) => {
+                    for (path, operand) in pairs {
+                        self.add_path(path);
+                        self.add_operand(operand);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn add_projection(&mut self, projection: &ProjectionExpression) {
+        for path in &projection.paths {
+            self.add_path(path);
+        }
+    }
+
+    fn add_set_value(&mut self, value: &parse::SetValue) {
+        match value {
+            parse::SetValue::Operand(operand) => self.add_operand(operand),
+            parse::SetValue::Arithmetic { first, rest } => {
+                self.add_set_value(first);
+                for (_, term) in rest {
+                    self.add_set_value(term);
+                }
+            }
+            parse::SetValue::IfNotExists(path, fallback) => {
+                self.add_path(path);
+                self.add_set_value(fallback);
+            }
+            parse::SetValue::ListAppend(first, second) => {
+                self.add_set_value(first);
+                self.add_set_value(second);
+            }
+        }
+    }
+
+    fn add_operand(&mut self, operand: &Operand) {
+        match operand {
+            Operand::Path(path) | Operand::Size(path) => self.add_path(path),
+            Operand::Value(placeholder) => {
+                self.values.insert(format!(":{placeholder}"));
+            }
+        }
+    }
+
+    fn add_path(&mut self, path: &[Segment]) {
+        for segment in path {
+            if let Segment::Name(name) = segment {
+                if name.starts_with('#') {
+                    self.names.insert(name.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Reject an entry in either expression-attribute map that no expression in
+/// the request names.
+pub(crate) fn validate_expression_maps(
+    usage: &ExpressionUsage,
+    names: &NameMap,
+    values: &ValueMap,
+) -> Result<()> {
+    let unused_names: Vec<&str> = names
+        .keys()
+        .filter(|name| !usage.names.contains(*name))
+        .map(String::as_str)
+        .collect();
+    if !unused_names.is_empty() {
+        return Err(Error::validation(format!(
+            "Value provided in ExpressionAttributeNames unused in expressions: keys: {{{}}}",
+            unused_names.join(", ")
+        )));
+    }
+
+    let unused_values: Vec<&str> = values
+        .keys()
+        .filter(|value| !usage.values.contains(*value))
+        .map(String::as_str)
+        .collect();
+    if !unused_values.is_empty() {
+        return Err(Error::validation(format!(
+            "Value provided in ExpressionAttributeValues unused in expressions: keys: {{{}}}",
+            unused_values.join(", ")
+        )));
+    }
+    Ok(())
+}
 
 /// A parsed `ConditionExpression`.
 ///
@@ -357,6 +508,10 @@ impl UpdateExpression {
         let context = Ctx { names, values };
         update::apply(&self.update, item, &context, key_schema)
     }
+
+    pub(crate) fn update(&self) -> &Update {
+        &self.update
+    }
 }
 
 /// A parsed `ProjectionExpression`.
@@ -509,6 +664,7 @@ impl ProjectionExpression {
 /// reached.
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedProjection {
+    expression: ProjectionExpression,
     paths: Vec<Path>,
 }
 
@@ -523,6 +679,7 @@ impl ResolvedProjection {
     pub(crate) fn new(expression: &ProjectionExpression, names: &NameMap) -> Result<Self> {
         check_path_count(expression.paths.len())?;
         Ok(Self {
+            expression: expression.clone(),
             paths: expression.resolve(names)?,
         })
     }
@@ -531,6 +688,10 @@ impl ResolvedProjection {
     pub(crate) fn project(&self, item: &Item) -> Item {
         let paths = self.paths.iter().map(Vec::as_slice).collect::<Vec<_>>();
         project(item, &paths)
+    }
+
+    pub(crate) fn expression(&self) -> &ProjectionExpression {
+        &self.expression
     }
 }
 

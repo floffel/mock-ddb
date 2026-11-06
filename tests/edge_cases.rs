@@ -3,10 +3,11 @@
 mod common;
 
 use mock_ddb::{
-    item, n, s, values, AttributeValue, Blob, CancellationReason, CancellationReasonCode, Clock,
-    ConditionExpression, CreateTableRequest, DeleteItemRequest, Error, GetItemRequest, KeySchema,
-    KeyType, ListTablesRequest, MockClock, MockDdb, PutItemRequest, QueryRequest, ReturnValues,
-    ScanRequest, Select, UpdateItemRequest,
+    item, n, names, s, values, AttributeValue, BatchGetItemRequest, Blob, CancellationReason,
+    CancellationReasonCode, Clock, ConditionExpression, CreateTableRequest, DeleteItemRequest,
+    Error, GetItemRequest, KeySchema, KeyType, KeysAndAttributes, ListTablesRequest, MockClock,
+    MockDdb, PutItemRequest, QueryRequest, ReturnValues, ScanRequest, Select, TransactGet,
+    TransactGetItemsRequest, TransactWriteItem, TransactWriteItemsRequest, UpdateItemRequest,
 };
 
 fn numbers() -> MockDdb {
@@ -19,6 +20,265 @@ fn numbers() -> MockDdb {
 
 fn users() -> MockDdb {
     MockDdb::with_table("users", KeySchema::hash("pk", KeyType::String)).unwrap()
+}
+
+fn assert_unused_names(error: &Error, alias: &str) {
+    assert_eq!(error.code(), "ValidationException");
+    assert!(
+        error.to_string().contains(&format!(
+            "ExpressionAttributeNames unused in expressions: keys: {{{alias}}}"
+        )),
+        "unexpected error: {error}"
+    );
+}
+
+fn assert_unused_values(error: &Error, placeholder: &str) {
+    assert_eq!(error.code(), "ValidationException");
+    assert!(
+        error.to_string().contains(&format!(
+            "ExpressionAttributeValues unused in expressions: keys: {{{placeholder}}}"
+        )),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn unused_expression_entries_are_rejected_on_every_single_expression_operation() {
+    let mock = users();
+    mock.put_item(PutItemRequest::new(
+        "users",
+        item([("pk", s("u#1")), ("email", s("a@example.com"))]),
+    ))
+    .await
+    .unwrap();
+
+    let put = mock
+        .put_item(
+            PutItemRequest::new("users", item([("pk", s("u#2"))]))
+                .with_condition("attribute_not_exists(pk)")
+                .with_names(names([("#stale", "email")]))
+                .with_values(values([(":stale", s("x"))])),
+        )
+        .await
+        .unwrap_err();
+    assert_unused_names(&put, "#stale");
+
+    let put_value = mock
+        .put_item(
+            PutItemRequest::new("users", item([("pk", s("u#2"))]))
+                .with_condition("attribute_not_exists(pk)")
+                .with_values(values([(":stale", s("x"))])),
+        )
+        .await
+        .unwrap_err();
+    assert_unused_values(&put_value, ":stale");
+
+    let delete = mock
+        .delete_item(
+            DeleteItemRequest::new("users", item([("pk", s("u#1"))]))
+                .with_condition("attribute_exists(pk)")
+                .with_names(names([("#stale", "email")])),
+        )
+        .await
+        .unwrap_err();
+    assert_unused_names(&delete, "#stale");
+
+    let update = mock
+        .update_item(
+            UpdateItemRequest::new("users", item([("pk", s("u#1"))]), "SET #email = :email")
+                .with_condition("attribute_exists(pk)")
+                .with_names(names([("#email", "email"), ("#stale", "other")]))
+                .with_values(values([(":email", s("b@example.com"))])),
+        )
+        .await
+        .unwrap_err();
+    assert_unused_names(&update, "#stale");
+
+    let get = mock
+        .get_item(
+            GetItemRequest::new("users", item([("pk", s("u#1"))]))
+                .with_projection("pk")
+                .with_names(names([("#stale", "email")])),
+        )
+        .await
+        .unwrap_err();
+    assert_unused_names(&get, "#stale");
+}
+
+#[tokio::test]
+async fn unused_expression_entries_are_rejected_across_shared_read_and_write_maps() {
+    let mock = common::orders();
+    mock.seed("orders", vec![common::order("c1", 1, "10")])
+        .unwrap();
+
+    let query = mock
+        .query(
+            QueryRequest::new("orders", "#p = :pk")
+                .with_filter("#total > :floor")
+                .with_projection("#sk")
+                .with_names(names([
+                    ("#p", "pk"),
+                    ("#total", "total"),
+                    ("#sk", "sk"),
+                    ("#stale", "unused"),
+                ]))
+                .with_values(values([(":pk", s("customer#c1")), (":floor", n("0"))])),
+        )
+        .await
+        .unwrap_err();
+    assert_unused_names(&query, "#stale");
+
+    let query_value = mock
+        .query(
+            QueryRequest::new("orders", "pk = :pk")
+                .with_filter("total > :floor")
+                .with_values(values([
+                    (":pk", s("customer#c1")),
+                    (":floor", n("0")),
+                    (":stale", n("1")),
+                ])),
+        )
+        .await
+        .unwrap_err();
+    assert_unused_values(&query_value, ":stale");
+
+    let scan = mock
+        .scan(
+            ScanRequest::new("orders")
+                .with_filter("#total > :floor")
+                .with_projection("#sk")
+                .with_names(names([
+                    ("#total", "total"),
+                    ("#sk", "sk"),
+                    ("#stale", "unused"),
+                ]))
+                .with_values(values([(":floor", n("0"))])),
+        )
+        .await
+        .unwrap_err();
+    assert_unused_names(&scan, "#stale");
+
+    let update = mock
+        .update_item(
+            UpdateItemRequest::new("orders", common::order_key("c1", 1), "SET #total = :new")
+                .with_condition("#total = :old")
+                .with_names(names([("#total", "total"), ("#stale", "unused")]))
+                .with_values(values([(":new", n("11")), (":old", n("10"))])),
+        )
+        .await
+        .unwrap_err();
+    assert_unused_names(&update, "#stale");
+    assert_eq!(
+        mock.get_item(GetItemRequest::new("orders", common::order_key("c1", 1)))
+            .await
+            .unwrap()
+            .item
+            .unwrap()["total"],
+        n("10")
+    );
+}
+
+#[tokio::test]
+async fn unused_expression_entries_are_rejected_in_batches_and_transactions() {
+    let mock = users();
+    mock.seed("users", vec![common::user("u#1", "a@example.com")])
+        .unwrap();
+
+    let batch_get = mock
+        .batch_get_item(
+            BatchGetItemRequest::new()
+                .add(
+                    "users",
+                    KeysAndAttributes {
+                        keys: vec![common::user_key("u#1")],
+                        projection_expression: Some("pk".to_string()),
+                        expression_attribute_names: Some(names([("#stale", "email")])),
+                        ..KeysAndAttributes::default()
+                    },
+                )
+                .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert_unused_names(&batch_get, "#stale");
+
+    let transaction = mock
+        .transact_write_items(TransactWriteItemsRequest::new(vec![
+            TransactWriteItem::update("users", common::user_key("u#1"), "SET #email = :new")
+                .with_condition("#email = :old")
+                .with_names(names([("#email", "email"), ("#stale", "unused")]))
+                .with_values(values([
+                    (":new", s("b@example.com")),
+                    (":old", s("a@example.com")),
+                ])),
+        ]))
+        .await
+        .unwrap_err();
+    assert_unused_names(&transaction, "#stale");
+
+    let transaction_put = mock
+        .transact_write_items(TransactWriteItemsRequest::new(vec![
+            TransactWriteItem::put("users", item([("pk", s("u#2"))]))
+                .with_condition("attribute_not_exists(pk)")
+                .with_values(values([(":stale", s("x"))])),
+        ]))
+        .await
+        .unwrap_err();
+    assert_unused_values(&transaction_put, ":stale");
+
+    let transaction_delete = mock
+        .transact_write_items(TransactWriteItemsRequest::new(vec![
+            TransactWriteItem::delete("users", common::user_key("u#1"))
+                .with_condition("attribute_exists(pk)")
+                .with_names(names([("#stale", "unused")])),
+        ]))
+        .await
+        .unwrap_err();
+    assert_unused_names(&transaction_delete, "#stale");
+
+    let condition_check = mock
+        .transact_write_items(TransactWriteItemsRequest::new(vec![
+            TransactWriteItem::condition_check("users", common::user_key("u#1"), "email = :old")
+                .with_values(values([(":old", s("a@example.com")), (":stale", s("x"))])),
+        ]))
+        .await
+        .unwrap_err();
+    assert_unused_values(&condition_check, ":stale");
+
+    let transact_get = mock
+        .transact_get_items(TransactGetItemsRequest::new(vec![TransactGet {
+            projection_expression: Some("pk".to_string()),
+            expression_attribute_names: Some(names([("#stale", "email")])),
+            ..TransactGet::new("users", common::user_key("missing"))
+        }]))
+        .await
+        .unwrap_err();
+    assert_unused_names(&transact_get, "#stale");
+}
+
+#[tokio::test]
+async fn unused_expression_entries_fail_before_a_false_condition_is_evaluated() {
+    let mock = users();
+    mock.seed("users", vec![common::user("u#1", "a@example.com")])
+        .unwrap();
+
+    let error = mock
+        .update_item(
+            UpdateItemRequest::new("users", common::user_key("u#1"), "SET email = :new")
+                .with_condition("attribute_not_exists(pk)")
+                .with_values(values([(":new", s("b@example.com")), (":stale", s("x"))])),
+        )
+        .await
+        .unwrap_err();
+    assert_unused_values(&error, ":stale");
+    assert_eq!(
+        mock.get_item(GetItemRequest::new("users", common::user_key("u#1")))
+            .await
+            .unwrap()
+            .item
+            .unwrap()["email"],
+        s("a@example.com")
+    );
 }
 
 #[tokio::test]

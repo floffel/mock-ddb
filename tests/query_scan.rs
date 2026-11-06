@@ -433,6 +433,150 @@ async fn sparse_index_omits_items_without_the_index_key() {
 }
 
 #[tokio::test]
+async fn overwrites_update_every_index_and_keep_sparse_membership_exact() {
+    let request = CreateTableRequest::new(
+        "events",
+        KeySchema::hash_and_range("pk", KeyType::String, "sk", KeyType::String),
+    )
+    .with_global_index(
+        SecondaryIndex::new(
+            "by-state",
+            KeySchema::hash_and_range("state", KeyType::String, "at", KeyType::Number),
+        )
+        .with_projection(Projection::KeysOnly),
+    )
+    .with_global_index(
+        SecondaryIndex::new("by-owner", KeySchema::hash("owner", KeyType::String))
+            .with_projection(Projection::Include(vec!["payload".to_string()])),
+    );
+    let mock = MockDdb::new();
+    mock.create_table(request).await.unwrap();
+
+    mock.put_item(PutItemRequest::new(
+        "events",
+        item([
+            ("pk", s("e1")),
+            ("sk", s("detail")),
+            ("state", s("old")),
+            ("at", n("1")),
+            ("owner", s("alice")),
+            ("payload", s("first")),
+        ]),
+    ))
+    .await
+    .unwrap();
+    mock.put_item(PutItemRequest::new(
+        "events",
+        item([
+            ("pk", s("e1")),
+            ("sk", s("detail")),
+            ("state", s("new")),
+            ("at", n("2")),
+            ("owner", s("bob")),
+            ("payload", s("second")),
+        ]),
+    ))
+    .await
+    .unwrap();
+
+    for old in ["old", "alice"] {
+        let index = if old == "old" { "by-state" } else { "by-owner" };
+        let expression = if old == "old" {
+            QueryRequest::new("events", "state = :v")
+        } else {
+            QueryRequest::new("events", "owner = :v")
+        };
+        assert_eq!(
+            mock.query(
+                expression
+                    .with_index(index)
+                    .with_values(values([(":v", s(old))])),
+            )
+            .await
+            .unwrap()
+            .count,
+            0,
+            "an overwrite must remove the old {index} entry"
+        );
+    }
+
+    let included = mock
+        .query(
+            QueryRequest::new("events", "owner = :owner")
+                .with_index("by-owner")
+                .with_values(values([(":owner", s("bob"))])),
+        )
+        .await
+        .unwrap();
+    assert_eq!(included.items.len(), 1);
+    assert_eq!(included.items[0]["payload"], s("second"));
+    for key in ["pk", "sk", "owner"] {
+        assert!(included.items[0].contains_key(key));
+    }
+
+    mock.put_item(PutItemRequest::new(
+        "events",
+        item([("pk", s("e2")), ("sk", s("detail"))]),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        mock.query(
+            QueryRequest::new("events", "owner = :owner")
+                .with_index("by-owner")
+                .with_values(values([(":owner", s("bob"))])),
+        )
+        .await
+        .unwrap()
+        .count,
+        1,
+        "the sparse item must not appear without the index key"
+    );
+}
+
+#[tokio::test]
+async fn purging_an_indexed_item_removes_the_index_membership() {
+    let clock = std::sync::Arc::new(mock_ddb::MockClock::at_epoch_seconds(1_000_000));
+    let mock = MockDdb::with_clock(clock);
+    mock.create_table(
+        CreateTableRequest::new("sessions", KeySchema::hash("pk", KeyType::String))
+            .with_global_index(
+                SecondaryIndex::new("by-state", KeySchema::hash("state", KeyType::String))
+                    .with_projection(Projection::KeysOnly),
+            ),
+    )
+    .await
+    .unwrap();
+    mock.update_time_to_live(mock_ddb::UpdateTimeToLiveRequest::new(
+        "sessions",
+        "expires_at",
+        true,
+    ))
+    .await
+    .unwrap();
+    mock.seed(
+        "sessions",
+        vec![item([
+            ("pk", s("u#1")),
+            ("state", s("open")),
+            ("expires_at", n("999999")),
+        ])],
+    )
+    .unwrap();
+
+    assert_eq!(mock.purge_expired("sessions").unwrap(), 1);
+    let page = mock
+        .query(
+            QueryRequest::new("sessions", "state = :state")
+                .with_index("by-state")
+                .with_values(values([(":state", s("open"))])),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items, []);
+}
+
+#[tokio::test]
 async fn local_index_queries_share_the_partition() {
     let mock = indexed_mock().await;
     for (pk, title) in [("c1", "b"), ("c1", "a"), ("c2", "a")] {
@@ -889,4 +1033,102 @@ async fn get_item_validates_the_projection_before_looking_up_the_key() {
         .unwrap();
     assert_eq!(found.len(), 1);
     assert!(found.contains_key("email"));
+}
+
+#[tokio::test]
+async fn cursor_keys_use_the_same_type_and_emptiness_rules_as_lookup_keys() {
+    let mock = orders();
+    mock.seed(
+        "orders",
+        vec![common::order("c1", 1, "1"), common::order("c1", 2, "1")],
+    )
+    .unwrap();
+
+    let wrong_type = mock
+        .query(
+            QueryRequest::new("orders", "pk = :pk")
+                .with_values(values([(":pk", s("customer#c1"))]))
+                .with_exclusive_start_key(item([("pk", s("customer#c1")), ("sk", s("1"))])),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(wrong_type.code(), "ValidationException");
+    assert!(wrong_type.to_string().contains("Type mismatch for key sk"));
+
+    // Inside: a valid cursor resumes after the named key, and an index cursor
+    // that omits the table key still means "past this index group".
+    let resumed = mock
+        .query(
+            QueryRequest::new("orders", "pk = :pk")
+                .with_values(values([(":pk", s("customer#c1"))]))
+                .with_exclusive_start_key(common::order_key("c1", 1)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resumed.count, 1);
+    assert_eq!(resumed.items[0]["sk"], n("2"));
+}
+
+#[tokio::test]
+async fn unknown_index_fails_closed_instead_of_returning_every_attribute() {
+    let mock = indexed_mock().await;
+    mock.put_item(PutItemRequest::new(
+        "events",
+        item([
+            ("pk", s("e1")),
+            ("sk", s("detail")),
+            ("state", s("open")),
+            ("at", n("1")),
+            ("payload", s("hidden")),
+        ]),
+    ))
+    .await
+    .unwrap();
+
+    let error = mock
+        .scan(ScanRequest::new("events").with_index("missing"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "ValidationException");
+    assert!(error.to_string().contains("specified index"));
+}
+
+#[tokio::test]
+async fn projection_alias_usage_counts_even_when_the_item_lacks_the_attribute() {
+    let mock = orders();
+    let page = mock
+        .query(
+            QueryRequest::new("orders", "pk = :pk")
+                .with_values(values([(":pk", s("customer#c1"))]))
+                .with_projection("#absent")
+                .with_names(mock_ddb::names([("#absent", "none")])),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.count, 0);
+
+    let unused = mock
+        .query(
+            QueryRequest::new("orders", "pk = :pk")
+                .with_values(values([(":pk", s("customer#c1"))]))
+                .with_projection("pk")
+                .with_names(mock_ddb::names([("#stale", "total")])),
+        )
+        .await
+        .unwrap_err();
+    assert!(unused
+        .to_string()
+        .contains("ExpressionAttributeNames unused in expressions: keys: {#stale}"));
+
+    let unused_value = mock
+        .scan(
+            ScanRequest::new("orders")
+                .with_filter("pk = :pk")
+                .with_values(values([(":pk", s("x")), (":stale", s("y"))])),
+        )
+        .await
+        .unwrap_err();
+    assert!(unused_value
+        .to_string()
+        .contains("ExpressionAttributeValues unused in expressions: keys: {:stale}"));
 }
