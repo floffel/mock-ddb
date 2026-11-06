@@ -95,12 +95,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Every response type is `#[non_exhaustive]`: the eleven data-plane outputs
   (`PutItemOutput`, `GetItemOutput`, `DeleteItemOutput`, `UpdateItemOutput`,
   `QueryOutput`, `ScanOutput`, `BatchWriteItemOutput`, `BatchGetItemOutput`,
-  `TransactWriteItemsOutput`, `TransactGetItemsOutput`, `ListTablesOutput`) and
-  the four Streams outputs (`ListStreamsOutput`, `DescribeStreamOutput`,
-  `GetShardIteratorOutput`, `GetRecordsOutput`). Every field stays public and
-  readable; a caller builds a response from `Default` and field assignment
-  instead of a struct literal, and a `compile_fail` doctest pins that the
-  literal no longer compiles. Growing a response with a field the service
+  `TransactWriteItemsOutput`, `TransactGetItemsOutput`, `ListTablesOutput`), the
+  four Streams outputs (`ListStreamsOutput`, `DescribeStreamOutput`,
+  `GetShardIteratorOutput`, `GetRecordsOutput`) and `TableDescription` (the
+  value `create_table`, `describe_table` and `delete_table` return). Every field
+  stays public and readable; a response that has a `Default` is built from it
+  plus field assignment rather than a struct literal, and a `compile_fail`
+  doctest pins that the literal no longer compiles. Growing a response with a
+  field the service
   offers — the last such pair was `consumed_capacity` /
   `item_collection_metrics` — used to be a breaking change for every caller
   that wrote the literal out; from here it is a minor release.
