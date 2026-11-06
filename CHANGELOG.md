@@ -92,6 +92,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `BatchGetItem` refuses a table that names the same primary key twice, with the
+  service's `ValidationException` ("Provided list of item keys contains
+  duplicates"). `KeysAndAttributes::keys` was a plain vector and the read looked
+  each key up on its own, so the same key came back twice in `responses` — a
+  duplicate the service rejects. `BatchWriteItem` already detected the
+  duplicate; both now share one check and one message. The comparison is on the
+  resolved primary key, so a composite key spelled in another attribute order,
+  one carrying extra attributes, and a key a second `BatchGetItemRequest::add`
+  repeats are all caught, while the same key value in two different tables
+  stays legal. The refusal happens in the validating pass, so the call reads
+  nothing, charges no capacity and leaves an armed `throttle_next_batch_get`
+  for the next batch.
 - `Number::add` and `Number::sub` refuse a result the write path would reject.
   The 38-significant-digit limit and the `1E-130` … `9.99…E+125` exponent range
   were checked only in `number::validate`, so `9e125 + 9e125` came back as

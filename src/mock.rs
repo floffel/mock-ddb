@@ -93,31 +93,57 @@ fn validated_batch_keys(
     request: &BatchWriteItemRequest,
 ) -> Result<Vec<(String, ItemKey)>> {
     let total: usize = request.request_items.values().map(Vec::len).sum();
-    let mut seen: BTreeSet<(String, ItemKey)> = BTreeSet::new();
     let mut ordered: Vec<(String, ItemKey)> = Vec::with_capacity(total);
     for (table_name, writes) in &request.request_items {
         let table = inner
             .tables
             .get(table_name)
             .ok_or_else(|| Error::table_not_found(table_name))?;
+        let mut keys: Vec<ItemKey> = Vec::with_capacity(writes.len());
         for write in writes {
-            let key = match write {
+            keys.push(match write {
                 WriteRequest::Put { item } => {
                     table.validate_item(item)?;
                     table.item_key(item)?
                 }
                 WriteRequest::Delete { key } => table.lookup_key(key)?,
-            };
-            let slot = (table_name.clone(), key);
-            if !seen.insert(slot.clone()) {
-                return Err(Error::validation(
-                    "Provided list of item keys contains duplicates",
-                ));
-            }
-            ordered.push(slot);
+            });
         }
+        reject_repeated_keys(table_name, &keys)?;
+        ordered.extend(keys.into_iter().map(|key| (table_name.clone(), key)));
     }
     Ok(ordered)
+}
+
+/// The `ValidationException` the service answers when one table of a batch
+/// names the same primary key more than once.
+///
+/// Both batch operations answer it, so a client reads the same wording whether
+/// it repeated a write or a read key.
+fn repeated_keys_error(table_name: &str) -> Error {
+    Error::validation(format!(
+        "1 validation error detected: Value at 'requestItems.{table_name}' failed to satisfy constraint: Provided list of item keys contains duplicates"
+    ))
+}
+
+/// Refuse a table whose batch names one primary key twice.
+///
+/// The duplicate is decided on the **resolved** primary key rather than on the
+/// request's attribute maps: `{pk, sk}` and `{sk, pk}`, a key that carries
+/// extra attributes, and a second [`BatchGetItemRequest::add`] that repeats a
+/// key the first call already sent all name the same item, so all of them are
+/// duplicates.
+///
+/// Duplicates are detected per table, never across the batch: two tables may
+/// name the same key value, because those are different items.
+fn reject_repeated_keys(table_name: &str, keys: &[ItemKey]) -> Result<()> {
+    let mut seen: BTreeSet<&ItemKey> = BTreeSet::new();
+    for key in keys {
+        if !seen.insert(key) {
+            return Err(repeated_keys_error(table_name));
+        }
+    }
+    Ok(())
 }
 
 /// The mutable state behind the client.
@@ -1311,9 +1337,9 @@ impl MockDdb {
     /// runs unthrottled. A `count` above that batch's size leaves the whole
     /// batch unprocessed, and `0` leaves nothing unprocessed; arming again
     /// before the next call replaces the pending count. A batch the mock rejects
-    /// outright — empty, over 100 keys, unknown table, a malformed key or
-    /// projection — leaves the count armed, so a test's setup is not eaten by a
-    /// request that never ran.
+    /// outright — empty, over 100 keys, unknown table, a repeated key, a
+    /// malformed key or projection — leaves the count armed, so a test's setup
+    /// is not eaten by a request that never ran.
     ///
     /// Without an armed knob the default holds: `unprocessed_keys` is empty.
     pub fn throttle_next_batch_get(&self, unprocessed: usize) {
@@ -1496,11 +1522,21 @@ impl MockDdb {
     /// ```
     /// Read up to 100 keys in one batch. Missing keys are omitted.
     ///
+    /// A table may not name the same primary key twice: the service answers
+    /// `ValidationException` ("Provided list of item keys contains duplicates"),
+    /// because a duplicated key is a client bug that a test double exists to
+    /// catch. The duplicate is decided on the primary key the request resolves
+    /// to, so the same key spelled with its attributes in another order, or
+    /// sent twice by two [`BatchGetItemRequest::add`] calls, is a duplicate
+    /// too. The same key value in two *different* tables is not: those are
+    /// different items, and the batch is accepted.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Validation`] when the batch is empty, asks for more than
-    /// 100 keys, or carries a malformed key or projection, and
-    /// [`Error::ResourceNotFound`] for an unknown table.
+    /// 100 keys, names one key twice within a table, or carries a malformed key
+    /// or projection, and [`Error::ResourceNotFound`] for an unknown table.
+    /// Nothing is read and no capacity is charged when the batch is refused.
     ///
     /// `unprocessed_keys` is empty unless the call was throttled with
     /// [`throttle_next_batch_get`](Self::throttle_next_batch_get).
@@ -1547,6 +1583,10 @@ impl MockDdb {
             for key in &attributes.keys {
                 keys.push(table.lookup_key(key)?);
             }
+            // A table that names one primary key twice is refused here, in the
+            // validating pass: the call reads nothing, charges nothing and
+            // leaves an armed throttle for the next batch.
+            reject_repeated_keys(table_name, &keys)?;
             steps.push(BatchReadStep {
                 table,
                 table_name,

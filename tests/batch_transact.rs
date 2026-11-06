@@ -259,6 +259,131 @@ async fn batch_get_spans_tables_and_keeps_request_order() {
 }
 
 #[tokio::test]
+async fn batch_get_refuses_a_key_repeated_within_one_table() {
+    let mock = orders();
+    for table in ["users", "mirror"] {
+        mock.create_table(mock_ddb::CreateTableRequest::new(
+            table,
+            mock_ddb::KeySchema::hash("pk", mock_ddb::KeyType::String),
+        ))
+        .await
+        .unwrap();
+        mock.seed(table, vec![user("u#1", "a@example.com")])
+            .unwrap();
+    }
+    mock.seed("orders", vec![order("c1", 1, "1"), order("c1", 2, "2")])
+        .unwrap();
+
+    // Just inside: two distinct keys of one table, read in one call.
+    let distinct = mock
+        .batch_get_item(
+            BatchGetItemRequest::new()
+                .add(
+                    "orders",
+                    KeysAndAttributes::new(vec![order_key("c1", 1), order_key("c1", 2)]),
+                )
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(distinct.responses["orders"].len(), 2);
+
+    // Just outside: the same key twice names one item, so the whole batch is
+    // refused instead of quietly reading it twice.
+    let repeated = mock
+        .batch_get_item(
+            BatchGetItemRequest::new()
+                .add(
+                    "orders",
+                    KeysAndAttributes::new(vec![order_key("c1", 1), order_key("c1", 1)]),
+                )
+                .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(repeated.code(), "ValidationException");
+    assert!(repeated.to_string().contains("duplicates"));
+
+    // The order a composite key is spelled in does not make it another key.
+    let reordered = mock
+        .batch_get_item(
+            BatchGetItemRequest::new()
+                .add(
+                    "orders",
+                    KeysAndAttributes::new(vec![
+                        order_key("c1", 1),
+                        item([("sk", n("1")), ("pk", s("customer#c1"))]),
+                    ]),
+                )
+                .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(reordered.code(), "ValidationException");
+
+    // Two `add` calls for one table are one key list, so the second call cannot
+    // slip a key past the check that the first call already sent.
+    let across_adds = BatchGetItemRequest::new()
+        .add("orders", KeysAndAttributes::new(vec![order_key("c1", 1)]))
+        .unwrap()
+        .add("orders", KeysAndAttributes::new(vec![order_key("c1", 1)]))
+        .unwrap();
+    let error = mock.batch_get_item(across_adds).await.unwrap_err();
+    assert_eq!(error.code(), "ValidationException");
+
+    // The same key value in two tables is two items, not a duplicate.
+    let shared = mock
+        .batch_get_item(
+            BatchGetItemRequest::new()
+                .add("users", KeysAndAttributes::new(vec![user_key("u#1")]))
+                .unwrap()
+                .add("mirror", KeysAndAttributes::new(vec![user_key("u#1")]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(shared.responses["users"].len(), 1);
+    assert_eq!(shared.responses["mirror"].len(), 1);
+}
+
+#[tokio::test]
+async fn a_refused_batch_get_leaves_the_armed_throttle_unspent() {
+    let mock = orders();
+    mock.seed("orders", vec![order("c1", 1, "1"), order("c1", 2, "2")])
+        .unwrap();
+    mock.throttle_next_batch_get(1);
+
+    let repeated = mock
+        .batch_get_item(
+            BatchGetItemRequest::new()
+                .add(
+                    "orders",
+                    KeysAndAttributes::new(vec![order_key("c1", 1), order_key("c1", 1)]),
+                )
+                .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(repeated.code(), "ValidationException");
+
+    // The refusal happened before the throttle was spent, so the next batch
+    // still sees the one deferred key.
+    let response = mock
+        .batch_get_item(
+            BatchGetItemRequest::new()
+                .add(
+                    "orders",
+                    KeysAndAttributes::new(vec![order_key("c1", 1), order_key("c1", 2)]),
+                )
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.unprocessed_keys["orders"].keys.len(), 1);
+    assert_eq!(response.responses["orders"].len(), 1);
+}
+
+#[tokio::test]
 async fn a_batch_get_built_in_two_steps_reads_both_steps_keys() {
     let mock = orders();
     mock.seed("orders", vec![order("c1", 1, "1"), order("c1", 2, "2")])
