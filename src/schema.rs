@@ -112,7 +112,7 @@ impl KeySchema {
     /// A schema with both a partition and a sort key.
     ///
     /// The two must name different attributes: one attribute cannot hold both
-    /// key roles, and [`MockDdb::create_table`] rejects such a schema.
+    /// key roles, and [`crate::MockDdb::create_table`] rejects such a schema.
     #[must_use]
     pub fn hash_and_range(
         partition_name: impl Into<String>,
@@ -218,7 +218,8 @@ pub enum Projection {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecondaryIndex {
-    /// Index name, unique within the table.
+    /// Index name, unique within the table and subject to the service's name
+    /// rule (3–255 characters from `[a-zA-Z0-9_.-]`, like a table name).
     pub index_name: String,
     /// The index's key schema. A global secondary index may use any key
     /// attributes; a local one must reuse the table's partition key.
@@ -319,7 +320,7 @@ impl StreamViewType {
 /// assert!(specification.stream_enabled);
 /// ```
 ///
-/// The two fields are kept consistent by [`MockDdb::create_table`]: a stream
+/// The two fields are kept consistent by [`crate::MockDdb::create_table`]: a stream
 /// that is on needs a view type, and a view type without a stream is refused
 /// rather than silently dropped.
 ///
@@ -406,7 +407,7 @@ impl CreateTableRequest {
     /// Add a local secondary index.
     ///
     /// The table must declare a sort key: DynamoDB offers local secondary
-    /// indexes only on tables that have one, so [`MockDdb::create_table`]
+    /// indexes only on tables that have one, so [`crate::MockDdb::create_table`]
     /// rejects a hash-only table that carries a local index.
     ///
     /// ```
@@ -540,18 +541,32 @@ impl CreateTableRequest {
         Ok(derived)
     }
 
-    /// Every index needs a non-empty, unique name.
+    /// Every index needs a name the service would accept, unique within the
+    /// table.
+    ///
+    /// The index name carries the same documented rule as the table name
+    /// (3–255 characters out of `[a-zA-Z0-9_.-]+`), so it goes through the
+    /// same predicate; an index name the service rejects must not yield a mock
+    /// table that a deploy would fail to create. The message names the request
+    /// path, which is how the service reports a bad list member.
     fn validate_index_names(&self) -> Result<()> {
+        for (position, index) in self.global_secondary_indexes.iter().enumerate() {
+            validate_name(
+                &index.index_name,
+                &format!("globalSecondaryIndexes.{}.member.indexName", position + 1),
+            )?;
+        }
+        for (position, index) in self.local_secondary_indexes.iter().enumerate() {
+            validate_name(
+                &index.index_name,
+                &format!("localSecondaryIndexes.{}.member.indexName", position + 1),
+            )?;
+        }
         for index in self
             .global_secondary_indexes
             .iter()
             .chain(&self.local_secondary_indexes)
         {
-            if index.index_name.is_empty() {
-                return Err(Error::validation(
-                    "One or more parameter values were invalid: Index name must not be empty",
-                ));
-            }
             let duplicates = self
                 .global_secondary_indexes
                 .iter()
@@ -727,20 +742,52 @@ pub struct TableDescription {
     pub creation_date_time: Option<SystemTime>,
 }
 
+/// Shortest name the service accepts for a table or an index.
+const MIN_NAME_LEN: usize = 3;
+
+/// Longest name the service accepts for a table or an index.
+const MAX_NAME_LEN: usize = 255;
+
 /// Validate a table name against DynamoDB's documented constraints.
 pub(crate) fn validate_table_name(name: &str) -> Result<()> {
-    if name.len() < 3 || name.len() > 255 {
+    validate_name(name, "tableName")
+}
+
+/// Check `name` against the one name rule the service documents for both table
+/// and index names: 3 to 255 characters drawn from `[a-zA-Z0-9_.-]`.
+///
+/// `location` is the request path the service points at in its message, e.g.
+/// `tableName` or `globalSecondaryIndexes.1.member.indexName` (list members are
+/// numbered from 1). Keeping the predicate in a single place is what stops the
+/// table name and the index names from drifting apart: before it existed the
+/// table name was bounded and an index name was only checked for emptiness, so
+/// a mock table could carry a name the service rejects.
+///
+/// The length is counted in characters, not bytes — the constraint is on the
+/// value's length, and a multi-byte name is rejected by the charset rule below
+/// either way. The echoed value is not truncated here; bounding the copy is
+/// tracked separately in issue #74.
+fn validate_name(name: &str, location: &str) -> Result<()> {
+    let length = name.chars().count();
+    if length < MIN_NAME_LEN {
         return Err(Error::validation(format!(
-            "1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3"
+            "1 validation error detected: Value '{name}' at '{location}' failed to satisfy constraint: Member must have length greater than or equal to {MIN_NAME_LEN}"
         )));
     }
-    if !name
-        .chars()
-        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
-    {
+    if length > MAX_NAME_LEN {
         return Err(Error::validation(format!(
-            "1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+            "1 validation error detected: Value '{name}' at '{location}' failed to satisfy constraint: Member must have length less than or equal to {MAX_NAME_LEN}"
+        )));
+    }
+    if !name.chars().all(is_name_character) {
+        return Err(Error::validation(format!(
+            "1 validation error detected: Value '{name}' at '{location}' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
         )));
     }
     Ok(())
+}
+
+/// Whether `character` belongs to the set the service allows in a name.
+fn is_name_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
 }
