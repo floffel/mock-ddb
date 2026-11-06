@@ -51,7 +51,6 @@ use crate::stream::{
     GetShardIteratorOutput, GetShardIteratorRequest, ListStreamsOutput, ListStreamsRequest, Shard,
     StreamDescription, StreamRecord, StreamState, StreamSummary, StreamsApi, StreamsRecord,
     MAX_RECORDS_PER_GET, MAX_SHARDS_PER_DESCRIBE, MAX_STREAMS_PER_LIST,
-    STREAM_CREATION_EPOCH_SECONDS,
 };
 
 /// Batch calls a test has throttled, waiting for their next call to spend it.
@@ -372,6 +371,13 @@ impl MockDdb {
         epoch_seconds(self.clock_now())
     }
 
+    /// The clock's current instant and its whole epoch seconds, captured in one
+    /// read so expiration and timestamp decisions describe the same moment.
+    fn now_parts(&self) -> (std::time::SystemTime, i64) {
+        let now = self.clock_now();
+        (now, epoch_seconds(now))
+    }
+
     /// The clock's current instant, in whole seconds since the Unix epoch.
     #[must_use]
     ///
@@ -406,7 +412,7 @@ impl MockDdb {
     /// Returns [`Error::ResourceNotFound`] for an unknown table and
     /// [`Error::Validation`] for an item that does not match the schema.
     pub fn seed(&self, table_name: &str, items: Vec<Item>) -> Result<()> {
-        let now = self.epoch_now();
+        let (now_time, now) = self.now_parts();
         let mut inner = self.inner.write();
         let table = inner
             .tables
@@ -426,10 +432,10 @@ impl MockDdb {
             let previous_live = previous
                 .clone()
                 .filter(|existing| !table.is_expired(existing, now));
-            table.store(key, item.clone(), previous.as_ref());
             if !table.is_expired(&item, now) {
-                table.on_put(previous_live.as_ref(), &item);
+                table.on_put(previous_live.as_ref(), &item, now_time)?;
             }
+            table.store(key, item.clone(), previous.as_ref());
         }
         Ok(())
     }
@@ -539,7 +545,7 @@ impl MockDdb {
         }
         let sequence = inner.sequence;
         inner.sequence += 1;
-        let table = Table::new(definition, now, sequence);
+        let table = Table::new(definition, now, sequence)?;
         let description = table.describe(0);
         inner.tables.insert(description.table_name.clone(), table);
         Ok(description)
@@ -679,7 +685,7 @@ impl MockDdb {
     }
 
     pub(crate) fn put_item_inner(&self, request: &PutItemRequest) -> Result<PutItemOutput> {
-        let now = self.epoch_now();
+        let (now_time, now) = self.now_parts();
         let mut inner = self.inner.write();
         let table = inner
             .tables
@@ -714,8 +720,8 @@ impl MockDdb {
             }
         }
 
+        table.on_put(previous_live.as_ref(), &request.item, now_time)?;
         table.store(key, request.item.clone(), previous.as_ref());
-        table.on_put(previous_live.as_ref(), &request.item);
         let mut breakdown = Breakdown::new();
         charge_write(
             table,
@@ -857,7 +863,7 @@ impl MockDdb {
         &self,
         request: &DeleteItemRequest,
     ) -> Result<DeleteItemOutput> {
-        let now = self.epoch_now();
+        let (now_time, now) = self.now_parts();
         let mut inner = self.inner.write();
         let table = inner
             .tables
@@ -891,10 +897,10 @@ impl MockDdb {
             }
         }
 
-        let removed = table.discard(&key);
         if let Some(item) = &previous_live {
-            table.on_delete(item);
+            table.on_delete(item, now_time)?;
         }
+        let removed = table.discard(&key);
         let mut breakdown = Breakdown::new();
         charge_write(table, &mut breakdown, [previous_live.as_ref(), None]);
         let item_collection_metrics = previous_live.as_ref().and_then(|item| {
@@ -945,7 +951,7 @@ impl MockDdb {
         &self,
         request: &UpdateItemRequest,
     ) -> Result<UpdateItemOutput> {
-        let now = self.epoch_now();
+        let (now_time, now) = self.now_parts();
         let mut inner = self.inner.write();
         let table = inner
             .tables
@@ -994,8 +1000,8 @@ impl MockDdb {
         };
         let touched = update.apply(&mut item, table.key_schema(), &names, &values)?;
         table.validate_item(&item)?;
+        table.on_update(previous_live.as_ref(), &item, now_time)?;
         table.store(key, item.clone(), previous.as_ref());
-        table.on_update(previous_live.as_ref(), &item);
 
         let mut breakdown = Breakdown::new();
         charge_write(table, &mut breakdown, [previous_live.as_ref(), Some(&item)]);
@@ -1394,7 +1400,7 @@ impl MockDdb {
         &self,
         request: BatchWriteItemRequest,
     ) -> Result<BatchWriteItemOutput> {
-        let now = self.epoch_now();
+        let (now_time, now) = self.now_parts();
         let total: usize = request.request_items.values().map(Vec::len).sum();
         if total == 0 || total > 25 {
             return Err(Error::validation(format!(
@@ -1449,8 +1455,8 @@ impl MockDdb {
                             .clone()
                             .filter(|existing| !table.is_expired(existing, now));
                         charge_write(table, &mut breakdown, [previous_live.as_ref(), Some(&item)]);
+                        table.on_put(previous_live.as_ref(), &item, now_time)?;
                         table.store(key, item.clone(), previous.as_ref());
-                        table.on_put(previous_live.as_ref(), &item);
                         note_collection(
                             table,
                             &item,
@@ -1467,10 +1473,11 @@ impl MockDdb {
                             .clone()
                             .filter(|existing| !table.is_expired(existing, now));
                         charge_write(table, &mut breakdown, [previous_live.as_ref(), None]);
-                        if let Some(previous) = table.discard(&key) {
+                        if let Some(previous) = table.items.get(&key).cloned() {
                             if !table.is_expired(&previous, now) {
-                                table.on_delete(&previous);
+                                table.on_delete(&previous, now_time)?;
                             }
+                            let _ = table.discard(&key);
                             note_collection(
                                 table,
                                 &previous,
@@ -1870,7 +1877,7 @@ impl MockDdb {
         &self,
         request: &TransactWriteItemsRequest,
     ) -> Result<TransactWriteItemsOutput> {
-        let now = self.epoch_now();
+        let (now_time, now) = self.now_parts();
         let mut inner = self.inner.write();
         if request.transact_items.is_empty() || request.transact_items.len() > 100 {
             return Err(Error::validation(format!(
@@ -1962,6 +1969,7 @@ impl MockDdb {
             prepared,
             request.return_consumed_capacity,
             request.return_item_collection_metrics,
+            now_time,
             now,
         )?;
 
@@ -2446,7 +2454,7 @@ impl StreamsApi<'_> {
                 stream_label: stream.label().to_string(),
                 stream_status: "ENABLED".to_string(),
                 stream_view_type: stream.view_type(),
-                creation_request_date_time: STREAM_CREATION_EPOCH_SECONDS,
+                creation_request_date_time: stream.creation_date_time,
                 table_name,
                 shards,
                 last_evaluated_shard_id: None,
@@ -3335,6 +3343,7 @@ fn apply_transaction(
     prepared: Vec<PreparedAction>,
     mode: ReturnConsumedCapacity,
     metrics_mode: ReturnItemCollectionMetrics,
+    now_time: std::time::SystemTime,
     now: i64,
 ) -> Result<TransactWriteItemsOutput> {
     let mut breakdowns: BTreeMap<String, Breakdown> = BTreeMap::new();
@@ -3352,8 +3361,8 @@ fn apply_transaction(
                     &mut breakdown,
                     [action.previous.as_ref(), Some(&item)],
                 );
+                table.on_put(action.previous.as_ref(), &item, now_time)?;
                 table.store(action.key, item.clone(), action.stored.as_ref());
-                table.on_put(action.previous.as_ref(), &item);
                 note_collection(
                     table,
                     &item,
@@ -3369,8 +3378,8 @@ fn apply_transaction(
                     &mut breakdown,
                     [action.previous.as_ref(), Some(&item)],
                 );
+                table.on_update(action.previous.as_ref(), &item, now_time)?;
                 table.store(action.key, item.clone(), action.stored.as_ref());
-                table.on_update(action.previous.as_ref(), &item);
                 note_collection(
                     table,
                     &item,
@@ -3382,9 +3391,9 @@ fn apply_transaction(
             }
             ActionKind::Delete => {
                 charge_write(table, &mut breakdown, [action.previous.as_ref(), None]);
-                let _ = table.discard(&action.key);
                 if let Some(previous) = &action.previous {
-                    table.on_delete(previous);
+                    table.on_delete(previous, now_time)?;
+                    let _ = table.discard(&action.key);
                     note_collection(
                         table,
                         previous,
@@ -3393,6 +3402,8 @@ fn apply_transaction(
                         &action.table_name,
                         &mut collections,
                     );
+                } else {
+                    let _ = table.discard(&action.key);
                 }
             }
             ActionKind::ConditionCheck => {
