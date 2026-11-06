@@ -318,7 +318,10 @@ async fn a_local_index_needs_a_table_range_key() {
 
     // Just inside: the same table without the local index is accepted.
     let description = MockDdb::new().create_table(hash_only).await.unwrap();
-    assert!(description.local_secondary_indexes.is_empty());
+    assert_eq!(
+        description.local_secondary_indexes,
+        Vec::<SecondaryIndex>::new()
+    );
 
     // And the indexed variant of a table that does have a range key stays valid.
     let ranged = CreateTableRequest::new(
@@ -1096,19 +1099,37 @@ async fn a_stream_specification_must_be_coherent() {
     );
 
     // Just inside: a disabled stream with no view type stays a valid, streamless
-    // table.
-    let disabled = MockDdb::new()
-        .create_table(with_stream(false, None))
-        .await
-        .unwrap();
-    assert!(disabled.latest_stream_arn.is_none());
-
+    // table. Only with the `streams` feature, though: without it every stream
+    // specification is refused before the coherence check, so there is no
+    // streamless table to assert on.
     #[cfg(feature = "streams")]
     {
+        let disabled = MockDdb::new()
+            .create_table(with_stream(false, None))
+            .await
+            .unwrap();
+        assert!(disabled.latest_stream_arn.is_none());
+
         let streamed = MockDdb::new()
             .create_table(with_stream(true, Some(mock_ddb::StreamViewType::KeysOnly)))
             .await
             .unwrap();
         assert!(streamed.latest_stream_arn.is_some());
+    }
+
+    // Without the feature the same disabled specification is refused outright
+    // rather than silently ignored.
+    #[cfg(not(feature = "streams"))]
+    {
+        let unavailable = MockDdb::new()
+            .create_table(with_stream(false, None))
+            .await
+            .unwrap_err();
+        assert!(
+            unavailable
+                .to_string()
+                .contains("Streams are not available in this build"),
+            "{unavailable}"
+        );
     }
 }
