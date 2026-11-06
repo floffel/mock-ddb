@@ -126,7 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | Return values | `NONE`, `ALL_OLD`, `UPDATED_OLD`, `ALL_NEW`, `UPDATED_NEW`, plus `ReturnValuesOnConditionCheckFailure` |
 | Reads | `query` and `scan` with `FilterExpression`, `ProjectionExpression`, `Limit`, `ExclusiveStartKey`, `ScanIndexForward`, `Select` (`ALL_ATTRIBUTES`, `COUNT`, `SPECIFIC_ATTRIBUTES`), index reads |
 | Parallel scan | `Segment` / `TotalSegments`, disjoint and complete |
-| Batches | `batch_write_item` (25 writes, duplicate-key detection), `batch_get_item` (100 keys, per-table projection); `throttle_next_batch_write` / `throttle_next_batch_get` arm one partial response so a caller's `UnprocessedItems`/`UnprocessedKeys` retry can be tested |
+| Batches | `batch_write_item` (25 writes, duplicate-key detection), `batch_get_item` (100 keys, duplicate-key detection per table, per-table projection); `throttle_next_batch_write` / `throttle_next_batch_get` arm one partial response so a caller's `UnprocessedItems`/`UnprocessedKeys` retry can be tested |
 | Capacity | `ReturnConsumedCapacity` (`NONE`/`TOTAL`/`INDEXES`) and `ReturnItemCollectionMetrics` (`SIZE`) on every data-plane operation, with the units computed from the stored items and split per table and per index |
 | Transactions | `transact_write_items` (100 actions: `Put`, `Update`, `Delete`, `ConditionCheck`; atomic; per-member cancellation reasons; `ClientRequestToken` idempotency), `transact_get_items` |
 | TTL | `update_time_to_live`, `describe_time_to_live`, lazy expiry on every read path, `purge_expired` |

@@ -841,6 +841,11 @@ pub struct BatchWriteItemOutput {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct KeysAndAttributes {
     /// Keys to read.
+    ///
+    /// One table may not name the same primary key twice; the whole batch is
+    /// refused with a `ValidationException` then, the way the service refuses
+    /// it. The comparison is on the primary key the request resolves to, not on
+    /// the attribute maps as they were spelled.
     pub keys: Vec<Item>,
     /// Optional projection expression.
     pub projection_expression: Option<String>,
