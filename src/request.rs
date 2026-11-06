@@ -191,6 +191,12 @@ pub struct PutItemRequest {
 
 impl PutItemRequest {
     /// A request that writes `item` to `table_name`.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, PutItemRequest};
+    /// let request = PutItemRequest::new("users", item([("pk", s("u#1"))]));
+    /// assert_eq!(request.table_name, "users");
+    /// ```
     #[must_use]
     pub fn new(table_name: impl Into<String>, item: Item) -> Self {
         Self {
@@ -201,6 +207,13 @@ impl PutItemRequest {
     }
 
     /// Require `expression` to hold before writing.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, PutItemRequest};
+    /// let request =
+    ///     PutItemRequest::new("users", item([("pk", s("u#1"))])).with_condition("attribute_exists(pk)");
+    /// assert_eq!(request.condition_expression.as_deref(), Some("attribute_exists(pk)"));
+    /// ```
     #[must_use]
     pub fn with_condition(mut self, expression: impl Into<String>) -> Self {
         self.condition_expression = Some(expression.into());
@@ -208,6 +221,13 @@ impl PutItemRequest {
     }
 
     /// Attach expression-attribute names.
+    ///
+    /// ```
+    /// use mock_ddb::{item, names, s, PutItemRequest};
+    /// let request =
+    ///     PutItemRequest::new("users", item([("pk", s("u#1"))])).with_names(names([("#n", "name")]));
+    /// assert_eq!(request.expression_attribute_names.as_ref().unwrap()["#n"], "name");
+    /// ```
     #[must_use]
     pub fn with_names(mut self, names: HashMap<String, String>) -> Self {
         self.expression_attribute_names = Some(names);
@@ -215,6 +235,13 @@ impl PutItemRequest {
     }
 
     /// Attach expression-attribute values.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, values, PutItemRequest};
+    /// let request =
+    ///     PutItemRequest::new("users", item([("pk", s("u#1"))])).with_values(values([(":n", s("x"))]));
+    /// assert_eq!(request.expression_attribute_values.as_ref().unwrap().len(), 1);
+    /// ```
     #[must_use]
     pub fn with_values(mut self, values: HashMap<String, AttributeValue>) -> Self {
         self.expression_attribute_values = Some(values);
@@ -222,6 +249,13 @@ impl PutItemRequest {
     }
 
     /// Choose what the write returns.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, PutItemRequest, ReturnValues};
+    /// let request = PutItemRequest::new("users", item([("pk", s("u#1"))]))
+    ///     .with_return_values(ReturnValues::AllOld);
+    /// assert_eq!(request.return_values, ReturnValues::AllOld);
+    /// ```
     #[must_use]
     pub fn with_return_values(mut self, return_values: ReturnValues) -> Self {
         self.return_values = return_values;
@@ -230,6 +264,13 @@ impl PutItemRequest {
 
     /// Include the existing item in the failure when the condition does not
     /// hold.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, PutItemRequest};
+    /// let request = PutItemRequest::new("users", item([("pk", s("u#1"))]))
+    ///     .with_return_values_on_condition_check_failure();
+    /// assert!(request.return_values_on_condition_check_failure);
+    /// ```
     #[must_use]
     pub fn with_return_values_on_condition_check_failure(mut self) -> Self {
         self.return_values_on_condition_check_failure = true;
@@ -237,6 +278,13 @@ impl PutItemRequest {
     }
 
     /// Choose what the response reports about consumed capacity.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, PutItemRequest, ReturnConsumedCapacity};
+    /// let request = PutItemRequest::new("users", item([("pk", s("u#1"))]))
+    ///     .with_return_consumed_capacity(ReturnConsumedCapacity::Total);
+    /// assert_eq!(request.return_consumed_capacity, ReturnConsumedCapacity::Total);
+    /// ```
     #[must_use]
     pub fn with_return_consumed_capacity(mut self, mode: ReturnConsumedCapacity) -> Self {
         self.return_consumed_capacity = mode;
@@ -244,6 +292,16 @@ impl PutItemRequest {
     }
 
     /// Choose whether the response reports the written item's collection size.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, PutItemRequest, ReturnItemCollectionMetrics};
+    /// let request = PutItemRequest::new("users", item([("pk", s("u#1"))]))
+    ///     .with_return_item_collection_metrics(ReturnItemCollectionMetrics::Size);
+    /// assert_eq!(
+    ///     request.return_item_collection_metrics,
+    ///     ReturnItemCollectionMetrics::Size
+    /// );
+    /// ```
     #[must_use]
     pub fn with_return_item_collection_metrics(
         mut self,
@@ -255,6 +313,14 @@ impl PutItemRequest {
 }
 
 /// `PutItem` output.
+///
+/// ```
+/// use mock_ddb::{item, s, PutItemOutput};
+/// let mut output = PutItemOutput::default();
+/// output.attributes = Some(item([("pk", s("u#1"))]));
+/// assert_eq!(output.attributes.as_ref().unwrap().len(), 1);
+/// assert!(output.consumed_capacity.is_none());
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 #[non_exhaustive]
 pub struct PutItemOutput {
@@ -268,6 +334,12 @@ pub struct PutItemOutput {
 }
 
 /// `GetItem` input.
+///
+/// ```
+/// use mock_ddb::{item, s, GetItemRequest};
+/// let request = GetItemRequest::new("users", item([("pk", s("u#1"))]));
+/// assert_eq!(request.table_name, "users");
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GetItemRequest {
     /// Table to read from.
@@ -286,6 +358,12 @@ pub struct GetItemRequest {
 
 impl GetItemRequest {
     /// A read of `key` from `table_name`.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, GetItemRequest};
+    /// let request = GetItemRequest::new("users", item([("pk", s("u#1"))]));
+    /// assert_eq!(request.key.len(), 1);
+    /// ```
     #[must_use]
     pub fn new(table_name: impl Into<String>, key: Item) -> Self {
         Self {
@@ -296,6 +374,13 @@ impl GetItemRequest {
     }
 
     /// Project the response down to `expression`.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, GetItemRequest};
+    /// let request =
+    ///     GetItemRequest::new("users", item([("pk", s("u#1"))])).with_projection("#n, age");
+    /// assert_eq!(request.projection_expression.as_deref(), Some("#n, age"));
+    /// ```
     #[must_use]
     pub fn with_projection(mut self, expression: impl Into<String>) -> Self {
         self.projection_expression = Some(expression.into());
@@ -303,6 +388,13 @@ impl GetItemRequest {
     }
 
     /// Attach expression-attribute names for the projection.
+    ///
+    /// ```
+    /// use mock_ddb::{item, names, s, GetItemRequest};
+    /// let request =
+    ///     GetItemRequest::new("users", item([("pk", s("u#1"))])).with_names(names([("#n", "name")]));
+    /// assert_eq!(request.expression_attribute_names.as_ref().unwrap()["#n"], "name");
+    /// ```
     #[must_use]
     pub fn with_names(mut self, names: HashMap<String, String>) -> Self {
         self.expression_attribute_names = Some(names);
@@ -310,6 +402,13 @@ impl GetItemRequest {
     }
 
     /// Choose what the response reports about consumed capacity.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, GetItemRequest, ReturnConsumedCapacity};
+    /// let request = GetItemRequest::new("users", item([("pk", s("u#1"))]))
+    ///     .with_return_consumed_capacity(ReturnConsumedCapacity::Indexes);
+    /// assert_eq!(request.return_consumed_capacity, ReturnConsumedCapacity::Indexes);
+    /// ```
     #[must_use]
     pub fn with_return_consumed_capacity(mut self, mode: ReturnConsumedCapacity) -> Self {
         self.return_consumed_capacity = mode;
@@ -318,6 +417,12 @@ impl GetItemRequest {
 }
 
 /// `GetItem` output. `item` is `None` when the key is absent or expired.
+///
+/// ```
+/// use mock_ddb::GetItemOutput;
+/// let output = GetItemOutput::default();
+/// assert!(output.item.is_none());
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 #[non_exhaustive]
 pub struct GetItemOutput {
@@ -328,6 +433,12 @@ pub struct GetItemOutput {
 }
 
 /// `DeleteItem` input.
+///
+/// ```
+/// use mock_ddb::{item, s, DeleteItemRequest};
+/// let request = DeleteItemRequest::new("users", item([("pk", s("u#1"))]));
+/// assert_eq!(request.key.len(), 1);
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DeleteItemRequest {
     /// Table to delete from.
@@ -352,6 +463,12 @@ pub struct DeleteItemRequest {
 
 impl DeleteItemRequest {
     /// A delete of `key` from `table_name`.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, DeleteItemRequest};
+    /// let request = DeleteItemRequest::new("users", item([("pk", s("u#1"))]));
+    /// assert_eq!(request.table_name, "users");
+    /// ```
     #[must_use]
     pub fn new(table_name: impl Into<String>, key: Item) -> Self {
         Self {
@@ -362,6 +479,13 @@ impl DeleteItemRequest {
     }
 
     /// Require `expression` to hold before deleting.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, DeleteItemRequest};
+    /// let request = DeleteItemRequest::new("users", item([("pk", s("u#1"))]))
+    ///     .with_condition("attribute_exists(pk)");
+    /// assert_eq!(request.condition_expression.as_deref(), Some("attribute_exists(pk)"));
+    /// ```
     #[must_use]
     pub fn with_condition(mut self, expression: impl Into<String>) -> Self {
         self.condition_expression = Some(expression.into());
@@ -369,6 +493,13 @@ impl DeleteItemRequest {
     }
 
     /// Attach expression-attribute names.
+    ///
+    /// ```
+    /// use mock_ddb::{item, names, s, DeleteItemRequest};
+    /// let request = DeleteItemRequest::new("users", item([("pk", s("u#1"))]))
+    ///     .with_names(names([("#n", "name")]));
+    /// assert_eq!(request.expression_attribute_names.as_ref().unwrap()["#n"], "name");
+    /// ```
     #[must_use]
     pub fn with_names(mut self, names: HashMap<String, String>) -> Self {
         self.expression_attribute_names = Some(names);
@@ -376,6 +507,13 @@ impl DeleteItemRequest {
     }
 
     /// Attach expression-attribute values.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, values, DeleteItemRequest};
+    /// let request = DeleteItemRequest::new("users", item([("pk", s("u#1"))]))
+    ///     .with_values(values([(":n", s("x"))]));
+    /// assert_eq!(request.expression_attribute_values.as_ref().unwrap().len(), 1);
+    /// ```
     #[must_use]
     pub fn with_values(mut self, values: HashMap<String, AttributeValue>) -> Self {
         self.expression_attribute_values = Some(values);
@@ -383,6 +521,13 @@ impl DeleteItemRequest {
     }
 
     /// Choose what the delete returns.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, DeleteItemRequest, ReturnValues};
+    /// let request = DeleteItemRequest::new("users", item([("pk", s("u#1"))]))
+    ///     .with_return_values(ReturnValues::AllOld);
+    /// assert_eq!(request.return_values, ReturnValues::AllOld);
+    /// ```
     #[must_use]
     pub fn with_return_values(mut self, return_values: ReturnValues) -> Self {
         self.return_values = return_values;
@@ -391,6 +536,13 @@ impl DeleteItemRequest {
 
     /// Include the existing item in the failure when the condition does not
     /// hold.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, DeleteItemRequest};
+    /// let request = DeleteItemRequest::new("users", item([("pk", s("u#1"))]))
+    ///     .with_return_values_on_condition_check_failure();
+    /// assert!(request.return_values_on_condition_check_failure);
+    /// ```
     #[must_use]
     pub fn with_return_values_on_condition_check_failure(mut self) -> Self {
         self.return_values_on_condition_check_failure = true;
@@ -398,6 +550,13 @@ impl DeleteItemRequest {
     }
 
     /// Choose what the response reports about consumed capacity.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, DeleteItemRequest, ReturnConsumedCapacity};
+    /// let request = DeleteItemRequest::new("users", item([("pk", s("u#1"))]))
+    ///     .with_return_consumed_capacity(ReturnConsumedCapacity::Total);
+    /// assert_eq!(request.return_consumed_capacity, ReturnConsumedCapacity::Total);
+    /// ```
     #[must_use]
     pub fn with_return_consumed_capacity(mut self, mode: ReturnConsumedCapacity) -> Self {
         self.return_consumed_capacity = mode;
@@ -405,6 +564,16 @@ impl DeleteItemRequest {
     }
 
     /// Choose whether the response reports the written item's collection size.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, DeleteItemRequest, ReturnItemCollectionMetrics};
+    /// let request = DeleteItemRequest::new("users", item([("pk", s("u#1"))]))
+    ///     .with_return_item_collection_metrics(ReturnItemCollectionMetrics::Size);
+    /// assert_eq!(
+    ///     request.return_item_collection_metrics,
+    ///     ReturnItemCollectionMetrics::Size
+    /// );
+    /// ```
     #[must_use]
     pub fn with_return_item_collection_metrics(
         mut self,
@@ -416,6 +585,12 @@ impl DeleteItemRequest {
 }
 
 /// `DeleteItem` output.
+///
+/// ```
+/// use mock_ddb::DeleteItemOutput;
+/// let output = DeleteItemOutput::default();
+/// assert!(output.attributes.is_none());
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 #[non_exhaustive]
 pub struct DeleteItemOutput {
@@ -429,6 +604,12 @@ pub struct DeleteItemOutput {
 }
 
 /// `UpdateItem` input.
+///
+/// ```
+/// use mock_ddb::{item, s, UpdateItemRequest};
+/// let request = UpdateItemRequest::new("users", item([("pk", s("u#1"))]), "SET age = :a");
+/// assert_eq!(request.update_expression, "SET age = :a");
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct UpdateItemRequest {
     /// Table to update.
@@ -455,6 +636,12 @@ pub struct UpdateItemRequest {
 
 impl UpdateItemRequest {
     /// An update of `key` in `table_name` with `expression`.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, UpdateItemRequest};
+    /// let request = UpdateItemRequest::new("users", item([("pk", s("u#1"))]), "SET age = :a");
+    /// assert_eq!(request.update_expression, "SET age = :a");
+    /// ```
     #[must_use]
     pub fn new(table_name: impl Into<String>, key: Item, expression: impl Into<String>) -> Self {
         Self {
@@ -466,6 +653,13 @@ impl UpdateItemRequest {
     }
 
     /// Require `expression` to hold before updating.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, UpdateItemRequest};
+    /// let request = UpdateItemRequest::new("users", item([("pk", s("u#1"))]), "SET age = :a")
+    ///     .with_condition("attribute_exists(pk)");
+    /// assert_eq!(request.condition_expression.as_deref(), Some("attribute_exists(pk)"));
+    /// ```
     #[must_use]
     pub fn with_condition(mut self, expression: impl Into<String>) -> Self {
         self.condition_expression = Some(expression.into());
@@ -473,6 +667,13 @@ impl UpdateItemRequest {
     }
 
     /// Attach expression-attribute names.
+    ///
+    /// ```
+    /// use mock_ddb::{item, names, s, UpdateItemRequest};
+    /// let request = UpdateItemRequest::new("users", item([("pk", s("u#1"))]), "SET #a = :a")
+    ///     .with_names(names([("#a", "age")]));
+    /// assert_eq!(request.expression_attribute_names.as_ref().unwrap()["#a"], "age");
+    /// ```
     #[must_use]
     pub fn with_names(mut self, names: HashMap<String, String>) -> Self {
         self.expression_attribute_names = Some(names);
@@ -480,6 +681,13 @@ impl UpdateItemRequest {
     }
 
     /// Attach expression-attribute values.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, values, UpdateItemRequest};
+    /// let request = UpdateItemRequest::new("users", item([("pk", s("u#1"))]), "SET age = :a")
+    ///     .with_values(values([(":a", s("42"))]));
+    /// assert_eq!(request.expression_attribute_values.as_ref().unwrap().len(), 1);
+    /// ```
     #[must_use]
     pub fn with_values(mut self, values: HashMap<String, AttributeValue>) -> Self {
         self.expression_attribute_values = Some(values);
@@ -487,6 +695,13 @@ impl UpdateItemRequest {
     }
 
     /// Choose what the update returns.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, ReturnValues, UpdateItemRequest};
+    /// let request = UpdateItemRequest::new("users", item([("pk", s("u#1"))]), "SET age = :a")
+    ///     .with_return_values(ReturnValues::UpdatedNew);
+    /// assert_eq!(request.return_values, ReturnValues::UpdatedNew);
+    /// ```
     #[must_use]
     pub fn with_return_values(mut self, return_values: ReturnValues) -> Self {
         self.return_values = return_values;
@@ -495,6 +710,13 @@ impl UpdateItemRequest {
 
     /// Include the existing item in the failure when the condition does not
     /// hold.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, UpdateItemRequest};
+    /// let request = UpdateItemRequest::new("users", item([("pk", s("u#1"))]), "SET age = :a")
+    ///     .with_return_values_on_condition_check_failure();
+    /// assert!(request.return_values_on_condition_check_failure);
+    /// ```
     #[must_use]
     pub fn with_return_values_on_condition_check_failure(mut self) -> Self {
         self.return_values_on_condition_check_failure = true;
@@ -502,6 +724,13 @@ impl UpdateItemRequest {
     }
 
     /// Choose what the response reports about consumed capacity.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, ReturnConsumedCapacity, UpdateItemRequest};
+    /// let request = UpdateItemRequest::new("users", item([("pk", s("u#1"))]), "SET age = :a")
+    ///     .with_return_consumed_capacity(ReturnConsumedCapacity::Total);
+    /// assert_eq!(request.return_consumed_capacity, ReturnConsumedCapacity::Total);
+    /// ```
     #[must_use]
     pub fn with_return_consumed_capacity(mut self, mode: ReturnConsumedCapacity) -> Self {
         self.return_consumed_capacity = mode;
@@ -509,6 +738,16 @@ impl UpdateItemRequest {
     }
 
     /// Choose whether the response reports the written item's collection size.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, ReturnItemCollectionMetrics, UpdateItemRequest};
+    /// let request = UpdateItemRequest::new("users", item([("pk", s("u#1"))]), "SET age = :a")
+    ///     .with_return_item_collection_metrics(ReturnItemCollectionMetrics::Size);
+    /// assert_eq!(
+    ///     request.return_item_collection_metrics,
+    ///     ReturnItemCollectionMetrics::Size
+    /// );
+    /// ```
     #[must_use]
     pub fn with_return_item_collection_metrics(
         mut self,
@@ -520,6 +759,12 @@ impl UpdateItemRequest {
 }
 
 /// `UpdateItem` output.
+///
+/// ```
+/// use mock_ddb::UpdateItemOutput;
+/// let output = UpdateItemOutput::default();
+/// assert!(output.attributes.is_none());
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 #[non_exhaustive]
 pub struct UpdateItemOutput {
@@ -573,6 +818,12 @@ pub struct QueryRequest {
 
 impl QueryRequest {
     /// A query of `table_name` with `key_condition`.
+    ///
+    /// ```
+    /// use mock_ddb::QueryRequest;
+    /// let request = QueryRequest::new("users", "pk = :pk");
+    /// assert_eq!(request.key_condition_expression.as_deref(), Some("pk = :pk"));
+    /// ```
     #[must_use]
     pub fn new(table_name: impl Into<String>, key_condition: impl Into<String>) -> Self {
         Self {
@@ -583,6 +834,12 @@ impl QueryRequest {
     }
 
     /// Query a secondary index.
+    ///
+    /// ```
+    /// use mock_ddb::QueryRequest;
+    /// let request = QueryRequest::new("users", "pk = :pk").with_index("by_email");
+    /// assert_eq!(request.index_name.as_deref(), Some("by_email"));
+    /// ```
     #[must_use]
     pub fn with_index(mut self, index_name: impl Into<String>) -> Self {
         self.index_name = Some(index_name.into());
@@ -590,6 +847,12 @@ impl QueryRequest {
     }
 
     /// Apply a filter after the key condition.
+    ///
+    /// ```
+    /// use mock_ddb::QueryRequest;
+    /// let request = QueryRequest::new("users", "pk = :pk").with_filter("age > :a");
+    /// assert_eq!(request.filter_expression.as_deref(), Some("age > :a"));
+    /// ```
     #[must_use]
     pub fn with_filter(mut self, expression: impl Into<String>) -> Self {
         self.filter_expression = Some(expression.into());
@@ -597,6 +860,12 @@ impl QueryRequest {
     }
 
     /// Set the sort direction.
+    ///
+    /// ```
+    /// use mock_ddb::QueryRequest;
+    /// let request = QueryRequest::new("users", "pk = :pk").with_scan_index_forward(false);
+    /// assert_eq!(request.scan_index_forward, Some(false));
+    /// ```
     #[must_use]
     pub fn with_scan_index_forward(mut self, ascending: bool) -> Self {
         self.scan_index_forward = Some(ascending);
@@ -604,6 +873,12 @@ impl QueryRequest {
     }
 
     /// Cap the number of evaluated items.
+    ///
+    /// ```
+    /// use mock_ddb::QueryRequest;
+    /// let request = QueryRequest::new("users", "pk = :pk").with_limit(5);
+    /// assert_eq!(request.limit, Some(5));
+    /// ```
     #[must_use]
     pub fn with_limit(mut self, limit: u32) -> Self {
         self.limit = Some(limit);
@@ -611,6 +886,13 @@ impl QueryRequest {
     }
 
     /// Continue after `key`.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, QueryRequest};
+    /// let request = QueryRequest::new("users", "pk = :pk")
+    ///     .with_exclusive_start_key(item([("pk", s("u#9"))]));
+    /// assert!(request.exclusive_start_key.is_some());
+    /// ```
     #[must_use]
     pub fn with_exclusive_start_key(mut self, key: Item) -> Self {
         self.exclusive_start_key = Some(key);
@@ -618,6 +900,12 @@ impl QueryRequest {
     }
 
     /// Project the response.
+    ///
+    /// ```
+    /// use mock_ddb::QueryRequest;
+    /// let request = QueryRequest::new("users", "pk = :pk").with_projection("#n");
+    /// assert_eq!(request.projection_expression.as_deref(), Some("#n"));
+    /// ```
     #[must_use]
     pub fn with_projection(mut self, expression: impl Into<String>) -> Self {
         self.projection_expression = Some(expression.into());
@@ -625,6 +913,12 @@ impl QueryRequest {
     }
 
     /// Attach expression-attribute names.
+    ///
+    /// ```
+    /// use mock_ddb::{names, QueryRequest};
+    /// let request = QueryRequest::new("users", "pk = :pk").with_names(names([("#n", "name")]));
+    /// assert_eq!(request.expression_attribute_names.as_ref().unwrap()["#n"], "name");
+    /// ```
     #[must_use]
     pub fn with_names(mut self, names: HashMap<String, String>) -> Self {
         self.expression_attribute_names = Some(names);
@@ -632,6 +926,12 @@ impl QueryRequest {
     }
 
     /// Attach expression-attribute values.
+    ///
+    /// ```
+    /// use mock_ddb::{s, values, QueryRequest};
+    /// let request = QueryRequest::new("users", "pk = :pk").with_values(values([(":pk", s("u#1"))]));
+    /// assert_eq!(request.expression_attribute_values.as_ref().unwrap().len(), 1);
+    /// ```
     #[must_use]
     pub fn with_values(mut self, values: HashMap<String, AttributeValue>) -> Self {
         self.expression_attribute_values = Some(values);
@@ -639,6 +939,12 @@ impl QueryRequest {
     }
 
     /// Select counts or specific attributes.
+    ///
+    /// ```
+    /// use mock_ddb::{QueryRequest, Select};
+    /// let request = QueryRequest::new("users", "pk = :pk").with_select(Select::Count);
+    /// assert_eq!(request.select, Select::Count);
+    /// ```
     #[must_use]
     pub fn with_select(mut self, select: Select) -> Self {
         self.select = select;
@@ -646,6 +952,13 @@ impl QueryRequest {
     }
 
     /// Choose what the response reports about consumed capacity.
+    ///
+    /// ```
+    /// use mock_ddb::{QueryRequest, ReturnConsumedCapacity};
+    /// let request = QueryRequest::new("users", "pk = :pk")
+    ///     .with_return_consumed_capacity(ReturnConsumedCapacity::Total);
+    /// assert_eq!(request.return_consumed_capacity, ReturnConsumedCapacity::Total);
+    /// ```
     #[must_use]
     pub fn with_return_consumed_capacity(mut self, mode: ReturnConsumedCapacity) -> Self {
         self.return_consumed_capacity = mode;
@@ -654,6 +967,14 @@ impl QueryRequest {
 }
 
 /// `Query` output.
+///
+/// ```
+/// use mock_ddb::QueryOutput;
+/// let mut output = QueryOutput::default();
+/// output.count = 3;
+/// assert!(output.items.is_empty());
+/// assert_eq!(output.scanned_count, 0);
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 #[non_exhaustive]
 pub struct QueryOutput {
@@ -670,6 +991,13 @@ pub struct QueryOutput {
 }
 
 /// `Scan` input.
+///
+/// ```
+/// use mock_ddb::ScanRequest;
+/// let request = ScanRequest::new("users");
+/// assert_eq!(request.table_name, "users");
+/// assert!(request.filter_expression.is_none());
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ScanRequest {
     /// Table to scan.
@@ -702,6 +1030,12 @@ pub struct ScanRequest {
 
 impl ScanRequest {
     /// A scan of `table_name`.
+    ///
+    /// ```
+    /// use mock_ddb::ScanRequest;
+    /// let request = ScanRequest::new("users");
+    /// assert_eq!(request.table_name, "users");
+    /// ```
     #[must_use]
     pub fn new(table_name: impl Into<String>) -> Self {
         Self {
@@ -711,6 +1045,12 @@ impl ScanRequest {
     }
 
     /// Apply a filter.
+    ///
+    /// ```
+    /// use mock_ddb::ScanRequest;
+    /// let request = ScanRequest::new("users").with_filter("age > :a");
+    /// assert_eq!(request.filter_expression.as_deref(), Some("age > :a"));
+    /// ```
     #[must_use]
     pub fn with_filter(mut self, expression: impl Into<String>) -> Self {
         self.filter_expression = Some(expression.into());
@@ -718,6 +1058,12 @@ impl ScanRequest {
     }
 
     /// Cap the number of evaluated items.
+    ///
+    /// ```
+    /// use mock_ddb::ScanRequest;
+    /// let request = ScanRequest::new("users").with_limit(10);
+    /// assert_eq!(request.limit, Some(10));
+    /// ```
     #[must_use]
     pub fn with_limit(mut self, limit: u32) -> Self {
         self.limit = Some(limit);
@@ -725,6 +1071,12 @@ impl ScanRequest {
     }
 
     /// Continue after `key`.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, ScanRequest};
+    /// let request = ScanRequest::new("users").with_exclusive_start_key(item([("pk", s("u#9"))]));
+    /// assert!(request.exclusive_start_key.is_some());
+    /// ```
     #[must_use]
     pub fn with_exclusive_start_key(mut self, key: Item) -> Self {
         self.exclusive_start_key = Some(key);
@@ -732,6 +1084,13 @@ impl ScanRequest {
     }
 
     /// Scan one segment of a parallel scan.
+    ///
+    /// ```
+    /// use mock_ddb::ScanRequest;
+    /// let request = ScanRequest::new("users").with_segment(1, 4);
+    /// assert_eq!(request.segment, Some(1));
+    /// assert_eq!(request.total_segments, Some(4));
+    /// ```
     #[must_use]
     pub fn with_segment(mut self, segment: u32, total_segments: u32) -> Self {
         self.segment = Some(segment);
@@ -740,6 +1099,12 @@ impl ScanRequest {
     }
 
     /// Scan a secondary index.
+    ///
+    /// ```
+    /// use mock_ddb::ScanRequest;
+    /// let request = ScanRequest::new("users").with_index("by_email");
+    /// assert_eq!(request.index_name.as_deref(), Some("by_email"));
+    /// ```
     #[must_use]
     pub fn with_index(mut self, index_name: impl Into<String>) -> Self {
         self.index_name = Some(index_name.into());
@@ -747,6 +1112,12 @@ impl ScanRequest {
     }
 
     /// Project the response.
+    ///
+    /// ```
+    /// use mock_ddb::ScanRequest;
+    /// let request = ScanRequest::new("users").with_projection("#n");
+    /// assert_eq!(request.projection_expression.as_deref(), Some("#n"));
+    /// ```
     #[must_use]
     pub fn with_projection(mut self, expression: impl Into<String>) -> Self {
         self.projection_expression = Some(expression.into());
@@ -754,6 +1125,12 @@ impl ScanRequest {
     }
 
     /// Attach expression-attribute names.
+    ///
+    /// ```
+    /// use mock_ddb::{names, ScanRequest};
+    /// let request = ScanRequest::new("users").with_names(names([("#n", "name")]));
+    /// assert_eq!(request.expression_attribute_names.as_ref().unwrap()["#n"], "name");
+    /// ```
     #[must_use]
     pub fn with_names(mut self, names: HashMap<String, String>) -> Self {
         self.expression_attribute_names = Some(names);
@@ -761,6 +1138,12 @@ impl ScanRequest {
     }
 
     /// Attach expression-attribute values.
+    ///
+    /// ```
+    /// use mock_ddb::{s, values, ScanRequest};
+    /// let request = ScanRequest::new("users").with_values(values([(":a", s("30"))]));
+    /// assert_eq!(request.expression_attribute_values.as_ref().unwrap().len(), 1);
+    /// ```
     #[must_use]
     pub fn with_values(mut self, values: HashMap<String, AttributeValue>) -> Self {
         self.expression_attribute_values = Some(values);
@@ -768,6 +1151,12 @@ impl ScanRequest {
     }
 
     /// Select counts or specific attributes.
+    ///
+    /// ```
+    /// use mock_ddb::{ScanRequest, Select};
+    /// let request = ScanRequest::new("users").with_select(Select::Count);
+    /// assert_eq!(request.select, Select::Count);
+    /// ```
     #[must_use]
     pub fn with_select(mut self, select: Select) -> Self {
         self.select = select;
@@ -775,6 +1164,13 @@ impl ScanRequest {
     }
 
     /// Choose what the response reports about consumed capacity.
+    ///
+    /// ```
+    /// use mock_ddb::{ReturnConsumedCapacity, ScanRequest};
+    /// let request =
+    ///     ScanRequest::new("users").with_return_consumed_capacity(ReturnConsumedCapacity::Total);
+    /// assert_eq!(request.return_consumed_capacity, ReturnConsumedCapacity::Total);
+    /// ```
     #[must_use]
     pub fn with_return_consumed_capacity(mut self, mode: ReturnConsumedCapacity) -> Self {
         self.return_consumed_capacity = mode;
@@ -783,6 +1179,12 @@ impl ScanRequest {
 }
 
 /// `Scan` output.
+///
+/// ```
+/// use mock_ddb::ScanOutput;
+/// let output = ScanOutput::default();
+/// assert!(output.last_evaluated_key.is_none());
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 #[non_exhaustive]
 pub struct ScanOutput {
@@ -799,6 +1201,14 @@ pub struct ScanOutput {
 }
 
 /// One write in a `BatchWriteItem` request.
+///
+/// ```
+/// use mock_ddb::{item, s, WriteRequest};
+/// let delete = WriteRequest::Delete {
+///     key: item([("pk", s("u#1"))]),
+/// };
+/// assert!(matches!(delete, WriteRequest::Delete { .. }));
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum WriteRequest {
@@ -815,6 +1225,17 @@ pub enum WriteRequest {
 }
 
 /// `BatchWriteItem` input.
+///
+/// ```
+/// use mock_ddb::{item, s, BatchWriteItemRequest, WriteRequest};
+/// let batch = BatchWriteItemRequest::new().add(
+///     "users",
+///     WriteRequest::Put {
+///         item: item([("pk", s("u#1"))]),
+///     },
+/// );
+/// assert_eq!(batch.request_items["users"].len(), 1);
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BatchWriteItemRequest {
     /// Table name → writes. At most 25 writes in total.
@@ -827,12 +1248,28 @@ pub struct BatchWriteItemRequest {
 
 impl BatchWriteItemRequest {
     /// An empty request, to be filled with [`add`](Self::add).
+    ///
+    /// ```
+    /// use mock_ddb::BatchWriteItemRequest;
+    /// let request = BatchWriteItemRequest::new();
+    /// assert!(request.request_items.is_empty());
+    /// ```
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Append a write for `table_name`.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, BatchWriteItemRequest, WriteRequest};
+    /// let batch = BatchWriteItemRequest::new()
+    ///     .add("users", WriteRequest::Put { item: item([("pk", s("u#1"))]) })
+    ///     .add("users", WriteRequest::Delete { key: item([("pk", s("u#2"))]) })
+    ///     .add("orders", WriteRequest::Delete { key: item([("pk", s("o#1"))]) });
+    /// assert_eq!(batch.request_items["users"].len(), 2);
+    /// assert_eq!(batch.request_items["orders"].len(), 1);
+    /// ```
     #[must_use]
     pub fn add(mut self, table_name: impl Into<String>, write: WriteRequest) -> Self {
         self.request_items
@@ -843,6 +1280,13 @@ impl BatchWriteItemRequest {
     }
 
     /// Choose what the response reports about consumed capacity.
+    ///
+    /// ```
+    /// use mock_ddb::{BatchWriteItemRequest, ReturnConsumedCapacity};
+    /// let request =
+    ///     BatchWriteItemRequest::new().with_return_consumed_capacity(ReturnConsumedCapacity::Total);
+    /// assert_eq!(request.return_consumed_capacity, ReturnConsumedCapacity::Total);
+    /// ```
     #[must_use]
     pub fn with_return_consumed_capacity(mut self, mode: ReturnConsumedCapacity) -> Self {
         self.return_consumed_capacity = mode;
@@ -850,6 +1294,16 @@ impl BatchWriteItemRequest {
     }
 
     /// Choose whether the response reports the touched item collections.
+    ///
+    /// ```
+    /// use mock_ddb::{BatchWriteItemRequest, ReturnItemCollectionMetrics};
+    /// let request = BatchWriteItemRequest::new()
+    ///     .with_return_item_collection_metrics(ReturnItemCollectionMetrics::Size);
+    /// assert_eq!(
+    ///     request.return_item_collection_metrics,
+    ///     ReturnItemCollectionMetrics::Size
+    /// );
+    /// ```
     #[must_use]
     pub fn with_return_item_collection_metrics(
         mut self,
@@ -861,6 +1315,13 @@ impl BatchWriteItemRequest {
 }
 
 /// `BatchWriteItem` output.
+///
+/// ```
+/// use mock_ddb::BatchWriteItemOutput;
+/// let output = BatchWriteItemOutput::default();
+/// assert!(output.unprocessed_items.is_empty());
+/// assert!(output.consumed_capacity.is_empty());
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 #[non_exhaustive]
 pub struct BatchWriteItemOutput {
@@ -874,6 +1335,13 @@ pub struct BatchWriteItemOutput {
 }
 
 /// The keys and options for one table in a `BatchGetItem` request.
+///
+/// ```
+/// use mock_ddb::{item, s, KeysAndAttributes};
+/// let keys = KeysAndAttributes::new(vec![item([("pk", s("u#1"))])]);
+/// assert_eq!(keys.keys.len(), 1);
+/// assert!(keys.projection_expression.is_none());
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct KeysAndAttributes {
     /// Keys to read.
@@ -893,6 +1361,12 @@ pub struct KeysAndAttributes {
 
 impl KeysAndAttributes {
     /// Keys with no projection.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, KeysAndAttributes};
+    /// let keys = KeysAndAttributes::new(vec![item([("pk", s("u#1"))]), item([("pk", s("u#2"))])]);
+    /// assert_eq!(keys.keys.len(), 2);
+    /// ```
     #[must_use]
     pub fn new(keys: Vec<Item>) -> Self {
         Self {
@@ -902,6 +1376,12 @@ impl KeysAndAttributes {
     }
 
     /// Project each returned item.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, KeysAndAttributes};
+    /// let keys = KeysAndAttributes::new(vec![item([("pk", s("u#1"))])]).with_projection("pk, #n");
+    /// assert_eq!(keys.projection_expression.as_deref(), Some("pk, #n"));
+    /// ```
     #[must_use]
     pub fn with_projection(mut self, expression: impl Into<String>) -> Self {
         self.projection_expression = Some(expression.into());
@@ -942,6 +1422,14 @@ fn merged_aliases(
 }
 
 /// `BatchGetItem` input.
+///
+/// ```
+/// use mock_ddb::{item, s, BatchGetItemRequest, KeysAndAttributes};
+/// let batch = BatchGetItemRequest::new()
+///     .add("users", KeysAndAttributes::new(vec![item([("pk", s("u#1"))])]))
+///     .unwrap();
+/// assert_eq!(batch.request_items.len(), 1);
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BatchGetItemRequest {
     /// Table name → keys. At most 100 keys in total.
@@ -952,6 +1440,12 @@ pub struct BatchGetItemRequest {
 
 impl BatchGetItemRequest {
     /// An empty request, to be filled with [`add`](Self::add).
+    ///
+    /// ```
+    /// use mock_ddb::BatchGetItemRequest;
+    /// let request = BatchGetItemRequest::new();
+    /// assert!(request.request_items.is_empty());
+    /// ```
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -1024,6 +1518,13 @@ impl BatchGetItemRequest {
     }
 
     /// Choose what the response reports about consumed capacity.
+    ///
+    /// ```
+    /// use mock_ddb::{BatchGetItemRequest, ReturnConsumedCapacity};
+    /// let request =
+    ///     BatchGetItemRequest::new().with_return_consumed_capacity(ReturnConsumedCapacity::Indexes);
+    /// assert_eq!(request.return_consumed_capacity, ReturnConsumedCapacity::Indexes);
+    /// ```
     #[must_use]
     pub fn with_return_consumed_capacity(mut self, mode: ReturnConsumedCapacity) -> Self {
         self.return_consumed_capacity = mode;
@@ -1032,6 +1533,12 @@ impl BatchGetItemRequest {
 }
 
 /// `BatchGetItem` output.
+///
+/// ```
+/// use mock_ddb::BatchGetItemOutput;
+/// let output = BatchGetItemOutput::default();
+/// assert!(output.responses.is_empty());
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 #[non_exhaustive]
 pub struct BatchGetItemOutput {
@@ -1045,6 +1552,16 @@ pub struct BatchGetItemOutput {
 }
 
 /// The `Put` action of a transaction.
+///
+/// ```
+/// use mock_ddb::{item, s, TransactPut};
+/// let action = TransactPut {
+///     table_name: "users".to_string(),
+///     item: item([("pk", s("u#1"))]),
+///     ..TransactPut::default()
+/// };
+/// assert!(action.condition_expression.is_none());
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TransactPut {
     /// Table to write to.
@@ -1062,6 +1579,17 @@ pub struct TransactPut {
 }
 
 /// The `Update` action of a transaction.
+///
+/// ```
+/// use mock_ddb::{item, s, TransactUpdate};
+/// let action = TransactUpdate {
+///     table_name: "users".to_string(),
+///     key: item([("pk", s("u#1"))]),
+///     update_expression: "SET age = :a".to_string(),
+///     ..TransactUpdate::default()
+/// };
+/// assert_eq!(action.update_expression, "SET age = :a");
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TransactUpdate {
     /// Table to update.
@@ -1081,6 +1609,16 @@ pub struct TransactUpdate {
 }
 
 /// The `Delete` action of a transaction.
+///
+/// ```
+/// use mock_ddb::{item, s, TransactDelete};
+/// let action = TransactDelete {
+///     table_name: "users".to_string(),
+///     key: item([("pk", s("u#1"))]),
+///     ..TransactDelete::default()
+/// };
+/// assert_eq!(action.table_name, "users");
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TransactDelete {
     /// Table to delete from.
@@ -1099,6 +1637,17 @@ pub struct TransactDelete {
 
 /// The `ConditionCheck` action of a transaction: assert something, write
 /// nothing.
+///
+/// ```
+/// use mock_ddb::{item, s, TransactConditionCheck};
+/// let check = TransactConditionCheck {
+///     table_name: "users".to_string(),
+///     key: item([("pk", s("u#1"))]),
+///     condition_expression: "attribute_exists(pk)".to_string(),
+///     ..TransactConditionCheck::default()
+/// };
+/// assert_eq!(check.condition_expression, "attribute_exists(pk)");
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TransactConditionCheck {
     /// Table the item lives in.
@@ -1116,6 +1665,13 @@ pub struct TransactConditionCheck {
 }
 
 /// One action of a transaction. Exactly one variant per member.
+///
+/// ```
+/// use mock_ddb::{item, s, TransactWriteItem};
+/// let action = TransactWriteItem::delete("users", item([("pk", s("u#1"))]));
+/// assert_eq!(action.table_name(), "users");
+/// assert!(matches!(action, TransactWriteItem::Delete(_)));
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum TransactWriteItem {
@@ -1131,6 +1687,12 @@ pub enum TransactWriteItem {
 
 impl TransactWriteItem {
     /// A `Put` action.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, TransactWriteItem};
+    /// let action = TransactWriteItem::put("users", item([("pk", s("u#1"))]));
+    /// assert!(matches!(action, TransactWriteItem::Put(_)));
+    /// ```
     #[must_use]
     pub fn put(table_name: impl Into<String>, item: Item) -> Self {
         Self::Put(TransactPut {
@@ -1141,6 +1703,16 @@ impl TransactWriteItem {
     }
 
     /// An `Update` action.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, TransactWriteItem};
+    /// let action = TransactWriteItem::update("users", item([("pk", s("u#1"))]), "SET age = :a");
+    /// let update = match action {
+    ///     TransactWriteItem::Update(update) => update,
+    ///     other => panic!("expected an update, got {other:?}"),
+    /// };
+    /// assert_eq!(update.update_expression, "SET age = :a");
+    /// ```
     #[must_use]
     pub fn update(table_name: impl Into<String>, key: Item, expression: impl Into<String>) -> Self {
         Self::Update(TransactUpdate {
@@ -1152,6 +1724,12 @@ impl TransactWriteItem {
     }
 
     /// A `Delete` action.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, TransactWriteItem};
+    /// let action = TransactWriteItem::delete("users", item([("pk", s("u#1"))]));
+    /// assert!(matches!(action, TransactWriteItem::Delete(_)));
+    /// ```
     #[must_use]
     pub fn delete(table_name: impl Into<String>, key: Item) -> Self {
         Self::Delete(TransactDelete {
@@ -1162,6 +1740,17 @@ impl TransactWriteItem {
     }
 
     /// A `ConditionCheck` action.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, TransactWriteItem};
+    /// let action =
+    ///     TransactWriteItem::condition_check("users", item([("pk", s("u#1"))]), "attribute_exists(pk)");
+    /// let check = match action {
+    ///     TransactWriteItem::ConditionCheck(check) => check,
+    ///     other => panic!("expected a condition check, got {other:?}"),
+    /// };
+    /// assert_eq!(check.condition_expression, "attribute_exists(pk)");
+    /// ```
     #[must_use]
     pub fn condition_check(
         table_name: impl Into<String>,
@@ -1177,6 +1766,12 @@ impl TransactWriteItem {
     }
 
     /// The table this action targets.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, TransactWriteItem};
+    /// let action = TransactWriteItem::put("users", item([("pk", s("u#1"))]));
+    /// assert_eq!(action.table_name(), "users");
+    /// ```
     #[must_use]
     pub fn table_name(&self) -> &str {
         match self {
@@ -1188,6 +1783,17 @@ impl TransactWriteItem {
     }
 
     /// Attach expression-attribute names to whichever action this is.
+    ///
+    /// ```
+    /// use mock_ddb::{item, names, s, TransactWriteItem};
+    /// let action =
+    ///     TransactWriteItem::put("users", item([("pk", s("u#1"))])).with_names(names([("#n", "name")]));
+    /// let put = match action {
+    ///     TransactWriteItem::Put(put) => put,
+    ///     other => panic!("expected a put, got {other:?}"),
+    /// };
+    /// assert_eq!(put.expression_attribute_names.as_ref().unwrap()["#n"], "name");
+    /// ```
     #[must_use]
     pub fn with_names(mut self, names: HashMap<String, String>) -> Self {
         match &mut self {
@@ -1200,6 +1806,17 @@ impl TransactWriteItem {
     }
 
     /// Attach expression-attribute values to whichever action this is.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, values, TransactWriteItem};
+    /// let action = TransactWriteItem::put("users", item([("pk", s("u#1"))]))
+    ///     .with_values(values([(":v", s("x"))]));
+    /// let put = match action {
+    ///     TransactWriteItem::Put(put) => put,
+    ///     other => panic!("expected a put, got {other:?}"),
+    /// };
+    /// assert_eq!(put.expression_attribute_values.as_ref().unwrap().len(), 1);
+    /// ```
     #[must_use]
     pub fn with_values(mut self, values: HashMap<String, AttributeValue>) -> Self {
         match &mut self {
@@ -1212,6 +1829,17 @@ impl TransactWriteItem {
     }
 
     /// Attach a condition to whichever action this is.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, TransactWriteItem};
+    /// let action = TransactWriteItem::put("users", item([("pk", s("u#1"))]))
+    ///     .with_condition("attribute_not_exists(pk)");
+    /// let put = match action {
+    ///     TransactWriteItem::Put(put) => put,
+    ///     other => panic!("expected a put, got {other:?}"),
+    /// };
+    /// assert_eq!(put.condition_expression.as_deref(), Some("attribute_not_exists(pk)"));
+    /// ```
     #[must_use]
     pub fn with_condition(mut self, condition: impl Into<String>) -> Self {
         match &mut self {
@@ -1225,6 +1853,13 @@ impl TransactWriteItem {
 }
 
 /// `TransactWriteItems` input.
+///
+/// ```
+/// use mock_ddb::{item, s, TransactWriteItem, TransactWriteItemsRequest};
+/// let request =
+///     TransactWriteItemsRequest::new(vec![TransactWriteItem::put("users", item([("pk", s("u#1"))]))]);
+/// assert_eq!(request.transact_items.len(), 1);
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TransactWriteItemsRequest {
     /// The actions. At most 100, at most one per item.
@@ -1239,6 +1874,14 @@ pub struct TransactWriteItemsRequest {
 
 impl TransactWriteItemsRequest {
     /// A transaction over `transact_items`.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, TransactWriteItem, TransactWriteItemsRequest};
+    /// let request =
+    ///     TransactWriteItemsRequest::new(vec![TransactWriteItem::put("users", item([("pk", s("u#1"))]))]);
+    /// assert_eq!(request.transact_items.len(), 1);
+    /// assert!(request.client_request_token.is_none());
+    /// ```
     #[must_use]
     pub fn new(transact_items: Vec<TransactWriteItem>) -> Self {
         Self {
@@ -1249,6 +1892,14 @@ impl TransactWriteItemsRequest {
     }
 
     /// Make the transaction idempotent.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, TransactWriteItem, TransactWriteItemsRequest};
+    /// let request =
+    ///     TransactWriteItemsRequest::new(vec![TransactWriteItem::put("users", item([("pk", s("u#1"))]))])
+    ///         .with_client_request_token("charge-7f3a");
+    /// assert_eq!(request.client_request_token.as_deref(), Some("charge-7f3a"));
+    /// ```
     #[must_use]
     pub fn with_client_request_token(mut self, token: impl Into<String>) -> Self {
         self.client_request_token = Some(token.into());
@@ -1256,6 +1907,13 @@ impl TransactWriteItemsRequest {
     }
 
     /// Choose what the response reports about consumed capacity.
+    ///
+    /// ```
+    /// use mock_ddb::{TransactWriteItemsRequest, ReturnConsumedCapacity};
+    /// let request = TransactWriteItemsRequest::new(Vec::new())
+    ///     .with_return_consumed_capacity(ReturnConsumedCapacity::Total);
+    /// assert_eq!(request.return_consumed_capacity, ReturnConsumedCapacity::Total);
+    /// ```
     #[must_use]
     pub fn with_return_consumed_capacity(mut self, mode: ReturnConsumedCapacity) -> Self {
         self.return_consumed_capacity = mode;
@@ -1263,6 +1921,16 @@ impl TransactWriteItemsRequest {
     }
 
     /// Choose whether the response reports the touched item collections.
+    ///
+    /// ```
+    /// use mock_ddb::{ReturnItemCollectionMetrics, TransactWriteItemsRequest};
+    /// let request = TransactWriteItemsRequest::new(Vec::new())
+    ///     .with_return_item_collection_metrics(ReturnItemCollectionMetrics::Size);
+    /// assert_eq!(
+    ///     request.return_item_collection_metrics,
+    ///     ReturnItemCollectionMetrics::Size
+    /// );
+    /// ```
     #[must_use]
     pub fn with_return_item_collection_metrics(
         mut self,
@@ -1277,6 +1945,12 @@ impl TransactWriteItemsRequest {
 ///
 /// A transaction writes to several tables at once, so the capacity is one entry
 /// per table, in table-name order.
+///
+/// ```
+/// use mock_ddb::TransactWriteItemsOutput;
+/// let output = TransactWriteItemsOutput::default();
+/// assert!(output.consumed_capacity.is_empty());
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 #[non_exhaustive]
 pub struct TransactWriteItemsOutput {
@@ -1287,6 +1961,12 @@ pub struct TransactWriteItemsOutput {
 }
 
 /// One `Get` action of a transaction.
+///
+/// ```
+/// use mock_ddb::{item, s, TransactGet};
+/// let get = TransactGet::new("users", item([("pk", s("u#1"))]));
+/// assert_eq!(get.table_name, "users");
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TransactGet {
     /// Table to read.
@@ -1301,6 +1981,13 @@ pub struct TransactGet {
 
 impl TransactGet {
     /// A read of `key` from `table_name`.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, TransactGet};
+    /// let get = TransactGet::new("users", item([("pk", s("u#1"))]));
+    /// assert_eq!(get.key.len(), 1);
+    /// assert!(get.projection_expression.is_none());
+    /// ```
     #[must_use]
     pub fn new(table_name: impl Into<String>, key: Item) -> Self {
         Self {
@@ -1312,6 +1999,13 @@ impl TransactGet {
 }
 
 /// `TransactGetItems` input.
+///
+/// ```
+/// use mock_ddb::{item, s, TransactGet, TransactGetItemsRequest};
+/// let request =
+///     TransactGetItemsRequest::new(vec![TransactGet::new("users", item([("pk", s("u#1"))]))]);
+/// assert_eq!(request.transact_items.len(), 1);
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TransactGetItemsRequest {
     /// The reads. At most 100.
@@ -1322,6 +2016,12 @@ pub struct TransactGetItemsRequest {
 
 impl TransactGetItemsRequest {
     /// A transaction over `transact_items`.
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, TransactGet, TransactGetItemsRequest};
+    /// let request = TransactGetItemsRequest::new(vec![TransactGet::new("users", item([("pk", s("u#1"))]))]);
+    /// assert_eq!(request.transact_items.len(), 1);
+    /// ```
     #[must_use]
     pub fn new(transact_items: Vec<TransactGet>) -> Self {
         Self {
@@ -1331,6 +2031,13 @@ impl TransactGetItemsRequest {
     }
 
     /// Choose what the response reports about consumed capacity.
+    ///
+    /// ```
+    /// use mock_ddb::{ReturnConsumedCapacity, TransactGetItemsRequest};
+    /// let request = TransactGetItemsRequest::new(Vec::new())
+    ///     .with_return_consumed_capacity(ReturnConsumedCapacity::Indexes);
+    /// assert_eq!(request.return_consumed_capacity, ReturnConsumedCapacity::Indexes);
+    /// ```
     #[must_use]
     pub fn with_return_consumed_capacity(mut self, mode: ReturnConsumedCapacity) -> Self {
         self.return_consumed_capacity = mode;
@@ -1339,6 +2046,12 @@ impl TransactGetItemsRequest {
 }
 
 /// `TransactGetItems` output.
+///
+/// ```
+/// use mock_ddb::TransactGetItemsOutput;
+/// let output = TransactGetItemsOutput::default();
+/// assert!(output.responses.is_empty());
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 #[non_exhaustive]
 pub struct TransactGetItemsOutput {
@@ -1349,6 +2062,12 @@ pub struct TransactGetItemsOutput {
 }
 
 /// `UpdateTimeToLive` input.
+///
+/// ```
+/// use mock_ddb::UpdateTimeToLiveRequest;
+/// let request = UpdateTimeToLiveRequest::new("users", "expires_at", true);
+/// assert!(request.enabled);
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct UpdateTimeToLiveRequest {
     /// Table to configure.
@@ -1361,6 +2080,13 @@ pub struct UpdateTimeToLiveRequest {
 
 impl UpdateTimeToLiveRequest {
     /// Enable or disable TTL for `attribute_name`.
+    ///
+    /// ```
+    /// use mock_ddb::UpdateTimeToLiveRequest;
+    /// let request = UpdateTimeToLiveRequest::new("users", "expires_at", false);
+    /// assert_eq!(request.attribute_name, "expires_at");
+    /// assert!(!request.enabled);
+    /// ```
     #[must_use]
     pub fn new(
         table_name: impl Into<String>,
@@ -1376,6 +2102,11 @@ impl UpdateTimeToLiveRequest {
 }
 
 /// Whether TTL is on for a table.
+///
+/// ```
+/// use mock_ddb::TimeToLiveStatus;
+/// assert_eq!(TimeToLiveStatus::Enabled.as_str(), "ENABLED");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TimeToLiveStatus {
@@ -1387,6 +2118,12 @@ pub enum TimeToLiveStatus {
 
 impl TimeToLiveStatus {
     /// The string the service reports.
+    ///
+    /// ```
+    /// use mock_ddb::TimeToLiveStatus;
+    /// assert_eq!(TimeToLiveStatus::Disabled.as_str(), "DISABLED");
+    /// assert_eq!(TimeToLiveStatus::Enabled.as_str(), "ENABLED");
+    /// ```
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -1397,6 +2134,15 @@ impl TimeToLiveStatus {
 }
 
 /// What `describe_time_to_live` reports.
+///
+/// ```
+/// use mock_ddb::{TimeToLiveDescription, TimeToLiveStatus};
+/// let description = TimeToLiveDescription {
+///     status: TimeToLiveStatus::Disabled,
+///     attribute_name: None,
+/// };
+/// assert_eq!(description.status.as_str(), "DISABLED");
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimeToLiveDescription {
     /// Whether TTL is on.
@@ -1406,6 +2152,16 @@ pub struct TimeToLiveDescription {
 }
 
 /// `ListTables` input.
+///
+/// ```
+/// use mock_ddb::ListTablesRequest;
+/// let request = ListTablesRequest {
+///     limit: Some(10),
+///     ..ListTablesRequest::default()
+/// };
+/// assert_eq!(request.limit, Some(10));
+/// assert!(request.exclusive_start_table_name.is_none());
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ListTablesRequest {
     /// Continue after this table name.
@@ -1415,6 +2171,12 @@ pub struct ListTablesRequest {
 }
 
 /// `ListTables` output.
+///
+/// ```
+/// use mock_ddb::ListTablesOutput;
+/// let output = ListTablesOutput::default();
+/// assert!(output.table_names.is_empty());
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 #[non_exhaustive]
 pub struct ListTablesOutput {
@@ -1425,6 +2187,17 @@ pub struct ListTablesOutput {
 }
 
 /// `DescribeTable` output, re-exported here for discoverability.
+///
+/// ```
+/// use mock_ddb::{DescribeTableOutput, KeySchema, KeyType, MockDdb};
+///
+/// # #[tokio::main]
+/// # async fn main() {
+/// let mock = MockDdb::with_table("users", KeySchema::hash("pk", KeyType::String)).unwrap();
+/// let described: DescribeTableOutput = mock.describe_table("users").await.unwrap();
+/// assert_eq!(described.table_name, "users");
+/// # }
+/// ```
 pub type DescribeTableOutput = TableDescription;
 
 #[cfg(test)]
