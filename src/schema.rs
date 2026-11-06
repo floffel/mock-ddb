@@ -112,7 +112,7 @@ impl KeySchema {
     /// A schema with both a partition and a sort key.
     ///
     /// The two must name different attributes: one attribute cannot hold both
-    /// key roles, and [`MockDdb::create_table`] rejects such a schema.
+    /// key roles, and [`crate::MockDdb::create_table`] rejects such a schema.
     #[must_use]
     pub fn hash_and_range(
         partition_name: impl Into<String>,
@@ -320,7 +320,7 @@ impl StreamViewType {
 /// assert!(specification.stream_enabled);
 /// ```
 ///
-/// The two fields are kept consistent by [`MockDdb::create_table`]: a stream
+/// The two fields are kept consistent by [`crate::MockDdb::create_table`]: a stream
 /// that is on needs a view type, and a view type without a stream is refused
 /// rather than silently dropped.
 ///
@@ -407,7 +407,7 @@ impl CreateTableRequest {
     /// Add a local secondary index.
     ///
     /// The table must declare a sort key: DynamoDB offers local secondary
-    /// indexes only on tables that have one, so [`MockDdb::create_table`]
+    /// indexes only on tables that have one, so [`crate::MockDdb::create_table`]
     /// rejects a hash-only table that carries a local index.
     ///
     /// ```
