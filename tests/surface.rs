@@ -192,6 +192,37 @@ async fn rejects(request: CreateTableRequest) -> bool {
 }
 
 #[tokio::test]
+async fn a_local_index_needs_a_table_range_key() {
+    // DynamoDB offers local secondary indexes only on tables with a range key,
+    // so a hash-only table that carries one is refused instead of silently
+    // becoming a table production would never create.
+    let hash_only = CreateTableRequest::new("orders", KeySchema::hash("pk", KeyType::String));
+    let with_lsi = hash_only.clone().with_local_index(SecondaryIndex::new(
+        "by-status",
+        KeySchema::hash_and_range("pk", KeyType::String, "status", KeyType::String),
+    ));
+    let error = MockDdb::new().create_table(with_lsi).await.unwrap_err();
+    assert!(matches!(error, Error::Validation { .. }), "{error}");
+    assert!(error.to_string().contains("range key"), "{error}");
+
+    // Just inside: the same table without the local index is accepted.
+    let description = MockDdb::new().create_table(hash_only).await.unwrap();
+    assert!(description.local_secondary_indexes.is_empty());
+
+    // And the indexed variant of a table that does have a range key stays valid.
+    let ranged = CreateTableRequest::new(
+        "orders",
+        KeySchema::hash_and_range("pk", KeyType::String, "sk", KeyType::String),
+    )
+    .with_local_index(SecondaryIndex::new(
+        "by-status",
+        KeySchema::hash_and_range("pk", KeyType::String, "status", KeyType::String),
+    ));
+    let description = MockDdb::new().create_table(ranged).await.unwrap();
+    assert_eq!(description.local_secondary_indexes.len(), 1);
+}
+
+#[tokio::test]
 async fn list_tables_paginates() {
     let mock = MockDdb::new();
     for name in ["tbl-a", "tbl-b", "tbl-c"] {

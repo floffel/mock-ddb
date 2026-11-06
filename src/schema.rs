@@ -380,6 +380,25 @@ impl CreateTableRequest {
     }
 
     /// Add a local secondary index.
+    ///
+    /// The table must declare a sort key: DynamoDB offers local secondary
+    /// indexes only on tables that have one, so [`MockDdb::create_table`]
+    /// rejects a hash-only table that carries a local index.
+    ///
+    /// ```
+    /// use mock_ddb::{CreateTableRequest, KeySchema, KeyType, MockDdb, SecondaryIndex};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let request = CreateTableRequest::new("orders", KeySchema::hash("pk", KeyType::String))
+    ///     .with_local_index(SecondaryIndex::new(
+    ///         "by-status",
+    ///         KeySchema::hash_and_range("pk", KeyType::String, "status", KeyType::String),
+    ///     ));
+    /// let error = MockDdb::new().create_table(request).await.unwrap_err();
+    /// assert!(error.to_string().contains("range key"), "{error}");
+    /// # }
+    /// ```
     #[must_use]
     pub fn with_local_index(mut self, index: SecondaryIndex) -> Self {
         self.local_secondary_indexes.push(index);
@@ -493,7 +512,16 @@ impl CreateTableRequest {
     }
 
     /// A local index shares the table partition key and needs its own sort key.
+    ///
+    /// The table itself needs a sort key first: DynamoDB only offers local
+    /// secondary indexes on tables that have a range key, so a hash-only
+    /// table with a local index is rejected before any per-index check.
     fn validate_local_indexes(&self) -> Result<()> {
+        if self.key_schema.sort_key.is_none() && !self.local_secondary_indexes.is_empty() {
+            return Err(Error::validation(
+                "One or more parameter values were invalid: Table KeySchema does not have a range key, which is required when specifying a LocalSecondaryIndex",
+            ));
+        }
         for index in &self.local_secondary_indexes {
             if index.key_schema.partition_key.attribute_name
                 != self.key_schema.partition_key.attribute_name
