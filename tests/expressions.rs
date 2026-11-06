@@ -552,6 +552,35 @@ async fn add_and_delete_type_rules() {
 }
 
 #[tokio::test]
+async fn add_renders_fractions_at_the_bottom_of_the_number_range() {
+    let mock = users();
+    mock.put_item(PutItemRequest::new(
+        "users",
+        item([("pk", s("u#1")), ("v", n("1.2345e-129"))]),
+    ))
+    .await
+    .unwrap();
+
+    mock.update_item(
+        UpdateItemRequest::new("users", item([("pk", s("u#1"))]), "ADD v :inc")
+            .with_values(values([(":inc", n("0.0001e-129"))])),
+    )
+    .await
+    .unwrap();
+
+    let stored = mock
+        .get_item(GetItemRequest::new("users", item([("pk", s("u#1"))])))
+        .await
+        .unwrap()
+        .item
+        .unwrap();
+    assert_eq!(
+        stored.get("v"),
+        Some(&n(format!("0.{}12346", "0".repeat(128))))
+    );
+}
+
+#[tokio::test]
 async fn set_against_missing_attribute_and_missing_parent() {
     let mock = users();
     mock.put_item(PutItemRequest::new("users", item([("pk", s("u#1"))])))
