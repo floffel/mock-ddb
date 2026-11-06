@@ -51,7 +51,7 @@ use crate::Item;
 use crate::stream::{
     wire_record, DescribeStreamOutput, DescribeStreamRequest, GetRecordsOutput, GetRecordsRequest,
     GetShardIteratorOutput, GetShardIteratorRequest, ListStreamsOutput, ListStreamsRequest, Shard,
-    StreamDescription, StreamRecord, StreamState, StreamSummary, StreamsApi, StreamsRecord,
+    StreamDescription, StreamRecordSnapshot, StreamState, StreamSummary, StreamsApi, StreamsRecord,
     MAX_RECORDS_PER_GET, MAX_SHARDS_PER_DESCRIBE, MAX_STREAMS_PER_LIST,
 };
 
@@ -2220,6 +2220,13 @@ impl MockDdb {
 
     /// Read a stream's records, in write order.
     ///
+    /// The log is bounded: a stream retains its most recent
+    /// [`MAX_RETAINED_STREAM_RECORDS`](crate::MAX_RETAINED_STREAM_RECORDS)
+    /// records and appending past that drops the oldest, so this returns at most
+    /// that many and never the whole write history. The snapshot shares the
+    /// retained records rather than deep-cloning their item images, so taking it
+    /// is cheap after the first read following a write.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::ResourceNotFound`] when no table has this stream ARN.
@@ -2245,12 +2252,64 @@ impl MockDdb {
     /// assert_eq!(mock.get_records(&arn).await.unwrap().len(), 1);
     /// # }
     /// ```
-    pub async fn get_records(&self, stream_arn: &str) -> Result<Vec<StreamRecord>> {
+    pub async fn get_records(&self, stream_arn: &str) -> Result<StreamRecordSnapshot> {
         let inner = self.inner.read();
         for table in inner.tables.values() {
             if let Some(stream) = &table.stream {
                 if stream.arn == stream_arn {
-                    return Ok(stream.records.clone());
+                    return Ok(stream.snapshot());
+                }
+            }
+        }
+        Err(Error::ResourceNotFound {
+            resource: format!("stream `{stream_arn}`"),
+            message: format!("Requested resource not found: Stream: {stream_arn} not found"),
+        })
+    }
+
+    /// Empty a stream's log, keeping its sequence numbers running.
+    ///
+    /// A test that asserts on a stream after a long warm-up wants a fresh log
+    /// without a fresh table: record [retention](crate::MAX_RETAINED_STREAM_RECORDS)
+    /// bounds the log, a clear resets it. Sequence numbers keep counting past the
+    /// cleared records, so a record appended afterwards is never mistaken for one
+    /// that was cleared.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ResourceNotFound`] when no table has this stream ARN.
+    ///
+    /// ```rust
+    /// use mock_ddb::{item, s, CreateTableRequest, KeySchema, KeyType, MockDdb, PutItemRequest, StreamViewType};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mock = MockDdb::new();
+    /// let table = mock
+    ///     .create_table(
+    ///         CreateTableRequest::new("users", KeySchema::hash("pk", KeyType::String))
+    ///             .with_stream(StreamViewType::KeysOnly),
+    ///     )
+    ///     .await
+    ///     .unwrap();
+    /// let arn = table.latest_stream_arn.unwrap();
+    /// mock.put_item(PutItemRequest::new("users", item([("pk", s("u#1"))])))
+    ///     .await
+    ///     .unwrap();
+    /// assert_eq!(mock.get_records(&arn).await.unwrap().len(), 1);
+    ///
+    /// mock.clear_records(&arn).unwrap();
+    /// assert!(mock.get_records(&arn).await.unwrap().is_empty());
+    /// # }
+    /// ```
+    #[cfg(feature = "streams")]
+    pub fn clear_records(&self, stream_arn: &str) -> Result<()> {
+        let mut inner = self.inner.write();
+        for table in inner.tables.values_mut() {
+            if let Some(stream) = table.stream.as_mut() {
+                if stream.arn == stream_arn {
+                    stream.clear();
+                    return Ok(());
                 }
             }
         }
@@ -2531,8 +2590,8 @@ impl StreamsApi<'_> {
                 ))
             }
             (false, None) => match kind {
-                crate::stream::ShardIteratorType::Latest => stream.records.len(),
-                _ => 0,
+                crate::stream::ShardIteratorType::Latest => stream.end_position(),
+                _ => stream.trim_horizon(),
             },
         };
         Ok(GetShardIteratorOutput {
@@ -2606,13 +2665,16 @@ impl StreamsApi<'_> {
         let (stream_arn, position) = decode_iterator(&request.shard_iterator)?;
         let inner = self.mock.inner.read();
         let (_, stream) = stream_for(&inner, &stream_arn)?;
-        let start = position.min(stream.records.len());
-        let records: Vec<StreamsRecord> = stream.records[start..]
+        let start = position.max(stream.trim_horizon()) - stream.trim_horizon();
+        let start = start.min(stream.records.len());
+        let records: Vec<StreamsRecord> = stream
+            .records
             .iter()
+            .skip(start)
             .take(limit)
             .map(|record| wire_record(record, stream.view_type()))
             .collect();
-        let next = encode_iterator(&stream_arn, start + records.len());
+        let next = encode_iterator(&stream_arn, stream.trim_horizon() + start + records.len());
         Ok(GetRecordsOutput {
             records,
             next_shard_iterator: Some(next),
@@ -2661,7 +2723,7 @@ fn inner_stream_count(inner: &Inner) -> usize {
 /// The first sequence number a shard can return.
 #[cfg(feature = "streams")]
 fn starting_sequence_number(stream: &StreamState) -> String {
-    stream.records.first().map_or_else(
+    stream.records.front().map_or_else(
         || format!("{:021}", stream.next_sequence),
         |record| record.sequence_number.clone(),
     )

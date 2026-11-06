@@ -89,8 +89,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Debug` rendering of an item differs between runs; the alias now says so
   explicitly, points equality at `==` (which compares entries, not order) and a
   golden or log assertion at `ordered_item`.
+- `MockDdb::clear_records` empties a stream's log without dropping its sequence
+  numbers, and `MAX_RETAINED_STREAM_RECORDS` states the cap the log holds. A
+  test that warms a stream up before it asserts had no way to reset the log
+  short of a new table, and no way to ask how far back the log reaches.
 
 ### Changed
+
+- A stream's log is bounded: it retains its most recent
+  `MAX_RETAINED_STREAM_RECORDS` records (10 000) and an append past the cap
+  drops the oldest, the way a trimming shard does. The log was a `Vec` that
+  every mutation pushed onto and that grew for the mock's whole life, so a test
+  or property run that wrote millions of items grew memory with its write
+  history — each record holding up to two item clones — and every
+  `get_records` cloned the entire log while the write lock was held. Shard
+  iterators now carry an absolute log position, so `TRIM_HORIZON`,
+  `AT_SEQUENCE_NUMBER` and a token taken before a trim all keep pointing at the
+  same record after the window has moved. The in-process `get_records` now
+  returns a point-in-time `StreamRecordSnapshot` backed by shared records, so a
+  read shares the retained log instead of deep-cloning every item image.
 
 - Every response type is `#[non_exhaustive]`: the eleven data-plane outputs
   (`PutItemOutput`, `GetItemOutput`, `DeleteItemOutput`, `UpdateItemOutput`,

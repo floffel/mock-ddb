@@ -414,8 +414,7 @@ mod streams {
     use super::*;
     use common::users;
     use mock_ddb::{
-        StreamEventName, StreamRecord, StreamViewType, TransactWriteItem,
-        TransactWriteItemsRequest, WriteRequest,
+        StreamEventName, StreamViewType, TransactWriteItem, TransactWriteItemsRequest, WriteRequest,
     };
 
     async fn streamed(view_type: StreamViewType) -> (MockDdb, String) {
@@ -453,7 +452,7 @@ mod streams {
             .await
             .unwrap();
 
-        let records: Vec<StreamRecord> = mock.get_records(&arn).await.unwrap();
+        let records = mock.get_records(&arn).await.unwrap();
         assert_eq!(records.len(), 3);
 
         assert_eq!(records[0].event_name, StreamEventName::Insert);
@@ -515,10 +514,7 @@ mod streams {
             vec![item([("pk", s("u#1")), ("expires_at", n("999999"))])],
         )
         .unwrap();
-        assert_eq!(
-            mock.get_records(&arn).await.unwrap(),
-            Vec::<StreamRecord>::new()
-        );
+        assert!(mock.get_records(&arn).await.unwrap().is_empty());
 
         // Seeding over that expired row creates the item, exactly as the same
         // write through `put_item` would.

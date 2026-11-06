@@ -11,6 +11,12 @@
 //! caller reads every field but builds one with `Default` and field assignment,
 //! so a field the service grows does not break a caller that spelled a literal.
 //!
+//! The log is bounded rather than aged out: a stream retains its most recent
+//! [`MAX_RETAINED_STREAM_RECORDS`] records, an append past the cap trims the
+//! oldest, and [`MockDdb::clear_records`](crate::MockDdb::clear_records) empties
+//! it. A shard iterator's position keeps counting from the first record the
+//! stream ever appended, so a token still reads the right place after a trim.
+//!
 //! ```
 //! use mock_ddb::{s, CreateTableRequest, KeySchema, KeyType, MockDdb, PutItemRequest, StreamViewType, item};
 //!
@@ -33,9 +39,13 @@
 //! # }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::ops::Index;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use parking_lot::Mutex;
 
 use crate::clock::epoch_seconds;
 use crate::schema::{KeySchema, StreamViewType};
@@ -105,16 +115,103 @@ pub struct StreamRecord {
     pub old_image: Option<Item>,
 }
 
+/// A point-in-time view of a stream's retained records.
+///
+/// Records are shared behind `Arc`s, so taking a snapshot does not deep-clone
+/// the item images in the log. A snapshot stays valid after later writes or
+/// [`MockDdb::clear_records`](crate::MockDdb::clear_records): it contains the
+/// records retained at the moment it was taken and nothing written afterwards.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamRecordSnapshot {
+    records: Arc<[Arc<StreamRecord>]>,
+}
+
+impl StreamRecordSnapshot {
+    fn new(records: Vec<Arc<StreamRecord>>) -> Self {
+        Self {
+            records: records.into(),
+        }
+    }
+
+    /// The number of records in the snapshot.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Whether the snapshot contains no records.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// Iterate over the records, oldest first.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &StreamRecord> {
+        self.records.iter().map(AsRef::as_ref)
+    }
+
+    /// The newest record in the snapshot.
+    #[must_use]
+    pub fn last(&self) -> Option<&StreamRecord> {
+        self.records.last().map(AsRef::as_ref)
+    }
+}
+
+impl Index<usize> for StreamRecordSnapshot {
+    type Output = StreamRecord;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.records[index]
+    }
+}
+
+impl<'a> IntoIterator for &'a StreamRecordSnapshot {
+    type Item = &'a StreamRecord;
+    type IntoIter = std::iter::Map<
+        std::slice::Iter<'a, Arc<StreamRecord>>,
+        fn(&'a Arc<StreamRecord>) -> &'a StreamRecord,
+    >;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.records.iter().map(AsRef::as_ref)
+    }
+}
+
+/// How many records one stream retains.
+///
+/// The service keeps a shard's records for 24 hours and trims what is older; the
+/// mock has no retention clock for its log, so it trims by count instead. An
+/// append past this cap drops the oldest record — the window moves, the log does
+/// not grow — so a test or a property run that writes a million items cannot
+/// grow the mock's memory with its write history.
+///
+/// The oldest record is what a trim horizon points at:
+/// [`ShardIteratorType::TrimHorizon`] starts at the oldest record still
+/// retained, and a shard iterator that named a record which has since been
+/// trimmed resumes at that record. [`MockDdb::clear_records`](crate::MockDdb::clear_records)
+/// empties the log outright.
+pub const MAX_RETAINED_STREAM_RECORDS: usize = 10_000;
+
 /// The mutable state of one table's stream.
 #[derive(Debug)]
 pub(crate) struct StreamState {
     pub(crate) arn: String,
-    pub(crate) records: Vec<StreamRecord>,
+    /// The records still retained, oldest first. Bounded by
+    /// [`MAX_RETAINED_STREAM_RECORDS`].
+    pub(crate) records: VecDeque<Arc<StreamRecord>>,
+    /// How many records the log has dropped off its front: the absolute log
+    /// position of `records.front()`.
+    ///
+    /// A shard iterator carries an absolute position — one that counts every
+    /// record the stream ever appended — so a token stays meaningful when a trim
+    /// shifts the retained window underneath it.
+    trimmed: usize,
     pub(crate) next_sequence: u64,
     pub(crate) view_type: StreamViewType,
     /// Creation time in seconds since the Unix epoch, as reported by
     /// `DescribeStream`.
     pub(crate) creation_date_time: i64,
+    snapshot: Mutex<Option<StreamRecordSnapshot>>,
     /// Process-wide unique discriminator for this stream, part of every
     /// `event_id` it issues.
     discriminator: u64,
@@ -138,10 +235,12 @@ impl StreamState {
             arn: format!(
                 "arn:aws:dynamodb:{STREAM_REGION}:000000000000:table/{table_name}/stream/{label}-{discriminator}"
             ),
-            records: Vec::new(),
+            records: VecDeque::new(),
+            trimmed: 0,
             next_sequence: sequence_origin,
             view_type,
             creation_date_time: epoch_seconds(created_at),
+            snapshot: Mutex::new(None),
             discriminator,
         })
     }
@@ -160,7 +259,7 @@ impl StreamState {
         let keys = key_map(key_schema, new_item.or(old_item))?;
         let sequence = self.next_sequence;
         self.next_sequence += 1;
-        self.records.push(StreamRecord {
+        self.records.push_back(Arc::new(StreamRecord {
             event_id: event_id(epoch_millis, self.discriminator, sequence),
             event_name,
             table_name: table_name.to_string(),
@@ -169,8 +268,49 @@ impl StreamState {
             approximate_creation_date_time: i64::try_from(epoch_millis / 1_000).unwrap_or(i64::MAX),
             new_image: self.view_type.new_image(new_item),
             old_image: self.view_type.old_image(old_item),
-        });
+        }));
+        // Trim after the append: one record goes out of the front for every one
+        // that comes in at the back, so the log is bounded at all times.
+        if self.records.len() > MAX_RETAINED_STREAM_RECORDS {
+            self.records.pop_front();
+            self.trimmed = self.trimmed.saturating_add(1);
+        }
+        self.snapshot.lock().take();
         Ok(())
+    }
+
+    /// The log position of the oldest record still retained: where a trim
+    /// horizon starts.
+    pub(crate) fn trim_horizon(&self) -> usize {
+        self.trimmed
+    }
+
+    /// The log position one past the last record: where `LATEST` starts.
+    pub(crate) fn end_position(&self) -> usize {
+        self.trimmed.saturating_add(self.records.len())
+    }
+
+    /// Drop every retained record.
+    ///
+    /// The positions already handed out stay absolute, so the log's end keeps
+    /// moving forward: a record appended after a clear gets a position past the
+    /// cleared ones, and a shard iterator that named a cleared record reads
+    /// nothing rather than a record out of the old window.
+    pub(crate) fn clear(&mut self) {
+        self.trimmed = self.end_position();
+        self.records.clear();
+        self.snapshot.lock().take();
+    }
+
+    /// Share the retained records without cloning their item images.
+    pub(crate) fn snapshot(&self) -> StreamRecordSnapshot {
+        let mut cached = self.snapshot.lock();
+        if let Some(snapshot) = cached.as_ref() {
+            return snapshot.clone();
+        }
+        let snapshot = StreamRecordSnapshot::new(self.records.iter().cloned().collect());
+        *cached = Some(snapshot.clone());
+        snapshot
     }
 
     /// The shard this stream exposes. The mock gives every stream one open
@@ -192,12 +332,15 @@ impl StreamState {
     /// The log position of the record with `sequence`.
     ///
     /// The number is parsed, so an unpadded `"7"` finds the record whose own
-    /// sequence number is `"000000000000000000007"`.
+    /// sequence number is `"000000000000000000007"`. The position counts every
+    /// record the stream ever appended, so it survives a trim; a sequence number
+    /// that has already been trimmed away has no position.
     pub(crate) fn position_of(&self, sequence: &str) -> Option<usize> {
         let wanted = sequence.parse::<u64>().ok()?;
         self.records
             .iter()
             .position(|record| record.sequence_number.parse::<u64>() == Ok(wanted))
+            .map(|index| self.trimmed.saturating_add(index))
     }
 }
 
@@ -808,6 +951,137 @@ mod tests {
     use super::*;
 
     use proptest::prelude::*;
+
+    fn item_with(pk: &str, extra: Option<(&str, &str)>) -> Item {
+        let mut item = HashMap::from([("pk".to_string(), crate::s(pk))]);
+        if let Some((name, value)) = extra {
+            item.insert(name.to_string(), crate::s(value));
+        }
+        item
+    }
+
+    fn key_item(item: &Item) -> Item {
+        HashMap::from([("pk".to_string(), item["pk"].clone())])
+    }
+
+    const VIEW_TYPES: [StreamViewType; 4] = [
+        StreamViewType::KeysOnly,
+        StreamViewType::NewImage,
+        StreamViewType::OldImage,
+        StreamViewType::NewAndOldImages,
+    ];
+
+    const EVENT_NAMES: [StreamEventName; 3] = [
+        StreamEventName::Insert,
+        StreamEventName::Modify,
+        StreamEventName::Remove,
+    ];
+
+    #[test]
+    fn record_shape_matrix_covers_every_view_event_and_image_presence() {
+        let schema = KeySchema::hash("pk", crate::KeyType::String);
+        let old = item_with("u#1", Some(("state", "old")));
+        let new = item_with("u#1", Some(("state", "new")));
+        let now = UNIX_EPOCH + std::time::Duration::from_secs(1_767_225_600);
+
+        for view_type in VIEW_TYPES {
+            for event_name in EVENT_NAMES {
+                for (old_present, new_present) in
+                    [(false, false), (true, false), (false, true), (true, true)]
+                {
+                    let old_item = old_present.then_some(&old);
+                    let new_item = new_present.then_some(&new);
+                    let expected_new = matches!(
+                        view_type,
+                        StreamViewType::NewImage | StreamViewType::NewAndOldImages
+                    )
+                    .then(|| new.clone())
+                    .filter(|_| new_present);
+                    let expected_old = matches!(
+                        view_type,
+                        StreamViewType::OldImage | StreamViewType::NewAndOldImages
+                    )
+                    .then(|| old.clone())
+                    .filter(|_| old_present);
+                    let mut stream = StreamState::new("events", view_type, 1, now).unwrap();
+                    let appended =
+                        stream.append("events", &schema, event_name, old_item, new_item, now);
+                    if new_item.is_none() && old_item.is_none() {
+                        let error = appended.expect_err("a record needs an item to derive its key");
+                        assert!(error.to_string().contains("no item"));
+                        assert!(stream.records.is_empty());
+                        continue;
+                    }
+                    appended.unwrap();
+                    let record = stream.records.front().expect("one appended record");
+                    assert_eq!(record.event_name, event_name);
+                    assert_eq!(record.keys, key_item(new_item.or(old_item).unwrap()));
+                    assert_eq!(record.new_image, expected_new);
+                    assert_eq!(record.old_image, expected_old);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn key_map_fails_closed_for_empty_and_partial_items() {
+        let old = item_with("u#1", Some(("state", "old")));
+        let partial = HashMap::from([("pk".to_string(), crate::s("u#1"))]);
+        let composite =
+            KeySchema::hash_and_range("pk", crate::KeyType::String, "sk", crate::KeyType::String);
+
+        let error = key_map(&composite, Some(&old)).unwrap_err();
+        assert!(error.to_string().contains("missing key attribute `sk`"));
+        let error = key_map(&composite, Some(&Item::new())).unwrap_err();
+        assert!(error.to_string().contains("missing key attribute `pk`"));
+        let error = key_map(&composite, None).unwrap_err();
+        assert!(error.to_string().contains("no item"));
+
+        let hash = KeySchema::hash("pk", crate::KeyType::String);
+        assert_eq!(key_map(&hash, Some(&partial)).unwrap(), partial);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn image_selectors_follow_the_full_view_and_presence_matrix(
+            view in prop_oneof![
+                Just(StreamViewType::KeysOnly),
+                Just(StreamViewType::NewImage),
+                Just(StreamViewType::OldImage),
+                Just(StreamViewType::NewAndOldImages),
+            ],
+            new_present in any::<bool>(),
+            old_present in any::<bool>(),
+            pk in "[a-z]{1,12}",
+        ) {
+            let new = item_with(&pk, Some(("state", "new")));
+            let old = item_with(&pk, Some(("state", "old")));
+            let new_input = new_present.then_some(&new);
+            let old_input = old_present.then_some(&old);
+            let expected_new = matches!(
+                view,
+                StreamViewType::NewImage | StreamViewType::NewAndOldImages
+            )
+            .then(|| new.clone())
+            .filter(|_| new_present);
+            let expected_old = matches!(
+                view,
+                StreamViewType::OldImage | StreamViewType::NewAndOldImages
+            )
+            .then(|| old.clone())
+            .filter(|_| old_present);
+
+            prop_assert_eq!(view.new_image(new_input), expected_new);
+            prop_assert_eq!(view.old_image(old_input), expected_old);
+            let selected = new_input.or(old_input);
+            match key_map(&KeySchema::hash("pk", crate::KeyType::String), selected) {
+                Ok(keys) => prop_assert_eq!(keys, key_item(selected.unwrap())),
+                Err(error) => prop_assert!(selected.is_none() && error.to_string().contains("no item")),
+            }
+        }
+    }
 
     #[test]
     fn one_streams_ids_are_distinct_for_consecutive_sequences() {
