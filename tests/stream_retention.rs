@@ -203,7 +203,7 @@ async fn latest_follows_the_end_across_a_trim() {
         .get_records(GetRecordsRequest::new(iterator.shard_iterator))
         .await
         .unwrap();
-    assert!(empty.records.is_empty());
+    assert_eq!(empty.records, []);
 
     let tail = empty.next_shard_iterator.expect("a next iterator");
     write(&mock, 100, 1).await;
@@ -228,7 +228,7 @@ async fn clear_records_empties_the_log() {
         .clone();
 
     mock.clear_records(&arn).unwrap();
-    assert!(mock.get_records(&arn).await.unwrap().is_empty());
+    assert_eq!(mock.get_records(&arn).await.unwrap(), []);
 
     let stale = mock
         .streams()
