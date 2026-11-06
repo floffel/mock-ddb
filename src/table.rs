@@ -29,6 +29,29 @@ pub(crate) type ItemMap = BTreeMap<ItemKey, Item>;
 /// Index name → (index key → set of primary keys).
 pub(crate) type IndexMap = HashMap<String, BTreeMap<IndexKey, BTreeSet<ItemKey>>>;
 
+/// The most expired keys one purge pass may collect and delete.
+const MAX_TTL_PURGE_BATCH: usize = 1_024;
+
+/// How a successful store should appear in the table's stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoreKind {
+    /// A normal put: INSERT when the previous row was logically absent.
+    Put,
+    /// An update: MODIFY even when it creates the row.
+    Update,
+    /// A fixture write: record only a logically visible new item.
+    Seed,
+}
+
+/// Which removals should append a REMOVE stream record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeleteKind {
+    /// `DeleteItem` and batch/transaction deletes skip logically expired rows.
+    LiveOnly,
+    /// TTL purge reports the removal of its expired row.
+    Expired,
+}
+
 /// A validated table definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableDefinition {
@@ -237,9 +260,42 @@ impl Table {
         Ok(())
     }
 
-    /// Store an item, maintaining every index.
-    pub(crate) fn store(&mut self, key: ItemKey, item: Item, previous: Option<&Item>) {
-        if let Some(previous) = previous {
+    /// Store an item, maintaining every index and the stream in one operation.
+    pub(crate) fn store(
+        &mut self,
+        key: ItemKey,
+        item: Item,
+        kind: StoreKind,
+        now_seconds: i64,
+        now_time: SystemTime,
+    ) -> Result<()> {
+        let previous = self.items.get(&key).cloned();
+        let previous_live = previous
+            .as_ref()
+            .filter(|existing| !self.is_expired(existing, now_seconds));
+
+        #[cfg(feature = "streams")]
+        {
+            let event = match kind {
+                StoreKind::Put | StoreKind::Seed if previous_live.is_none() => {
+                    StreamEventName::Insert
+                }
+                StoreKind::Put | StoreKind::Seed | StoreKind::Update => StreamEventName::Modify,
+            };
+            let record = match kind {
+                StoreKind::Seed => !self.is_expired(&item, now_seconds),
+                StoreKind::Put | StoreKind::Update => true,
+            };
+            if record {
+                self.record(event, previous_live, Some(&item), now_time)?;
+            }
+        }
+        #[cfg(not(feature = "streams"))]
+        {
+            let _ = (kind, previous_live, now_time);
+        }
+
+        if let Some(previous) = previous.as_ref() {
             self.unindex(&key, previous);
         }
         let entries = index_entries(&self.definition, &item);
@@ -252,13 +308,34 @@ impl Table {
                 .insert(key.clone());
         }
         self.items.insert(key, item);
+        Ok(())
     }
 
-    /// Remove an item, maintaining every index.
-    pub(crate) fn discard(&mut self, key: &ItemKey) -> Option<Item> {
-        let item = self.items.remove(key)?;
+    /// Remove an item, maintaining every index and the requested stream event.
+    pub(crate) fn delete(
+        &mut self,
+        key: &ItemKey,
+        kind: DeleteKind,
+        now_seconds: i64,
+        now_time: SystemTime,
+    ) -> Result<Option<Item>> {
+        let Some(item) = self.items.get(key).cloned() else {
+            return Ok(None);
+        };
+        let expired = self.is_expired(&item, now_seconds);
+
+        #[cfg(feature = "streams")]
+        if kind == DeleteKind::Expired || !expired {
+            self.record(StreamEventName::Remove, Some(&item), None, now_time)?;
+        }
+        #[cfg(not(feature = "streams"))]
+        {
+            let _ = (kind, expired, now_time);
+        }
+
         self.unindex(key, &item);
-        Some(item)
+        self.items.remove(key);
+        Ok(Some(item))
     }
 
     /// Drop an item's entries from every index.
@@ -302,19 +379,29 @@ impl Table {
             .unwrap_or(u64::MAX)
     }
 
-    /// Remove every expired item and return how many were removed.
-    pub(crate) fn purge_expired(&mut self, now_seconds: i64) -> usize {
+    /// Remove up to `MAX_TTL_PURGE_BATCH` expired items.
+    pub(crate) fn purge_expired(
+        &mut self,
+        now_seconds: i64,
+        now_time: SystemTime,
+    ) -> Result<usize> {
         let expired: Vec<ItemKey> = self
             .items
             .iter()
             .filter(|(_, item)| self.is_expired(item, now_seconds))
             .map(|(key, _)| key.clone())
+            .take(MAX_TTL_PURGE_BATCH)
             .collect();
-        let removed = expired.len();
+        let mut removed = 0;
         for key in expired {
-            let _ = self.discard(&key);
+            if self
+                .delete(&key, DeleteKind::Expired, now_seconds, now_time)?
+                .is_some()
+            {
+                removed += 1;
+            }
         }
-        removed
+        Ok(removed)
     }
 
     /// Append a stream record for a mutation, when the table has a stream.
@@ -337,60 +424,6 @@ impl Table {
                 new_item,
                 now,
             )?;
-        }
-        Ok(())
-    }
-
-    /// Hook for a write that created or replaced an item.
-    // The receiver is only read when the `streams` feature is on.
-    #[allow(clippy::unused_self)]
-    pub(crate) fn on_put(
-        &mut self,
-        previous: Option<&Item>,
-        item: &Item,
-        now: SystemTime,
-    ) -> Result<()> {
-        #[cfg(feature = "streams")]
-        {
-            let event = if previous.is_some() {
-                StreamEventName::Modify
-            } else {
-                StreamEventName::Insert
-            };
-            self.record(event, previous, Some(item), now)?;
-        }
-        #[cfg(not(feature = "streams"))]
-        {
-            let _ = (previous, item, now);
-        }
-        Ok(())
-    }
-
-    /// Hook for an update of an existing item.
-    #[allow(clippy::unused_self)]
-    pub(crate) fn on_update(
-        &mut self,
-        previous: Option<&Item>,
-        item: &Item,
-        now: SystemTime,
-    ) -> Result<()> {
-        #[cfg(feature = "streams")]
-        self.record(StreamEventName::Modify, previous, Some(item), now)?;
-        #[cfg(not(feature = "streams"))]
-        {
-            let _ = (previous, item, now);
-        }
-        Ok(())
-    }
-
-    /// Hook for a delete.
-    #[allow(clippy::unused_self)]
-    pub(crate) fn on_delete(&mut self, item: &Item, now: SystemTime) -> Result<()> {
-        #[cfg(feature = "streams")]
-        self.record(StreamEventName::Remove, Some(item), None, now)?;
-        #[cfg(not(feature = "streams"))]
-        {
-            let _ = (item, now);
         }
         Ok(())
     }
@@ -599,6 +632,7 @@ pub(crate) fn index_key(schema: &KeySchema, item: &Item) -> Option<IndexKey> {
 mod tests {
     use super::*;
     use crate::schema::{CreateTableRequest, KeySchema, KeyType};
+    use proptest::prelude::*;
 
     fn table() -> Table {
         let request = CreateTableRequest::new(
@@ -630,18 +664,147 @@ mod tests {
         item.insert("email".into(), crate::s("a@example.com"));
         table.validate_item(&item).unwrap();
         let key = table.item_key(&item).unwrap();
-        table.store(key.clone(), item, None);
+        table
+            .store(key.clone(), item, StoreKind::Put, 0, SystemTime::UNIX_EPOCH)
+            .unwrap();
         assert_eq!(table.items.len(), 1);
         assert_eq!(
             table.indexes["by-email"].len(),
             1,
             "write must populate the index"
         );
-        assert!(table.discard(&key).is_some());
+        assert!(table
+            .delete(&key, DeleteKind::LiveOnly, 0, SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .is_some());
         assert!(
             table.indexes["by-email"].is_empty(),
             "discard must de-index"
         );
+    }
+
+    #[test]
+    fn store_reads_and_replaces_the_current_index_entry() {
+        let mut table = Table::new(
+            TableDefinition {
+                global_secondary_indexes: vec![SecondaryIndex::new(
+                    "by-email",
+                    KeySchema::hash("email", KeyType::String),
+                )],
+                ..table().definition
+            },
+            SystemTime::UNIX_EPOCH,
+            1,
+        )
+        .unwrap();
+
+        let mut first = item();
+        first.insert("email".into(), crate::s("old@example.com"));
+        table
+            .store(
+                table.item_key(&first).unwrap(),
+                first,
+                StoreKind::Put,
+                0,
+                SystemTime::UNIX_EPOCH,
+            )
+            .unwrap();
+
+        let mut replacement = item();
+        replacement.insert("email".into(), crate::s("new@example.com"));
+        table
+            .store(
+                table.item_key(&replacement).unwrap(),
+                replacement,
+                StoreKind::Put,
+                0,
+                SystemTime::UNIX_EPOCH,
+            )
+            .unwrap();
+
+        let old_key = (Scalar::S("old@example.com".into()), None);
+        let new_key = (Scalar::S("new@example.com".into()), None);
+        assert!(!table.indexes["by-email"].contains_key(&old_key));
+        assert_eq!(
+            table.indexes["by-email"][&new_key].len(),
+            1,
+            "the replacement must own exactly its current index entry"
+        );
+    }
+
+    #[test]
+    fn purge_is_bounded_and_counts_only_deleted_rows() {
+        let mut table = table();
+        table.ttl = Some(Ttl {
+            attribute_name: "expires_at".into(),
+            enabled: true,
+        });
+        for id in 0..(MAX_TTL_PURGE_BATCH + 2) {
+            let mut row = item();
+            row.insert("pk".into(), crate::s(format!("u#{id:04}")));
+            row.insert("sk".into(), crate::s("profile"));
+            row.insert("expires_at".into(), crate::n("10"));
+            table
+                .store(
+                    table.item_key(&row).unwrap(),
+                    row,
+                    StoreKind::Seed,
+                    0,
+                    SystemTime::UNIX_EPOCH,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            table.purge_expired(11, SystemTime::UNIX_EPOCH).unwrap(),
+            MAX_TTL_PURGE_BATCH
+        );
+        assert_eq!(table.items.len(), 2);
+        assert_eq!(table.purge_expired(11, SystemTime::UNIX_EPOCH).unwrap(), 2);
+        assert!(table.items.is_empty());
+        assert_eq!(table.purge_expired(11, SystemTime::UNIX_EPOCH).unwrap(), 0);
+    }
+
+    proptest! {
+        #[test]
+        fn overwrites_keep_exactly_one_current_index_entry(
+            emails in prop::collection::vec("[a-z]{1,12}@example\\.com", 1..20)
+        ) {
+            let mut table = Table::new(
+                TableDefinition {
+                    global_secondary_indexes: vec![SecondaryIndex::new(
+                        "by-email",
+                        KeySchema::hash("email", KeyType::String),
+                    )],
+                    ..table().definition
+                },
+                SystemTime::UNIX_EPOCH,
+                1,
+            ).unwrap();
+
+            for email in emails {
+                let mut row = item();
+                row.insert("email".into(), crate::s(email.clone()));
+                let key = table.item_key(&row).unwrap();
+                table
+                    .store(key.clone(), row, StoreKind::Put, 0, SystemTime::UNIX_EPOCH)
+                    .unwrap();
+
+                prop_assert_eq!(table.indexes["by-email"].len(), 1);
+                let index_key = (Scalar::S(email), None);
+                prop_assert_eq!(
+                    table.indexes["by-email"][&index_key].iter().cloned().collect::<Vec<_>>(),
+                    vec![key],
+                );
+            }
+        }
+    }
+
+    fn item() -> Item {
+        let mut item = Item::new();
+        item.insert("pk".into(), crate::s("u#1"));
+        item.insert("sk".into(), crate::s("profile"));
+        item
     }
 
     #[test]
