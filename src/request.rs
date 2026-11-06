@@ -1654,7 +1654,8 @@ pub struct TransactConditionCheck {
     pub table_name: String,
     /// The key to check.
     pub key: Item,
-    /// The condition, which must be present.
+    /// The condition, which must be present. [`TransactWriteItem::with_condition`] leaves
+    /// it untouched; build a new action to assert something else.
     pub condition_expression: String,
     /// `#alias` → attribute name.
     pub expression_attribute_names: Option<HashMap<String, String>>,
@@ -1828,7 +1829,12 @@ impl TransactWriteItem {
         self
     }
 
-    /// Attach a condition to whichever action this is.
+    /// Attach a condition to a `Put`, `Update` or `Delete` action.
+    ///
+    /// A `ConditionCheck` is left untouched: its condition is mandatory and is what the
+    /// action asserts, so replacing it would silently change what the transaction checks.
+    /// To assert something else, build a new action with
+    /// [`TransactWriteItem::condition_check`].
     ///
     /// ```
     /// use mock_ddb::{item, s, TransactWriteItem};
@@ -1840,13 +1846,28 @@ impl TransactWriteItem {
     /// };
     /// assert_eq!(put.condition_expression.as_deref(), Some("attribute_not_exists(pk)"));
     /// ```
+    ///
+    /// A condition check keeps the expression it was built with:
+    ///
+    /// ```
+    /// use mock_ddb::{item, s, TransactWriteItem};
+    /// let action = TransactWriteItem::condition_check("users", item([("pk", s("u#1"))]), "v = :v")
+    ///     .with_condition("attribute_exists(pk)");
+    /// let check = match action {
+    ///     TransactWriteItem::ConditionCheck(check) => check,
+    ///     other => panic!("expected a condition check, got {other:?}"),
+    /// };
+    /// assert_eq!(check.condition_expression, "v = :v");
+    /// ```
     #[must_use]
     pub fn with_condition(mut self, condition: impl Into<String>) -> Self {
         match &mut self {
             Self::Put(action) => action.condition_expression = Some(condition.into()),
             Self::Update(action) => action.condition_expression = Some(condition.into()),
             Self::Delete(action) => action.condition_expression = Some(condition.into()),
-            Self::ConditionCheck(action) => action.condition_expression = condition.into(),
+            // The condition of a `ConditionCheck` is its whole purpose and is mandatory;
+            // replacing it here would silently rewrite what the caller's test asserts.
+            Self::ConditionCheck(_) => {}
         }
         self
     }

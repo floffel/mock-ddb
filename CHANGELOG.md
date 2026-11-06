@@ -252,6 +252,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `i128` and is narrowed once at the end, so both `i64` boundaries are checked
   against the same accumulator: `i64::MAX` and `i64::MIN` convert, one step
   outside either does not.
+- `TransactWriteItem::with_condition` no longer replaces the condition of a
+  `ConditionCheck`. That action exists for its one assertion, its
+  `condition_expression` is a `String` rather than an `Option`, and
+  `condition_check()` demands it — so the builder arm that overwrote it silently
+  changed what a transaction asserted while still type-checking, and mapping the
+  builder over a `Vec<TransactWriteItem>` (the usual way to add a guard to every
+  action) rewrote a check the caller had already written. The call now leaves the
+  expression untouched there; the `Put`/`Update`/`Delete` arms still replace, as
+  their condition is optional. To assert something else, build the action with
+  `condition_check()` again — that replacement stays visible at the call site.
 
 ### Changed
 

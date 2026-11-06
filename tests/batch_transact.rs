@@ -732,6 +732,50 @@ async fn transaction_token_with_a_different_payload_is_refused() {
 }
 
 #[tokio::test]
+async fn with_condition_replaces_writes_but_not_a_condition_check() {
+    // Writes get the new condition.
+    let writes = vec![
+        TransactWriteItem::put("orders", order("c1", 2, "20")),
+        TransactWriteItem::update("orders", order_key("c1", 3), "SET total = :t"),
+        TransactWriteItem::delete("orders", order_key("c1", 4)),
+    ];
+    for action in writes {
+        let action = action.with_condition("attribute_exists(pk)");
+        let expression = match &action {
+            TransactWriteItem::Put(put) => put.condition_expression.as_deref(),
+            TransactWriteItem::Update(update) => update.condition_expression.as_deref(),
+            TransactWriteItem::Delete(delete) => delete.condition_expression.as_deref(),
+            other => panic!("expected a write action, got {other:?}"),
+        };
+        assert_eq!(expression, Some("attribute_exists(pk)"));
+    }
+
+    // A condition check keeps the assertion it was built with, so mapping
+    // `with_condition` over a transaction cannot rewrite what it checks.
+    let checked =
+        TransactWriteItem::condition_check("orders", order_key("c1", 1), "total = :expected")
+            .with_values(values([(":expected", n("10"))]))
+            .with_condition("attribute_not_exists(pk)");
+    let check = match &checked {
+        TransactWriteItem::ConditionCheck(check) => check,
+        other => panic!("expected a condition check, got {other:?}"),
+    };
+    assert_eq!(check.condition_expression, "total = :expected");
+
+    // Behavioural proof: `attribute_not_exists(pk)` is false for the seeded item,
+    // so a replaced condition would fail the transaction.
+    let mock = orders();
+    mock.seed("orders", vec![order("c1", 1, "10")]).unwrap();
+    mock.transact_write_items(TransactWriteItemsRequest::new(vec![
+        checked,
+        TransactWriteItem::put("orders", order("c1", 2, "20")),
+    ]))
+    .await
+    .unwrap();
+    assert_eq!(mock.count("orders"), 2);
+}
+
+#[tokio::test]
 async fn transaction_token_is_forgotten_after_ten_minutes() {
     let clock = Arc::new(MockClock::at_epoch_seconds(1_700_000_000));
     let mock = orders();
