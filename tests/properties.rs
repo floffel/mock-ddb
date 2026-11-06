@@ -46,10 +46,19 @@ fn attribute() -> impl Strategy<Value = AttributeValue> {
             prop::collection::vec(inner.clone(), 0..3).prop_map(AttributeValue::L),
             prop::collection::hash_map("[a-z]{1,5}", inner.clone(), 0..3)
                 .prop_map(AttributeValue::M),
-            prop::collection::vec("[a-z]{1,4}", 1..3).prop_map(AttributeValue::Ss),
-            prop::collection::vec(1_i64..100, 1..3).prop_map(|members| AttributeValue::Ns(
-                members.iter().map(i64::to_string).collect()
-            )),
+            prop::collection::hash_set("[a-z]{1,4}", 1..3)
+                .prop_map(|members| AttributeValue::Ss(members.into_iter().collect())),
+            prop::collection::hash_set(1_i64..100, 1..3).prop_map(|members| {
+                AttributeValue::Ns(
+                    members
+                        .into_iter()
+                        .map(|member| member.to_string())
+                        .collect(),
+                )
+            }),
+            prop::collection::hash_set(prop::collection::vec(any::<u8>(), 1..4), 1..3).prop_map(
+                |members| AttributeValue::Bs(members.into_iter().map(Blob::new).collect())
+            ),
         ]
     })
 }
