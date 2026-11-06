@@ -16,6 +16,7 @@
 //! assert_eq!(request.key_schema.sort_key.unwrap().attribute_name, "sk");
 //! ```
 
+use std::borrow::Cow;
 use std::time::SystemTime;
 
 use crate::{Error, Result};
@@ -748,6 +749,14 @@ const MIN_NAME_LEN: usize = 3;
 /// Longest name the service accepts for a table or an index.
 const MAX_NAME_LEN: usize = 255;
 
+/// Longest slice of an untrusted name an error message echoes back.
+///
+/// The service quotes the offending value verbatim; a mock must not, because
+/// the value is caller-controlled and, until a length check has run, unbounded
+/// — a megabyte-long table name would otherwise be cloned into the `Error`,
+/// and from there into whatever log or test report prints it.
+const MAX_ECHO_CHARS: usize = 64;
+
 /// Validate a table name against DynamoDB's documented constraints.
 pub(crate) fn validate_table_name(name: &str) -> Result<()> {
     validate_name(name, "tableName")
@@ -765,29 +774,114 @@ pub(crate) fn validate_table_name(name: &str) -> Result<()> {
 ///
 /// The length is counted in characters, not bytes — the constraint is on the
 /// value's length, and a multi-byte name is rejected by the charset rule below
-/// either way. The echoed value is not truncated here; bounding the copy is
-/// tracked separately in issue #74.
+/// either way. The echoed value is elided: a name longer than [`MAX_ECHO_CHARS`]
+/// characters is quoted as its first [`MAX_ECHO_CHARS`] characters followed by a
+/// `...` marker, so the message says which value was rejected without copying an
+/// unbounded caller string into it. A name of exactly [`MAX_ECHO_CHARS`]
+/// characters carries no marker and is quoted whole.
 fn validate_name(name: &str, location: &str) -> Result<()> {
     let length = name.chars().count();
     if length < MIN_NAME_LEN {
+        let value = echoed_name(name);
         return Err(Error::validation(format!(
-            "1 validation error detected: Value '{name}' at '{location}' failed to satisfy constraint: Member must have length greater than or equal to {MIN_NAME_LEN}"
+            "1 validation error detected: Value '{value}' at '{location}' failed to satisfy constraint: Member must have length greater than or equal to {MIN_NAME_LEN}"
         )));
     }
     if length > MAX_NAME_LEN {
+        let value = echoed_name(name);
         return Err(Error::validation(format!(
-            "1 validation error detected: Value '{name}' at '{location}' failed to satisfy constraint: Member must have length less than or equal to {MAX_NAME_LEN}"
+            "1 validation error detected: Value '{value}' at '{location}' failed to satisfy constraint: Member must have length less than or equal to {MAX_NAME_LEN}"
         )));
     }
     if !name.chars().all(is_name_character) {
+        let value = echoed_name(name);
         return Err(Error::validation(format!(
-            "1 validation error detected: Value '{name}' at '{location}' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+            "1 validation error detected: Value '{value}' at '{location}' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
         )));
     }
     Ok(())
 }
 
+/// Render an untrusted name for an error message, eliding anything past
+/// [`MAX_ECHO_CHARS`] characters.
+///
+/// The elision is measured in characters, so a multi-byte value is never cut
+/// through a scalar value. Values within the budget are returned unchanged;
+/// longer ones keep their first [`MAX_ECHO_CHARS`] characters and gain a `...`
+/// marker, which puts the result at most `MAX_ECHO_CHARS + 3` characters long.
+/// It is called on the rejection path only, so a valid name pays nothing.
+fn echoed_name(name: &str) -> Cow<'_, str> {
+    if name.chars().count() <= MAX_ECHO_CHARS {
+        return Cow::Borrowed(name);
+    }
+    let kept: String = name.chars().take(MAX_ECHO_CHARS).collect();
+    Cow::Owned(format!("{kept}..."))
+}
+
 /// Whether `character` belongs to the set the service allows in a name.
 fn is_name_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::{echoed_name, MAX_ECHO_CHARS};
+
+    #[test]
+    fn echoes_a_value_that_fits_unchanged() {
+        // Just inside the budget: quoted whole, no marker.
+        let at_limit = "a".repeat(MAX_ECHO_CHARS);
+        assert_eq!(echoed_name(&at_limit), at_limit);
+
+        // One character over: the first MAX_ECHO_CHARS characters plus the
+        // marker, and the result is bounded.
+        let over = "a".repeat(MAX_ECHO_CHARS + 1);
+        let rendered = echoed_name(&over);
+        assert_eq!(rendered, format!("{}...", "a".repeat(MAX_ECHO_CHARS)));
+        assert_eq!(rendered.chars().count(), MAX_ECHO_CHARS + 3);
+        assert!(!rendered.contains(&over), "{rendered}");
+    }
+
+    #[test]
+    fn elides_on_a_character_boundary_not_a_byte_one() {
+        // Multi-byte scalars: a byte-based cut would split a character and
+        // return invalid UTF-8, so the count has to be in characters.
+        let over = "ä".repeat(MAX_ECHO_CHARS + 1);
+        let rendered = echoed_name(&over);
+        assert!(rendered.ends_with("..."), "{rendered}");
+        assert_eq!(
+            rendered.chars().count(),
+            MAX_ECHO_CHARS + 3,
+            "the marker must not eat into the budget"
+        );
+        assert!(rendered.starts_with(&"ä".repeat(MAX_ECHO_CHARS)));
+    }
+
+    #[test]
+    fn keeps_short_and_empty_values_untouched() {
+        assert_eq!(echoed_name(""), "");
+        assert_eq!(echoed_name("orders"), "orders");
+        assert_eq!(echoed_name("ab"), "ab");
+    }
+
+    proptest! {
+        #[test]
+        fn elision_is_bounded_prefix_preserving_and_idempotent(value in any::<String>()) {
+            let rendered = echoed_name(&value);
+            let characters = value.chars().count();
+
+            prop_assert!(rendered.chars().count() <= MAX_ECHO_CHARS + 3);
+            if characters <= MAX_ECHO_CHARS {
+                prop_assert_eq!(rendered.as_ref(), value.as_str());
+            } else {
+                let kept: String = value.chars().take(MAX_ECHO_CHARS).collect();
+                prop_assert_eq!(rendered.as_ref(), format!("{kept}..."));
+                prop_assert!(rendered.ends_with("..."));
+            }
+            // Eliding an already-elided value changes nothing.
+            prop_assert_eq!(echoed_name(&rendered), rendered.clone());
+        }
+    }
 }

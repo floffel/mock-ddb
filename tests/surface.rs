@@ -303,6 +303,65 @@ async fn index_names_carry_the_service_name_rule() {
 }
 
 #[tokio::test]
+async fn error_messages_elide_an_untrusted_name() {
+    // The name is caller-controlled and, until the length check runs, of any
+    // size. Quoting it whole would copy a megabyte into the `Error` and from
+    // there into a test log, so the echo is capped at 64 characters plus a
+    // `...` marker — the same budget on every rejection path.
+    let kept = "a".repeat(64);
+    let kept_x = "x".repeat(64);
+
+    // Over the upper length bound: the marker appears, the full value does not.
+    let over_long = "a".repeat(300);
+    let length_error = rejection(CreateTableRequest::new(
+        over_long.clone(),
+        KeySchema::hash("pk", KeyType::String),
+    ))
+    .await;
+    assert!(
+        length_error.contains("length less than or equal to 255"),
+        "{length_error}"
+    );
+    assert!(
+        length_error.contains(&format!("Value '{kept}...'")),
+        "{length_error}"
+    );
+    assert!(!length_error.contains(&over_long), "{length_error}");
+
+    // Charset path, one character over the budget: the elision applies there
+    // too, so the forbidden character is trimmed out of the echo rather than
+    // smuggling a long value past the cap.
+    let over_budget = format!("{} ", "x".repeat(64));
+    let charset_error = rejection(CreateTableRequest::new(
+        over_budget.clone(),
+        KeySchema::hash("pk", KeyType::String),
+    ))
+    .await;
+    assert!(
+        charset_error.contains("regular expression pattern"),
+        "{charset_error}"
+    );
+    assert!(
+        charset_error.contains(&format!("Value '{kept_x}...'")),
+        "{charset_error}"
+    );
+    assert!(!charset_error.contains(&over_budget), "{charset_error}");
+
+    // Just inside the budget: quoted whole, and the message carries no marker.
+    let at_budget = format!("{} ", "x".repeat(63));
+    let short_error = rejection(CreateTableRequest::new(
+        at_budget.clone(),
+        KeySchema::hash("pk", KeyType::String),
+    ))
+    .await;
+    assert!(
+        short_error.contains(&format!("Value '{at_budget}'")),
+        "{short_error}"
+    );
+    assert!(!short_error.contains("..."), "{short_error}");
+}
+
+#[tokio::test]
 async fn a_local_index_needs_a_table_range_key() {
     // DynamoDB offers local secondary indexes only on tables with a range key,
     // so a hash-only table that carries one is refused instead of silently
