@@ -3157,13 +3157,20 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 /// a sort scalar at all — the partition bytes alone hash the way they would as
 /// the prefix of a longer key — and it is pinned to the published vectors by
 /// `fnv1a_matches_the_specification_vectors`.
+#[cfg(test)]
 fn fnv1a_64<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> u64 {
     let mut hash = FNV_OFFSET_BASIS;
     for bytes in chunks {
-        for byte in bytes {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(FNV_PRIME);
-        }
+        hash = fnv1a_64_continue(hash, bytes);
+    }
+    hash
+}
+
+/// Continue an FNV-1a digest over another chunk.
+fn fnv1a_64_continue(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
 }
@@ -3192,15 +3199,17 @@ fn fnv1a_64<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> u64 {
 /// `("key-{n}", "{n}")` key shape. The finalizer only changes bucket assignment;
 /// the FNV digest itself stays pinned to the specification vectors below.
 fn segment_of(key: &ItemKey, total_segments: u32) -> u32 {
-    let hash = fnv1a_64(
-        [Some(&key.0), key.1.as_ref()]
-            .into_iter()
-            .flatten()
-            .map(|scalar| match scalar {
-                Scalar::S(text) | Scalar::N(text) => text.as_bytes(),
-                Scalar::B(bytes) => bytes.as_slice(),
-            }),
-    );
+    let mut hash = FNV_OFFSET_BASIS;
+    for scalar in [Some(&key.0), key.1.as_ref()].into_iter().flatten() {
+        hash = match scalar {
+            Scalar::S(text) => fnv1a_64_continue(hash, text.as_bytes()),
+            Scalar::N(number) => {
+                let canonical = number.canonical();
+                fnv1a_64_continue(hash, canonical.as_bytes())
+            }
+            Scalar::B(bytes) => fnv1a_64_continue(hash, bytes),
+        };
+    }
     let hash = mix_segment_hash(hash);
     // The remainder is below `total_segments`, itself a `u32`, so the
     // conversion back cannot fail.
@@ -3564,9 +3573,13 @@ mod tests {
         .unwrap()
     }
 
+    fn scalar_n(text: &str) -> Scalar {
+        Scalar::from_value(&n(text)).expect("a numeric scalar")
+    }
+
     #[test]
     fn segment_assignment_is_stable_and_bounded() {
-        let key: ItemKey = (Scalar::S("a".into()), Some(Scalar::N("1".into())));
+        let key: ItemKey = (Scalar::S("a".into()), Some(scalar_n("1")));
         let first = segment_of(&key, 4);
         assert!(first < 4);
         assert_eq!(first, segment_of(&key, 4));
@@ -3578,7 +3591,7 @@ mod tests {
             let counts = segment_counts(total, |index| {
                 (
                     Scalar::S(format!("key-{index}")),
-                    Some(Scalar::N(index.to_string())),
+                    Some(scalar_n(&index.to_string())),
                 )
             });
             assert!(
@@ -3609,7 +3622,7 @@ mod tests {
     #[test]
     fn segment_assignment_uses_the_partition_bytes_alone_for_a_key_only_item() {
         let partition = Scalar::S("answer".into());
-        let sort = Scalar::N("42".into());
+        let sort = scalar_n("42");
         let key_only: ItemKey = (partition.clone(), None);
         let full: ItemKey = (partition.clone(), Some(sort.clone()));
         // Hashing the partition bytes alone is the same as hashing them as the
@@ -3629,11 +3642,7 @@ mod tests {
         // (see `parallel_scan_segments_are_disjoint_and_complete`), so those are
         // the just-inside values this function has to survive.
         let partitions = ["", "a", "zzz", "\u{1F600}"];
-        let sorts = [
-            None,
-            Some(Scalar::N("0".into())),
-            Some(Scalar::N("-1".into())),
-        ];
+        let sorts = [None, Some(scalar_n("0")), Some(scalar_n("-1"))];
         for partition in partitions {
             for sort in &sorts {
                 let key: ItemKey = (Scalar::S(partition.into()), sort.clone());
@@ -3663,7 +3672,10 @@ mod tests {
             sort in proptest::option::of("[0-9]{1,18}"),
             total in 1u32..=1_000_000u32,
         ) {
-            let key: ItemKey = (Scalar::S(partition), sort.map(Scalar::N));
+            let key: ItemKey = (
+                Scalar::S(partition),
+                sort.map(|text| scalar_n(&text)),
+            );
             let segment = segment_of(&key, total);
             prop_assert!(segment < total);
             prop_assert_eq!(segment, segment_of(&key, total));
@@ -3683,7 +3695,7 @@ mod tests {
             let counts = segment_counts(total, |index| {
                 (
                     Scalar::S(format!("{prefix}key-{index}")),
-                    Some(Scalar::N(index.to_string())),
+                    Some(scalar_n(&index.to_string())),
                 )
             });
             prop_assert!(

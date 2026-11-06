@@ -134,6 +134,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stream record for successful expired-row deletions, and processes at most
   1,024 expired rows per call so purging a large table has bounded key
   allocation.
+- Value semantics now share one canonical representation. A numeric key stores
+  its parsed `Number`, so equality, hashing, and ordering agree on `"1"`,
+  `"1.0"`, and `"1e0"` instead of splitting between a `BTreeMap` and a
+  `HashMap`. Numeric set equality is reflexive again, set comparison and union
+  use canonical multiset counts rather than quadratic scans, and set members
+  are validated once for emptiness, duplicates after numeric normalization, and
+  malformed numbers. ADD and DELETE now report a malformed numeric member as
+  the caller's `ValidationException` naming the member and attribute, rather
+  than silently doing nothing or calling it a set-type mismatch.
 - Parallel scans no longer starve every even segment for keys whose last sort
   value ends in a decimal digit. Segment assignment still hashes the primary
   key with FNV-1a, but runs the digest through SplitMix64's finalizer before

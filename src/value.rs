@@ -5,6 +5,8 @@
 //! disagree about what `"1.0"` equals or how large an item is.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::hash::Hash;
 
 use aws_sdk_dynamodb::types::AttributeValue;
 
@@ -33,8 +35,8 @@ pub(crate) fn item_too_large(size: usize) -> Error {
 pub(crate) enum Scalar {
     /// A string key value.
     S(String),
-    /// A number key value, stored in canonical form.
-    N(String),
+    /// A number key value, parsed so equality and ordering share one value.
+    N(Number),
     /// A binary key value.
     B(Vec<u8>),
 }
@@ -44,9 +46,7 @@ impl Scalar {
     pub(crate) fn from_value(value: &AttributeValue) -> Option<Self> {
         match value {
             AttributeValue::S(text) => Some(Self::S(text.clone())),
-            AttributeValue::N(text) => {
-                Number::parse(text).map(|number| Self::N(number.canonical()))
-            }
+            AttributeValue::N(text) => Number::parse(text).map(Self::N),
             AttributeValue::B(blob) => Some(Self::B(blob.as_ref().to_vec())),
             _ => None,
         }
@@ -75,10 +75,7 @@ impl Ord for Scalar {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
             (Self::S(left), Self::S(right)) => left.as_bytes().cmp(right.as_bytes()),
-            (Self::N(left), Self::N(right)) => match (Number::parse(left), Number::parse(right)) {
-                (Some(left), Some(right)) => left.cmp(&right),
-                _ => left.cmp(right),
-            },
+            (Self::N(left), Self::N(right)) => left.cmp(right),
             (Self::B(left), Self::B(right)) => left.cmp(right),
             _ => discriminant(self).cmp(&discriminant(other)),
         }
@@ -160,42 +157,49 @@ pub(crate) fn value_eq(left: &AttributeValue, right: &AttributeValue) -> bool {
 /// Order-insensitive comparison of two string-ish sets.
 fn unordered_eq<'a, T, I, J>(left: I, right: J) -> bool
 where
-    T: PartialEq + 'a,
+    T: Eq + Hash + 'a,
     I: Iterator<Item = T> + Clone,
     J: Iterator<Item = T>,
 {
-    let mut right: Vec<T> = right.collect();
-    if left.clone().count() != right.len() {
-        return false;
+    let mut counts: HashMap<T, usize> = HashMap::new();
+    for item in left.clone() {
+        *counts.entry(item).or_default() += 1;
     }
-    for item in left {
-        let Some(position) = right.iter().position(|candidate| *candidate == item) else {
+    let mut right_count = 0;
+    for item in right {
+        right_count += 1;
+        let Some(count) = counts.get_mut(&item) else {
             return false;
         };
-        right.swap_remove(position);
+        if *count == 0 {
+            return false;
+        }
+        *count -= 1;
     }
-    true
+    if left.count() != right_count {
+        return false;
+    }
+    counts.values().all(|count| *count == 0)
 }
 
 /// Number sets compare numerically, so `["1.0"]` equals `["1"]`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum NumericMember {
+    Number(Number),
+    Raw(String),
+}
+
+impl NumericMember {
+    fn parse(text: &str) -> Self {
+        Number::parse(text).map_or_else(|| Self::Raw(text.to_string()), Self::Number)
+    }
+}
+
 fn numeric_sets_eq(left: &[String], right: &[String]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut right: Vec<Option<Number>> = right.iter().map(|text| Number::parse(text)).collect();
-    for text in left {
-        let Some(number) = Number::parse(text) else {
-            return false;
-        };
-        let Some(position) = right
-            .iter()
-            .position(|candidate| candidate.as_ref() == Some(&number))
-        else {
-            return false;
-        };
-        right.swap_remove(position);
-    }
-    true
+    unordered_eq(
+        left.iter().map(|text| NumericMember::parse(text)),
+        right.iter().map(|text| NumericMember::parse(text)),
+    )
 }
 
 /// Ordering for the comparison operators.
@@ -263,8 +267,98 @@ pub(crate) fn list_size(elements: &[AttributeValue]) -> usize {
     elements.iter().map(value_size).sum::<usize>() + 3 * elements.len()
 }
 
+/// Why a set member is not storable.
+///
+/// Kept apart from [`Error`] so the update evaluator can choose the service
+/// wording and attribute path for the caller's operand, while the write path
+/// uses the same verdict for a whole item.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SetMemberError {
+    /// A string set contains the empty string.
+    EmptyString,
+    /// A binary set contains a zero-length blob.
+    EmptyBinary,
+    /// A number set member is not a storable DynamoDB number.
+    InvalidNumber(String),
+    /// Two members are equal after DynamoDB normalization.
+    Duplicate,
+    /// The value is not one of the three set types.
+    NotASet,
+}
+
+/// Validate the members shared by every set type.
+///
+/// DynamoDB rejects empty members and duplicates after normalization: `"1"`
+/// and `"1.0"` are the same NS member. Running this before equality or set
+/// algebra means the operations never have to choose between silently ignoring
+/// malformed data and reporting it as a type mismatch.
+pub(crate) fn validate_set_members(value: &AttributeValue) -> Result<(), SetMemberError> {
+    match value {
+        AttributeValue::Ss(members) => {
+            let mut seen = std::collections::HashSet::with_capacity(members.len());
+            for member in members {
+                if member.is_empty() {
+                    return Err(SetMemberError::EmptyString);
+                }
+                if !seen.insert(member.as_str()) {
+                    return Err(SetMemberError::Duplicate);
+                }
+            }
+            Ok(())
+        }
+        AttributeValue::Ns(members) => {
+            let mut seen = std::collections::HashSet::with_capacity(members.len());
+            for member in members {
+                let number = Number::parse(member)
+                    .ok_or_else(|| SetMemberError::InvalidNumber(member.clone()))?;
+                crate::number::validate(member)
+                    .map_err(|_| SetMemberError::InvalidNumber(member.clone()))?;
+                if !seen.insert(number) {
+                    return Err(SetMemberError::Duplicate);
+                }
+            }
+            Ok(())
+        }
+        AttributeValue::Bs(members) => {
+            let mut seen = std::collections::HashSet::with_capacity(members.len());
+            for member in members {
+                if member.as_ref().is_empty() {
+                    return Err(SetMemberError::EmptyBinary);
+                }
+                if !seen.insert(member.as_ref()) {
+                    return Err(SetMemberError::Duplicate);
+                }
+            }
+            Ok(())
+        }
+        _ => Err(SetMemberError::NotASet),
+    }
+}
+
+fn set_member_validation_error(error: SetMemberError, path: &str) -> Error {
+    match error {
+        SetMemberError::EmptyString => Error::validation(format!(
+            "One or more parameter values were invalid: An string set may not have an empty string as a member ({path})"
+        )),
+        SetMemberError::EmptyBinary => Error::validation(format!(
+            "One or more parameter values were invalid: An binary set may not have an empty binary as a member ({path})"
+        )),
+        SetMemberError::InvalidNumber(member) => Error::validation(format!(
+            "The parameter cannot be converted to a numeric value: {} (attribute: {path})",
+            crate::number::excerpt(&member)
+        )),
+        SetMemberError::Duplicate => Error::validation(format!(
+            "One or more parameter values were invalid: Input collection contains duplicates ({path})"
+        )),
+        SetMemberError::NotASet => Error::validation(format!(
+            "One or more parameter values were invalid: The value at {path} is not a set"
+        )),
+    }
+}
+
 /// Validate one value: numbers must parse within DynamoDB's limits and sets
-/// must not be empty. Recurses into lists and maps.
+/// must be non-empty with unique, non-empty members. Recurses into lists and
+/// maps.
 pub(crate) fn validate_value(value: &AttributeValue, path: &str) -> Result<()> {
     match value {
         AttributeValue::N(text) => crate::number::validate(text),
@@ -274,9 +368,7 @@ pub(crate) fn validate_value(value: &AttributeValue, path: &str) -> Result<()> {
                     "One or more parameter values were invalid: An number set may not be empty ({path})"
                 )));
             }
-            members
-                .iter()
-                .try_for_each(|text| crate::number::validate(text))
+            validate_set_members(value).map_err(|error| set_member_validation_error(error, path))
         }
         AttributeValue::Ss(members) => {
             if members.is_empty() {
@@ -284,7 +376,7 @@ pub(crate) fn validate_value(value: &AttributeValue, path: &str) -> Result<()> {
                     "One or more parameter values were invalid: An string set may not be empty ({path})"
                 )));
             }
-            Ok(())
+            validate_set_members(value).map_err(|error| set_member_validation_error(error, path))
         }
         AttributeValue::Bs(members) => {
             if members.is_empty() {
@@ -292,7 +384,7 @@ pub(crate) fn validate_value(value: &AttributeValue, path: &str) -> Result<()> {
                     "One or more parameter values were invalid: An binary set may not be empty ({path})"
                 )));
             }
-            Ok(())
+            validate_set_members(value).map_err(|error| set_member_validation_error(error, path))
         }
         AttributeValue::L(elements) => elements
             .iter()
@@ -305,88 +397,129 @@ pub(crate) fn validate_value(value: &AttributeValue, path: &str) -> Result<()> {
     }
 }
 
-/// Union of two sets of the same type. `None` when either side is not a set or
-/// the types differ.
-pub(crate) fn set_union(left: &AttributeValue, right: &AttributeValue) -> Option<AttributeValue> {
+/// Union of two sets of the same type. `Ok(None)` when either side is not a set
+/// or the types differ; a malformed set member is a typed error.
+pub(crate) fn set_union(
+    left: &AttributeValue,
+    right: &AttributeValue,
+) -> std::result::Result<Option<AttributeValue>, SetMemberError> {
+    if !matches!(
+        (left, right),
+        (AttributeValue::Ss(_), AttributeValue::Ss(_))
+            | (AttributeValue::Ns(_), AttributeValue::Ns(_))
+            | (AttributeValue::Bs(_), AttributeValue::Bs(_))
+    ) {
+        return Ok(None);
+    }
+    validate_set_members(left)?;
+    validate_set_members(right)?;
     match (left, right) {
         (AttributeValue::Ss(left), AttributeValue::Ss(right)) => {
             let mut values: Vec<String> = left.clone();
+            let mut present: std::collections::HashSet<&str> =
+                left.iter().map(String::as_str).collect();
             for member in right {
-                if !values.contains(member) {
+                if present.insert(member.as_str()) {
                     values.push(member.clone());
                 }
             }
-            Some(AttributeValue::Ss(values))
+            Ok(Some(AttributeValue::Ss(values)))
         }
         (AttributeValue::Ns(left), AttributeValue::Ns(right)) => {
             let mut values: Vec<String> = left.clone();
+            let mut present: std::collections::HashSet<Number> = left
+                .iter()
+                .map(|member| {
+                    Number::parse(member)
+                        .ok_or_else(|| SetMemberError::InvalidNumber(member.clone()))
+                })
+                .collect::<std::result::Result<_, _>>()?;
             for member in right {
-                let member_number = Number::parse(member)?;
-                let present = values
-                    .iter()
-                    .filter_map(|existing| Number::parse(existing))
-                    .any(|existing| existing == member_number);
-                if !present {
+                let member_number = Number::parse(member)
+                    .ok_or_else(|| SetMemberError::InvalidNumber(member.clone()))?;
+                if present.insert(member_number) {
                     values.push(member.clone());
                 }
             }
-            Some(AttributeValue::Ns(values))
+            Ok(Some(AttributeValue::Ns(values)))
         }
         (AttributeValue::Bs(left), AttributeValue::Bs(right)) => {
             let mut values: Vec<aws_sdk_dynamodb::primitives::Blob> = left.clone();
+            let mut present: std::collections::HashSet<&[u8]> =
+                left.iter().map(std::convert::AsRef::as_ref).collect();
             for member in right {
-                if !values
-                    .iter()
-                    .any(|existing| existing.as_ref() == member.as_ref())
-                {
+                if present.insert(member.as_ref()) {
                     values.push(member.clone());
                 }
             }
-            Some(AttributeValue::Bs(values))
+            Ok(Some(AttributeValue::Bs(values)))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
-/// Difference of two sets of the same type. `None` when either side is not a
-/// set or the types differ. An empty result is reported as `Some(empty set)`;
-/// the caller removes the attribute, as DynamoDB does.
+/// Difference of two sets of the same type. `Ok(None)` when either side is not
+/// a set or the types differ. An empty result is reported as `Ok(Some(empty
+/// set))`; the caller removes the attribute, as DynamoDB does.
 pub(crate) fn set_difference(
     left: &AttributeValue,
     right: &AttributeValue,
-) -> Option<AttributeValue> {
+) -> std::result::Result<Option<AttributeValue>, SetMemberError> {
+    if !matches!(
+        (left, right),
+        (AttributeValue::Ss(_), AttributeValue::Ss(_))
+            | (AttributeValue::Ns(_), AttributeValue::Ns(_))
+            | (AttributeValue::Bs(_), AttributeValue::Bs(_))
+    ) {
+        return Ok(None);
+    }
+    validate_set_members(left)?;
+    validate_set_members(right)?;
     match (left, right) {
-        (AttributeValue::Ss(left), AttributeValue::Ss(right)) => Some(AttributeValue::Ss(
-            left.iter()
-                .filter(|member| !right.contains(member))
-                .cloned()
-                .collect(),
-        )),
-        (AttributeValue::Ns(left), AttributeValue::Ns(right)) => {
-            let removals: Vec<Number> = right
-                .iter()
-                .filter_map(|text| Number::parse(text))
-                .collect();
-            Some(AttributeValue::Ns(
+        (AttributeValue::Ss(left), AttributeValue::Ss(right)) => {
+            let removals: std::collections::HashSet<&str> =
+                right.iter().map(String::as_str).collect();
+            Ok(Some(AttributeValue::Ss(
                 left.iter()
-                    .filter(|member| {
-                        Number::parse(member).is_none_or(|number| !removals.contains(&number))
-                    })
+                    .filter(|member| !removals.contains(member.as_str()))
                     .cloned()
                     .collect(),
-            ))
+            )))
         }
-        (AttributeValue::Bs(left), AttributeValue::Bs(right)) => Some(AttributeValue::Bs(
-            left.iter()
-                .filter(|member| {
-                    !right
-                        .iter()
-                        .any(|removal| removal.as_ref() == member.as_ref())
+        (AttributeValue::Ns(left), AttributeValue::Ns(right)) => {
+            let removals: std::collections::HashSet<Number> = right
+                .iter()
+                .map(|text| {
+                    Number::parse(text).ok_or_else(|| SetMemberError::InvalidNumber(text.clone()))
                 })
-                .cloned()
-                .collect(),
-        )),
-        _ => None,
+                .collect::<std::result::Result<_, _>>()?;
+            let parsed_left = left
+                .iter()
+                .map(|member| -> std::result::Result<_, SetMemberError> {
+                    let number = Number::parse(member)
+                        .ok_or_else(|| SetMemberError::InvalidNumber(member.clone()))?;
+                    Ok((member, number))
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(Some(AttributeValue::Ns(
+                parsed_left
+                    .into_iter()
+                    .filter(|(_, number)| !removals.contains(number))
+                    .map(|(member, _)| member.clone())
+                    .collect(),
+            )))
+        }
+        (AttributeValue::Bs(left), AttributeValue::Bs(right)) => {
+            let removals: std::collections::HashSet<&[u8]> =
+                right.iter().map(std::convert::AsRef::as_ref).collect();
+            Ok(Some(AttributeValue::Bs(
+                left.iter()
+                    .filter(|member| !removals.contains(member.as_ref()))
+                    .cloned()
+                    .collect(),
+            )))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -429,9 +562,12 @@ mod tests {
         let left = AttributeValue::Ns(vec!["1.0".into(), "2".into()]);
         let right = AttributeValue::Ns(vec!["2".into(), "1".into()]);
         assert!(value_eq(&left, &right));
-        assert!(value_eq(&set_union(&left, &right).unwrap(), &right));
+        assert!(value_eq(
+            &set_union(&left, &right).unwrap().unwrap(),
+            &right
+        ));
         assert_eq!(
-            set_difference(&right, &left),
+            set_difference(&right, &left).unwrap(),
             Some(AttributeValue::Ns(Vec::new()))
         );
     }
@@ -441,7 +577,7 @@ mod tests {
         let left = AttributeValue::Bs(vec![Blob::new(vec![1_u8, 2])]);
         let right = AttributeValue::Bs(vec![Blob::new(vec![1_u8, 2])]);
         assert!(value_eq(&left, &right));
-        assert!(set_union(&left, &right).is_some());
+        assert!(set_union(&left, &right).unwrap().is_some());
     }
 
     #[test]
@@ -546,7 +682,7 @@ mod tests {
             &AttributeValue::N("nope".into()),
             &AttributeValue::N("other".into())
         ));
-        assert!(!value_eq(
+        assert!(value_eq(
             &AttributeValue::Ns(vec!["nope".into()]),
             &AttributeValue::Ns(vec!["nope".into()])
         ));
@@ -566,39 +702,41 @@ mod tests {
         let left = AttributeValue::Bs(vec![Blob::new(vec![1])]);
         let right = AttributeValue::Bs(vec![Blob::new(vec![2])]);
         assert_eq!(
-            set_union(&left, &right),
+            set_union(&left, &right).unwrap(),
             Some(AttributeValue::Bs(vec![
                 Blob::new(vec![1]),
                 Blob::new(vec![2])
             ]))
         );
         assert_eq!(
-            set_difference(&left, &right),
+            set_difference(&left, &right).unwrap(),
             Some(AttributeValue::Bs(vec![Blob::new(vec![1])]))
         );
 
         let strings = AttributeValue::Ss(vec!["a".into(), "b".into()]);
         assert_eq!(
-            set_difference(&strings, &AttributeValue::Ss(vec!["a".into()])),
+            set_difference(&strings, &AttributeValue::Ss(vec!["a".into()])).unwrap(),
             Some(AttributeValue::Ss(vec!["b".into()]))
         );
 
         let numbers = AttributeValue::Ns(vec!["1".into(), "2".into()]);
         assert_eq!(
-            set_difference(&numbers, &numbers),
+            set_difference(&numbers, &numbers).unwrap(),
             Some(AttributeValue::Ns(Vec::new()))
         );
 
         // Mismatched types are not sets of the same kind.
-        assert!(set_union(&left, &strings).is_none());
-        assert!(set_difference(&strings, &left).is_none());
-        assert!(set_union(&strings, &AttributeValue::S("x".into())).is_none());
+        assert!(set_union(&left, &strings).unwrap().is_none());
+        assert!(set_difference(&strings, &left).unwrap().is_none());
+        assert!(set_union(&strings, &AttributeValue::S("x".into()))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn scalars_compare_and_report_emptiness() {
         let text = Scalar::S("a".into());
-        let number = Scalar::N("1".into());
+        let number = Scalar::N(Number::parse("1").unwrap());
         let binary = Scalar::B(vec![1]);
         assert!(text < number);
         assert!(number < binary);
@@ -615,7 +753,7 @@ mod tests {
         assert_eq!(Scalar::from_value(&AttributeValue::M(HashMap::new())), None);
         assert_eq!(
             Scalar::from_value(&AttributeValue::N("1.0".into())),
-            Some(Scalar::N("1E0".into()))
+            Some(Scalar::N(Number::parse("1").unwrap()))
         );
         assert_eq!(Scalar::from_value(&AttributeValue::N("bad".into())), None);
         assert_eq!(
@@ -626,6 +764,29 @@ mod tests {
             Scalar::B(vec![2]).cmp(&Scalar::B(vec![1])),
             Ordering::Greater
         );
+    }
+
+    #[test]
+    fn scalar_equality_hash_and_order_share_the_parsed_number() {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+
+        fn hash(scalar: &Scalar) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            scalar.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        let one = Scalar::from_value(&AttributeValue::N("1".into())).unwrap();
+        let one_point_zero = Scalar::from_value(&AttributeValue::N("1.0".into())).unwrap();
+        let one_exponent = Scalar::from_value(&AttributeValue::N("1e0".into())).unwrap();
+        assert_eq!(one, one_point_zero);
+        assert_eq!(one, one_exponent);
+        assert_eq!(one.cmp(&one_point_zero), Ordering::Equal);
+        assert_eq!(hash(&one), hash(&one_point_zero));
+
+        let ten = Scalar::from_value(&AttributeValue::N("10".into())).unwrap();
+        assert_eq!(one.cmp(&ten), Ordering::Less);
+        assert_ne!(one, ten);
     }
 
     #[test]
@@ -648,5 +809,88 @@ mod tests {
             "x"
         )
         .is_err());
+    }
+    #[test]
+    fn set_validation_rejects_duplicates_and_empty_members() {
+        let cases = [
+            (
+                AttributeValue::Ss(vec![String::new()]),
+                "empty string as a member",
+            ),
+            (
+                AttributeValue::Ss(vec!["a".into(), "a".into()]),
+                "Input collection contains duplicates",
+            ),
+            (
+                AttributeValue::Ns(vec!["1".into(), "1.0".into()]),
+                "Input collection contains duplicates",
+            ),
+            (
+                AttributeValue::Ns(vec!["not-a-number".into()]),
+                "cannot be converted to a numeric value",
+            ),
+            (
+                AttributeValue::Bs(vec![Blob::new(Vec::new())]),
+                "empty binary as a member",
+            ),
+            (
+                AttributeValue::Bs(vec![Blob::new(vec![1]), Blob::new(vec![1])]),
+                "Input collection contains duplicates",
+            ),
+        ];
+        for (value, expected) in cases {
+            let error = validate_value(&value, "members").unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{expected}` in `{error}`"
+            );
+        }
+
+        for value in [
+            AttributeValue::Ss(vec!["a".into()]),
+            AttributeValue::Ns(vec!["1".into(), "2.0".into()]),
+            AttributeValue::Bs(vec![Blob::new(vec![1]), Blob::new(vec![2])]),
+        ] {
+            validate_value(&value, "members").unwrap();
+        }
+    }
+
+    #[test]
+    fn set_operations_use_canonical_multiset_membership() {
+        let left = AttributeValue::Ns(vec!["1.0".into(), "2".into()]);
+        let right = AttributeValue::Ns(vec!["1".into()]);
+        assert_eq!(
+            set_difference(&left, &right).unwrap(),
+            Some(AttributeValue::Ns(vec!["2".into()]))
+        );
+        assert_eq!(
+            set_union(&left, &right).unwrap(),
+            Some(AttributeValue::Ns(vec!["1.0".into(), "2".into()]))
+        );
+
+        let raw = AttributeValue::Ns(vec!["nope".into()]);
+        assert!(value_eq(&raw, &raw));
+        assert_eq!(
+            set_difference(&raw, &raw),
+            Err(SetMemberError::InvalidNumber("nope".into()))
+        );
+        assert_eq!(
+            set_union(&raw, &raw),
+            Err(SetMemberError::InvalidNumber("nope".into()))
+        );
+        assert!(validate_value(&raw, "members").is_err());
+    }
+
+    #[test]
+    fn large_set_operations_are_linear_enough_for_large_items() {
+        let count = 20_000_usize;
+        let members: Vec<String> = (0..count).map(|index| index.to_string()).collect();
+        let left = AttributeValue::Ns(members.clone());
+        let right = AttributeValue::Ns(members.into_iter().rev().collect());
+        assert!(value_eq(&left, &right));
+        assert_eq!(
+            set_difference(&left, &right).unwrap(),
+            Some(AttributeValue::Ns(Vec::new()))
+        );
     }
 }
