@@ -605,6 +605,43 @@ async fn parallel_scan_segments_are_disjoint_and_complete() {
 }
 
 #[tokio::test]
+async fn parallel_scan_segments_spread_a_common_composite_key_shape() {
+    let mock = orders();
+    let total_orders = 512;
+    for id in 0..total_orders {
+        mock.put_item(mock_ddb::PutItemRequest::new(
+            "orders",
+            item([("pk", s(format!("key-{id}"))), ("sk", n(id.to_string()))]),
+        ))
+        .await
+        .unwrap();
+    }
+
+    for total in [4, 8] {
+        let mut counts = vec![0_usize; total];
+        for (segment, count) in counts.iter_mut().enumerate() {
+            let page = mock
+                .scan(ScanRequest::new("orders").with_segment(
+                    u32::try_from(segment).unwrap(),
+                    u32::try_from(total).unwrap(),
+                ))
+                .await
+                .unwrap();
+            *count = page.items.len();
+        }
+        assert!(
+            counts.iter().all(|&count| count > 0),
+            "{total}-way scan starves a segment: {counts:?}"
+        );
+        assert!(
+            counts.iter().all(|&count| count <= total_orders / 2),
+            "{total}-way scan concentrates too many items: {counts:?}"
+        );
+        assert_eq!(counts.iter().sum::<usize>(), total_orders);
+    }
+}
+
+#[tokio::test]
 async fn scan_of_an_index_applies_the_index_projection() {
     let mock = indexed_mock().await;
     mock.put_item(mock_ddb::PutItemRequest::new(
