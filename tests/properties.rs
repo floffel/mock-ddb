@@ -46,10 +46,19 @@ fn attribute() -> impl Strategy<Value = AttributeValue> {
             prop::collection::vec(inner.clone(), 0..3).prop_map(AttributeValue::L),
             prop::collection::hash_map("[a-z]{1,5}", inner.clone(), 0..3)
                 .prop_map(AttributeValue::M),
-            prop::collection::vec("[a-z]{1,4}", 1..3).prop_map(AttributeValue::Ss),
-            prop::collection::vec(1_i64..100, 1..3).prop_map(|members| AttributeValue::Ns(
-                members.iter().map(i64::to_string).collect()
-            )),
+            prop::collection::hash_set("[a-z]{1,4}", 1..3)
+                .prop_map(|members| AttributeValue::Ss(members.into_iter().collect())),
+            prop::collection::hash_set(1_i64..100, 1..3).prop_map(|members| {
+                AttributeValue::Ns(
+                    members
+                        .into_iter()
+                        .map(|member| member.to_string())
+                        .collect(),
+                )
+            }),
+            prop::collection::hash_set(prop::collection::vec(any::<u8>(), 1..4), 1..3).prop_map(
+                |members| AttributeValue::Bs(members.into_iter().map(Blob::new).collect())
+            ),
         ]
     })
 }
@@ -291,6 +300,57 @@ proptest! {
                     .unwrap();
             }
             assert_eq!(mock.count("users"), unique.len());
+        });
+    }
+
+    /// Number-set equality is an equivalence relation over generated NS values,
+    /// independent of member order and numeric spelling.
+    #[test]
+    fn number_set_equality_is_reflexive_and_order_insensitive(
+        members in prop::collection::hash_set(-1_000_i64..1_000, 1..12),
+        spell in prop::sample::select(vec!["", ".0", "e0"]),
+    ) {
+        let spell_number = |number: i64| format!("{number}{spell}");
+        let left = AttributeValue::Ns(members.iter().map(|number| spell_number(*number)).collect());
+        let mut ordered: Vec<i64> = members.iter().copied().collect();
+        ordered.reverse();
+        let right = AttributeValue::Ns(
+            ordered
+                .into_iter()
+                .map(|number| number.to_string())
+                .collect(),
+        );
+        let condition = ConditionExpression::parse("s = :v").unwrap();
+        let values = values([(":v", right.clone())]);
+        let item = item([("pk", s("p")), ("s", left)]);
+        assert!(condition
+            .evaluate(Some(&item), &HashMap::new(), &values)
+            .unwrap());
+    }
+
+    /// Equal numeric spellings address the same item, whether the key text is
+    /// plain or exponent-form.
+    #[test]
+    fn number_key_spellings_address_one_item(number in -10_000_i64..10_000) {
+        let mock = events();
+        run(async {
+            mock.put_item(PutItemRequest::new(
+                "events",
+                item([("pk", s("p")), ("sk", n(format!("{number}.0"))), ("v", n("1"))]),
+            ))
+            .await
+            .unwrap();
+            for spelling in [number.to_string(), format!("{number}e0")] {
+                let found = mock
+                    .get_item(GetItemRequest::new(
+                        "events",
+                        item([("pk", s("p")), ("sk", n(spelling))]),
+                    ))
+                    .await
+                    .unwrap();
+                assert!(found.item.is_some());
+            }
+            assert_eq!(mock.count("events"), 1);
         });
     }
 }

@@ -35,7 +35,8 @@ use super::path::{get_path, invalid_nested_path, remove_path, render, root, set_
 use crate::number::Number;
 use crate::schema::KeySchema;
 use crate::value::{
-    item_size, item_too_large, list_size, set_difference, set_union, type_name, MAX_ITEM_SIZE,
+    item_size, item_too_large, list_size, set_difference, set_union, type_name,
+    validate_set_members, SetMemberError, MAX_ITEM_SIZE,
 };
 use crate::{Error, Item, Result};
 
@@ -134,6 +135,8 @@ pub(crate) fn apply(
                     // happens to exist. Skipping the gate for a missing path
                     // would let a client bug hide behind the stored state.
                     validate_delete_delta(&delta, &rendered)?;
+                    validate_set_members(&delta)
+                        .map_err(|error| set_member_error(error, &rendered, Origin::Request))?;
                     // A path that is not there is the no-op the service
                     // reports: nothing to remove, nothing written.
                     let Some(current) = get_path(item, &resolved).cloned() else {
@@ -141,8 +144,10 @@ pub(crate) fn apply(
                     };
                     // Only the stored side can be wrong now, so it is the one
                     // the error names: a set of another member type cannot be
-                    // subtracted from this value.
+                    // subtracted from this value, and a malformed stored set is
+                    // an invariant failure rather than the caller's request.
                     let remaining = set_difference(&current, &delta)
+                        .map_err(|error| set_member_error(error, &rendered, Origin::Item))?
                         .ok_or_else(|| delete_type_error(&current))?;
                     // A value the mock cannot classify is never "empty": that
                     // answer removes the attribute outright, and it is the one
@@ -377,20 +382,20 @@ fn validate_add_delta(delta: &AttributeValue, path: &str) -> Result<AttributeVal
         AttributeValue::N(text) => Ok(AttributeValue::N(render_number(text, path)?)),
         AttributeValue::Ns(members) => {
             refuse_empty_set(members.is_empty(), "number", path)?;
-            match members
-                .iter()
-                .find(|member| Number::parse(member).is_none())
-            {
-                Some(member) => Err(unusable_number(member, Origin::Request, path)),
-                None => Ok(delta.clone()),
-            }
+            validate_set_members(delta)
+                .map_err(|error| set_member_error(error, path, Origin::Request))?;
+            Ok(delta.clone())
         }
         AttributeValue::Ss(members) => {
             refuse_empty_set(members.is_empty(), "string", path)?;
+            validate_set_members(delta)
+                .map_err(|error| set_member_error(error, path, Origin::Request))?;
             Ok(delta.clone())
         }
         AttributeValue::Bs(members) => {
             refuse_empty_set(members.is_empty(), "binary", path)?;
+            validate_set_members(delta)
+                .map_err(|error| set_member_error(error, path, Origin::Request))?;
             Ok(delta.clone())
         }
         _ => Err(add_type_error(delta)),
@@ -506,10 +511,53 @@ fn add_values(
         }
         (AttributeValue::Ss(_), AttributeValue::Ss(_))
         | (AttributeValue::Ns(_), AttributeValue::Ns(_))
-        | (AttributeValue::Bs(_), AttributeValue::Bs(_)) => {
-            set_union(current, delta).ok_or_else(|| add_type_error(delta))
-        }
+        | (AttributeValue::Bs(_), AttributeValue::Bs(_)) => set_union(current, delta)
+            .map_err(|error| set_member_error(error, path, Origin::Item))?
+            .ok_or_else(|| add_type_error(delta)),
         _ => Err(add_type_error(delta)),
+    }
+}
+
+/// Turn a malformed-set verdict into the error class appropriate to its source.
+fn set_member_error(error: SetMemberError, path: &str, origin: Origin) -> Error {
+    match error {
+        SetMemberError::InvalidNumber(member) => unusable_number(&member, origin, path),
+        SetMemberError::EmptyString | SetMemberError::EmptyBinary | SetMemberError::Duplicate => {
+            match origin {
+                Origin::Request => Error::validation(set_member_request_message(&error, path)),
+                Origin::Item => Error::internal(format!(
+                    "the item holds an invalid set at `{path}`: {}",
+                    set_member_request_message(&error, path)
+                )),
+            }
+        }
+        SetMemberError::NotASet => match origin {
+            Origin::Request => Error::validation(format!(
+                "One or more parameter values were invalid: The value at {path} is not a set"
+            )),
+            Origin::Item => Error::internal(format!("the item holds a non-set value at `{path}`")),
+        },
+    }
+}
+
+fn set_member_request_message(error: &SetMemberError, path: &str) -> String {
+    match error {
+        SetMemberError::EmptyString => format!(
+            "One or more parameter values were invalid: An string set may not have an empty string as a member ({path})"
+        ),
+        SetMemberError::EmptyBinary => format!(
+            "One or more parameter values were invalid: An binary set may not have an empty binary as a member ({path})"
+        ),
+        SetMemberError::Duplicate => format!(
+            "One or more parameter values were invalid: Input collection contains duplicates ({path})"
+        ),
+        SetMemberError::InvalidNumber(member) => format!(
+            "The parameter cannot be converted to a numeric value: {} (attribute: {path})",
+            crate::number::excerpt(member)
+        ),
+        SetMemberError::NotASet => format!(
+            "One or more parameter values were invalid: The value at {path} is not a set"
+        ),
     }
 }
 
@@ -862,6 +910,52 @@ mod tests {
             target.get("tags"),
             Some(&AttributeValue::Ss(vec!["y".into()]))
         );
+    }
+
+    #[test]
+    fn delete_rejects_a_malformed_number_operand_before_lookup() {
+        let values = crate::values([(":bad", AttributeValue::Ns(vec!["nope".into()]))]);
+        for present in [false, true] {
+            let mut target = item([("pk", s("a"))]);
+            if present {
+                target.insert("members".into(), AttributeValue::Ns(vec!["1".into()]));
+            }
+            let error = apply("DELETE members :bad", &mut target, &values).unwrap_err();
+            assert_eq!(error.code(), "ValidationException");
+            assert!(
+                error.to_string().contains(
+                    "The parameter cannot be converted to a numeric value: nope (attribute: members)"
+                ),
+                "unexpected error: {error}"
+            );
+            assert_eq!(
+                target.get("members"),
+                present.then_some(&AttributeValue::Ns(vec!["1".into()]))
+            );
+        }
+    }
+
+    #[test]
+    fn add_rejects_duplicate_set_members_after_normalization() {
+        let values = crate::values([
+            (":dup_n", AttributeValue::Ns(vec!["1".into(), "1.0".into()])),
+            (":dup_s", AttributeValue::Ss(vec!["x".into(), "x".into()])),
+            (":empty_s", AttributeValue::Ss(vec![String::new()])),
+        ]);
+        for (operand, expected) in [
+            (":dup_n", "Input collection contains duplicates"),
+            (":dup_s", "Input collection contains duplicates"),
+            (":empty_s", "empty string as a member"),
+        ] {
+            let mut target = item([("pk", s("a"))]);
+            let error = apply(&format!("ADD members {operand}"), &mut target, &values).unwrap_err();
+            assert_eq!(error.code(), "ValidationException");
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{expected}` in `{error}`"
+            );
+            assert!(!target.contains_key("members"));
+        }
     }
 
     #[test]
@@ -1388,7 +1482,11 @@ mod tests {
 
     /// Whether one set holds every member of the other.
     fn covers(left: &AttributeValue, right: &AttributeValue) -> bool {
-        set_difference(right, left).and_then(|remaining| empty_set(&remaining)) == Some(true)
+        set_difference(right, left)
+            .ok()
+            .flatten()
+            .and_then(|remaining| empty_set(&remaining))
+            == Some(true)
     }
 
     /// The clauses [`clause_order_cannot_change_the_result`] permutes: three
@@ -1529,9 +1627,9 @@ mod tests {
         /// [`delete_after_add_over_an_overlap_loses_the_member`] pins down.
         #[test]
         fn delete_after_add_restores_the_set((stored, delta) in same_type_sets()) {
-            let delta = set_difference(&delta, &stored).unwrap();
+            let delta = set_difference(&delta, &stored).unwrap().unwrap();
             let united = add_values(&stored, &delta, "members").unwrap();
-            let remaining = set_difference(&united, &delta).unwrap();
+            let remaining = set_difference(&united, &delta).unwrap().unwrap();
             prop_assert_eq!(remaining, stored);
         }
 
@@ -1639,13 +1737,13 @@ mod tests {
         let shared = AttributeValue::Ns(vec!["831".to_string()]);
         let united = add_values(&shared, &shared, "members").unwrap();
         assert_eq!(united, shared);
-        let remaining = set_difference(&united, &shared).unwrap();
+        let remaining = set_difference(&united, &shared).unwrap().unwrap();
         assert_eq!(empty_set(&remaining), Some(true));
 
         let stored = AttributeValue::Ns(vec!["831".to_string()]);
         let delta = AttributeValue::Ns(vec!["832".to_string()]);
         let united = add_values(&stored, &delta, "members").unwrap();
-        let remaining = set_difference(&united, &delta).unwrap();
+        let remaining = set_difference(&united, &delta).unwrap().unwrap();
         assert_eq!(remaining, stored);
     }
 }
