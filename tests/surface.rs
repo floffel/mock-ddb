@@ -303,6 +303,134 @@ async fn index_names_carry_the_service_name_rule() {
 }
 
 #[tokio::test]
+async fn attribute_names_carry_the_service_length_rule() {
+    // Attribute names are 1 to 255 characters, but unlike table and index
+    // names they have no restricted character set. A mock table with an empty
+    // or oversized key/definition name would be rejected by the service.
+    let hash =
+        |name: String| CreateTableRequest::new("orders", KeySchema::hash(name, KeyType::String));
+
+    // Lower length bound: empty, then exactly one character.
+    let empty = rejection(hash(String::new())).await;
+    assert!(
+        empty.contains("keySchema.1.member.attributeName"),
+        "{empty}"
+    );
+    assert!(
+        empty.contains("length greater than or equal to 1"),
+        "{empty}"
+    );
+    assert!(MockDdb::new()
+        .create_table(hash("a".to_string()))
+        .await
+        .is_ok());
+
+    // Upper length bound: exactly the maximum, then one character over.
+    assert!(MockDdb::new()
+        .create_table(hash("a".repeat(255)))
+        .await
+        .is_ok());
+    let too_long = rejection(hash("a".repeat(256))).await;
+    assert!(
+        too_long.contains("keySchema.1.member.attributeName"),
+        "{too_long}"
+    );
+    assert!(
+        too_long.contains("length less than or equal to 255"),
+        "{too_long}"
+    );
+
+    // Attribute names are not subject to the table/index charset rule.
+    assert!(MockDdb::new()
+        .create_table(hash("customer email".to_string()))
+        .await
+        .is_ok());
+}
+
+#[tokio::test]
+async fn every_attribute_name_location_is_validated() {
+    let valid_table = || {
+        CreateTableRequest::new(
+            "orders",
+            KeySchema::hash_and_range("pk", KeyType::String, "sk", KeyType::String),
+        )
+    };
+
+    let table_sort = rejection(CreateTableRequest::new(
+        "orders",
+        KeySchema::hash_and_range("pk", KeyType::String, String::new(), KeyType::String),
+    ))
+    .await;
+    assert!(
+        table_sort.contains("keySchema.2.member.attributeName"),
+        "{table_sort}"
+    );
+
+    let global_partition = rejection(valid_table().with_global_index(SecondaryIndex::new(
+        "by-state",
+        KeySchema::hash(String::new(), KeyType::String),
+    )))
+    .await;
+    assert!(
+        global_partition
+            .contains("globalSecondaryIndexes.1.member.keySchema.1.member.attributeName"),
+        "{global_partition}"
+    );
+
+    let global_sort = rejection(valid_table().with_global_index(SecondaryIndex::new(
+        "by-state",
+        KeySchema::hash_and_range("state", KeyType::String, "a".repeat(256), KeyType::String),
+    )))
+    .await;
+    assert!(
+        global_sort.contains("globalSecondaryIndexes.1.member.keySchema.2.member.attributeName"),
+        "{global_sort}"
+    );
+    assert!(
+        global_sort.contains("length less than or equal to 255"),
+        "{global_sort}"
+    );
+
+    let local_partition = rejection(valid_table().with_local_index(SecondaryIndex::new(
+        "by-status",
+        KeySchema::hash_and_range(String::new(), KeyType::String, "status", KeyType::String),
+    )))
+    .await;
+    assert!(
+        local_partition.contains("localSecondaryIndexes.1.member.keySchema.1.member.attributeName"),
+        "{local_partition}"
+    );
+
+    let local_sort = rejection(valid_table().with_local_index(SecondaryIndex::new(
+        "by-status",
+        KeySchema::hash_and_range("pk", KeyType::String, String::new(), KeyType::String),
+    )))
+    .await;
+    assert!(
+        local_sort.contains("localSecondaryIndexes.1.member.keySchema.2.member.attributeName"),
+        "{local_sort}"
+    );
+
+    let declared = rejection(CreateTableRequest {
+        attribute_definitions: vec![
+            AttributeDefinition::new("pk", KeyType::String),
+            AttributeDefinition::new("sk", KeyType::String),
+            AttributeDefinition::new("a".repeat(256), KeyType::String),
+        ],
+        ..valid_table()
+    })
+    .await;
+    assert!(
+        declared.contains("attributeDefinitions.3.member.attributeName"),
+        "{declared}"
+    );
+    assert!(
+        declared.contains("length less than or equal to 255"),
+        "{declared}"
+    );
+}
+
+#[tokio::test]
 async fn error_messages_elide_an_untrusted_name() {
     // The name is caller-controlled and, until the length check runs, of any
     // size. Quoting it whole would copy a megabyte into the `Error` and from

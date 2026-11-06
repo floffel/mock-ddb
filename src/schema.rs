@@ -459,6 +459,7 @@ impl CreateTableRequest {
     /// should carry.
     pub(crate) fn validate(&self) -> Result<Vec<AttributeDefinition>> {
         validate_table_name(&self.table_name)?;
+        self.validate_attribute_names()?;
         self.validate_key_schemas()?;
         self.validate_index_limits()?;
         let derived = self.derive_attribute_definitions()?;
@@ -470,6 +471,36 @@ impl CreateTableRequest {
         }
         self.validate_declared_definitions(&derived)?;
         Ok(self.attribute_definitions.clone())
+    }
+
+    /// Every attribute name a table definition carries must fit the service's
+    /// 1–255 character window.
+    ///
+    /// Attribute names do not share the table/index charset restriction, so
+    /// this deliberately checks length only. It covers the names in the table
+    /// key schema, every secondary-index key schema, and every explicitly
+    /// declared attribute definition.
+    fn validate_attribute_names(&self) -> Result<()> {
+        validate_key_schema_attribute_names(&self.key_schema, "keySchema")?;
+        for (position, index) in self.global_secondary_indexes.iter().enumerate() {
+            validate_key_schema_attribute_names(
+                &index.key_schema,
+                &format!("globalSecondaryIndexes.{}.member.keySchema", position + 1),
+            )?;
+        }
+        for (position, index) in self.local_secondary_indexes.iter().enumerate() {
+            validate_key_schema_attribute_names(
+                &index.key_schema,
+                &format!("localSecondaryIndexes.{}.member.keySchema", position + 1),
+            )?;
+        }
+        for (position, definition) in self.attribute_definitions.iter().enumerate() {
+            validate_attribute_name(
+                &definition.attribute_name,
+                &format!("attributeDefinitions.{}.member.attributeName", position + 1),
+            )?;
+        }
+        Ok(())
     }
 
     /// Every key schema must name two different attributes on its two roles.
@@ -763,6 +794,12 @@ const MIN_NAME_LEN: usize = 3;
 /// Longest name the service accepts for a table or an index.
 const MAX_NAME_LEN: usize = 255;
 
+/// Shortest attribute name the service accepts.
+const MIN_ATTRIBUTE_NAME_LEN: usize = 1;
+
+/// Longest attribute name the service accepts.
+const MAX_ATTRIBUTE_NAME_LEN: usize = 255;
+
 /// Longest slice of an untrusted name an error message echoes back.
 ///
 /// The service quotes the offending value verbatim; a mock must not, because
@@ -774,6 +811,41 @@ const MAX_ECHO_CHARS: usize = 64;
 /// Validate a table name against DynamoDB's documented constraints.
 pub(crate) fn validate_table_name(name: &str) -> Result<()> {
     validate_name(name, "tableName")
+}
+
+/// Validate every attribute name in a key schema, numbering list members from
+/// one as the service does.
+fn validate_key_schema_attribute_names(schema: &KeySchema, location: &str) -> Result<()> {
+    for (position, element) in schema.elements().into_iter().enumerate() {
+        validate_attribute_name(
+            &element.attribute_name,
+            &format!("{location}.{}.member.attributeName", position + 1),
+        )?;
+    }
+    Ok(())
+}
+
+/// Check an attribute name against the service's documented 1–255 character
+/// length window.
+///
+/// Unlike table and index names, attribute names have no restricted character
+/// set: only their length is checked. The message keeps the service's shape and
+/// uses the bounded echo shared with table-name errors.
+fn validate_attribute_name(name: &str, location: &str) -> Result<()> {
+    let length = name.chars().count();
+    if length < MIN_ATTRIBUTE_NAME_LEN {
+        let value = echoed_name(name);
+        return Err(Error::validation(format!(
+            "1 validation error detected: Value '{value}' at '{location}' failed to satisfy constraint: Member must have length greater than or equal to {MIN_ATTRIBUTE_NAME_LEN}"
+        )));
+    }
+    if length > MAX_ATTRIBUTE_NAME_LEN {
+        let value = echoed_name(name);
+        return Err(Error::validation(format!(
+            "1 validation error detected: Value '{value}' at '{location}' failed to satisfy constraint: Member must have length less than or equal to {MAX_ATTRIBUTE_NAME_LEN}"
+        )));
+    }
+    Ok(())
 }
 
 /// Check `name` against the one name rule the service documents for both table
@@ -841,7 +913,10 @@ fn is_name_character(character: char) -> bool {
 mod tests {
     use proptest::prelude::*;
 
-    use super::{echoed_name, validate_table_name, MAX_ECHO_CHARS, MAX_NAME_LEN, MIN_NAME_LEN};
+    use super::{
+        echoed_name, validate_attribute_name, validate_table_name, MAX_ATTRIBUTE_NAME_LEN,
+        MAX_ECHO_CHARS, MAX_NAME_LEN, MIN_ATTRIBUTE_NAME_LEN, MIN_NAME_LEN,
+    };
 
     #[test]
     fn table_name_length_window_is_inclusive_on_both_ends() {
@@ -913,6 +988,19 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn attribute_names_are_accepted_exactly_inside_the_length_window(name in any::<String>()) {
+            let characters = name.chars().count();
+            let inside = (MIN_ATTRIBUTE_NAME_LEN..=MAX_ATTRIBUTE_NAME_LEN).contains(&characters);
+            prop_assert_eq!(
+                validate_attribute_name(&name, "attributeName").is_ok(),
+                inside,
+                "{} characters: {:?}",
+                characters,
+                name
+            );
+        }
+
         #[test]
         fn every_charset_conforming_name_is_accepted_exactly_inside_the_window(name in ascii_name()) {
             let characters = name.chars().count();
